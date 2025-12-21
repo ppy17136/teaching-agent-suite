@@ -569,51 +569,93 @@ def guess_course_support_matrix(tables_pack: List[Dict[str, Any]]) -> Dict[str, 
     return res
 
 
-def extract_training_plan_checklist(text: str) -> Dict[str, Any]:
-    """
-    从文本粗抽一些清单字段（可编辑，最终以用户确认为准）
-    """
-    # 简单正则：培养目标通常“培养目标/目标”附近；毕业要求通常“毕业要求”附近
-    major = ""
-    grade = ""
-    # 从类似“2024版/2024级”等中猜年级
-    m = re.search(r"(\d{2,4})级", text)
-    if m:
-        grade = m.group(1)
+import re
 
-    # 专业名称猜测
-    m2 = re.search(r"(材料成型及控制工程|机械工程|电气工程及其自动化|计算机科学与技术|土木工程|航空航天|测控技术与仪器)", text)
-    if m2:
-        major = m2.group(1)
+def extract_training_plan_checklist(txt: str) -> dict:
+    # 预处理：统一空白
+    raw = (txt or "").replace("\u3000", " ")
+    lines = []
+    for l in raw.splitlines():
+        l = re.sub(r"\s+", " ", l).strip()
+        if l:
+            lines.append(l)
 
-    # 粗提“培养目标”段落
+    # ------------------ 培养目标（支持：目标 1：/目标1:/1.） ------------------
     goals = []
-    m3 = re.search(r"(培养目标[\s\S]{0,2000}?)(毕业要求|三、|四、|五、|课程体系|$)", text)
-    if m3:
-        chunk = m3.group(1)
-        for line in chunk.splitlines():
-            line = line.strip()
-            if re.match(r"^(\d+[\.\、]|[-•])", line):
-                goals.append(re.sub(r"^(\d+[\.\、]|[-•])\s*", "", line))
+    in_goal = False
+    for line in lines:
+        if "培养目标" in line:
+            in_goal = True
+            continue
+        if in_goal and ("毕业要求" in line or re.match(r"^二[、\.]\s*毕业要求", line)):
+            in_goal = False
+        if not in_goal:
+            continue
 
-    # 粗提“毕业要求”编号行
+        # 目标 1：xxx
+        m = re.match(r"^(?:目标\s*)?(\d{1,2})\s*[:：]\s*(.+)$", line)
+        if m:
+            goals.append(m.group(2).strip("；;。."))
+            continue
+
+        # 1. xxx 或 1、xxx（有的目标也这么写）
+        m = re.match(r"^(\d{1,2})[\.、]\s*(.+)$", line)
+        if m:
+            goals.append(m.group(2).strip("；;。."))
+            continue
+
+    # ------------------ 毕业要求（只抓1~12大条，跳过1.1/2.3） ------------------
     outcomes = []
-    # 找到“毕业要求”后 2000 字内的 “1.”、“2.” 等
-    m4 = re.search(r"(毕业要求[\s\S]{0,2500})", text)
-    if m4:
-        chunk = m4.group(1)
-        for line in chunk.splitlines():
-            line = line.strip()
-            mm = re.match(r"^(\d{1,2})[\.、]\s*(.+)$", line)
-            if mm:
-                outcomes.append({"no": mm.group(1), "name": mm.group(2).strip()})
+    in_out = False
+    pending_no = None
 
+    for line in lines:
+        if "毕业要求" in line:
+            in_out = True
+            continue
+        # 到“三、/四、...”等后续章节就停止
+        if in_out and re.match(r"^(三|四|五)[、\.]", line):
+            in_out = False
+        if not in_out:
+            continue
+
+        # 处理 “1.” 单独成行的分页断行
+        m = re.match(r"^(\d{1,2})[\.、]?$", line)
+        if m:
+            pending_no = m.group(1)
+            continue
+
+        # 只匹配大条：1. xxx / 2、xxx 但禁止 1.1（负向前瞻）
+        m = re.match(r"^(\d{1,2})[\.、](?!\d)\s*(.+)$", line)
+        if m:
+            no = m.group(1)
+            name = m.group(2).strip()
+            outcomes.append({"no": no, "name": name})
+            pending_no = None
+            continue
+
+        # 如果上一行是孤立的 “1.”，那这一行就当作该大条标题
+        if pending_no is not None:
+            outcomes.append({"no": pending_no, "name": line.strip()})
+            pending_no = None
+
+    # ------------------ 去重+排序（确保最多12条） ------------------
+    dedup = {}
+    for o in outcomes:
+        no = str(int(o["no"]))  # 规范成 "1".."12"
+        if no not in dedup:
+            dedup[no] = o["name"].strip()
+
+    outcomes_final = [{"no": k, "name": dedup[k]} for k in sorted(dedup.keys(), key=lambda x: int(x))]
+    # 如果多于12（极少数情况），截断；如果少于12，后面页面可给 warning
+    outcomes_final = outcomes_final[:12]
+
+    # 其它字段你原来怎么猜就怎么保留（这里示例返回关键三项）
     return {
-        "major_guess": major,
-        "grade_guess": grade,
-        "goals_guess": goals[:8],
-        "outcomes_guess": outcomes[:20],
+        "goals_guess": goals,
+        "outcomes_guess": outcomes_final,
     }
+
 
 
 # ---------------------------
@@ -1736,169 +1778,171 @@ def page_training_plan():
                 }
                 st.success("已生成识别清单，请在下方确认/修正，然后再保存。")
 
-            if "tp_extract" in st.session_state:
-                ex = st.session_state["tp_extract"]
-                st.markdown("---")
-                st.markdown("### 识别清单（请确认/修正）")
-                st.caption("原则：系统先尽力抽取，最终以你的确认结果为准；确认后的结构化信息会用于后续大纲自动填充。")
 
-                ck = ex["checklist"]
-                colA, colB, colC = st.columns(3)
-                with colA:
-                    major2 = st.text_input("专业（可修正）", value=ck.get("major_guess", ""), key="tp_major_fix")
-                    grade2 = st.text_input("年级（可修正）", value=ck.get("grade_guess", ""), key="tp_grade_fix")
-                with colB:
-                    course_group2 = st.text_input("课程体系/方向（可补充）", value="", key="tp_group_fix")
-                    confirmed_flag = st.checkbox("我已确认以上信息大体正确", value=False, key="tp_confirm_flag")
-                with colC:
-                    st.markdown("**识别来源**")
-                    st.code(ex.get("source", ""), language="text")
+        # ✅ 关键：放到 columns 外（全宽）
+        if "tp_extract" in st.session_state:
+            ex = st.session_state["tp_extract"]
+            st.markdown("---")
+            st.markdown("### 识别清单（请确认/修正）")
+            st.caption("原则：系统先尽力抽取，最终以你的确认结果为准；确认后的结构化信息会用于后续大纲自动填充。")
 
-                st.markdown("#### 1) 培养目标（可编辑）")
-                goals_init = ck.get("goals_guess", []) or []
-                goals_text = st.text_area(
-                    "每行一个目标（可增删/改写）",
-                    value="\n".join(goals_init) if goals_init else "",
-                    height=140,
-                    key="tp_goals_edit",
+            ck = ex["checklist"]
+            colA, colB, colC = st.columns(3)
+            with colA:
+                major2 = st.text_input("专业（可修正）", value=ck.get("major_guess", ""), key="tp_major_fix")
+                grade2 = st.text_input("年级（可修正）", value=ck.get("grade_guess", ""), key="tp_grade_fix")
+            with colB:
+                course_group2 = st.text_input("课程体系/方向（可补充）", value="", key="tp_group_fix")
+                confirmed_flag = st.checkbox("我已确认以上信息大体正确", value=False, key="tp_confirm_flag")
+            with colC:
+                st.markdown("**识别来源**")
+                st.code(ex.get("source", ""), language="text")
+
+            st.markdown("#### 1) 培养目标（可编辑）")
+            goals_init = ck.get("goals_guess", []) or []
+            goals_text = st.text_area(
+                "每行一个目标（可增删/改写）",
+                value="\n".join(goals_init) if goals_init else "",
+                height=140,
+                key="tp_goals_edit",
+            )
+            goals_final = [x.strip() for x in goals_text.splitlines() if x.strip()]
+
+            st.markdown("#### 2) 毕业要求（可编辑）")
+            out_init = ck.get("outcomes_guess", []) or []
+            if pd is not None:
+                df_out = pd.DataFrame(out_init) if out_init else pd.DataFrame(columns=["no", "name"])
+                df_out2 = st.data_editor(df_out, use_container_width=True, num_rows="dynamic", key="tp_out_editor")
+                outcomes_final = [{"no": str(r["no"]), "name": str(r["name"])} for _, r in df_out2.iterrows() if str(r.get("no","")).strip()]
+            else:
+                outcomes_json = st.text_area(
+                    "毕业要求 JSON（数组）",
+                    value=json.dumps(out_init, ensure_ascii=False, indent=2),
+                    height=160,
+                    key="tp_out_json",
                 )
-                goals_final = [x.strip() for x in goals_text.splitlines() if x.strip()]
+                try:
+                    outcomes_final = json.loads(outcomes_json) if outcomes_json.strip() else []
+                except Exception:
+                    outcomes_final = out_init
 
-                st.markdown("#### 2) 毕业要求（可编辑）")
-                out_init = ck.get("outcomes_guess", []) or []
-                if pd is not None:
-                    df_out = pd.DataFrame(out_init) if out_init else pd.DataFrame(columns=["no", "name"])
-                    df_out2 = st.data_editor(df_out, use_container_width=True, num_rows="dynamic", key="tp_out_editor")
-                    outcomes_final = [{"no": str(r["no"]), "name": str(r["name"])} for _, r in df_out2.iterrows() if str(r.get("no","")).strip()]
+            st.markdown("#### 3) 课程-毕业要求支撑矩阵（表格→可编辑）")
+            mg = ex["matrix_guess"]
+            st.info(mg.get("hint", ""))
+            best = mg.get("best_table", None)
+
+            # 编辑“疑似矩阵表”
+            edited_best_table = None
+            if best and best.get("table"):
+                st.markdown(f"**疑似矩阵表（第 {best.get('page')} 页）**：请直接改表格内容（包括表头）")
+                #edited_best_table = render_table_editor(best["table"], key="tp_matrix_table_editor")
+                
+                edited_best_table, ok_table = render_table_editor(best["table"], key="tp_matrix_table_editor", title="毕业要求-课程目标矩阵（识别结果）")
+                if ok_table:
+                    # 这里写入你的最终 content_json（示例）
+                    st.session_state["tp_matrix_table_confirmed"] = edited_best_table
+                    st.success("该表格已确认并缓存为最终版本。")
                 else:
-                    outcomes_json = st.text_area(
-                        "毕业要求 JSON（数组）",
-                        value=json.dumps(out_init, ensure_ascii=False, indent=2),
-                        height=160,
-                        key="tp_out_json",
-                    )
-                    try:
-                        outcomes_final = json.loads(outcomes_json) if outcomes_json.strip() else []
-                    except Exception:
-                        outcomes_final = out_init
+                    st.info("请确认或修正表格后再采用。")
 
-                st.markdown("#### 3) 课程-毕业要求支撑矩阵（表格→可编辑）")
-                mg = ex["matrix_guess"]
-                st.info(mg.get("hint", ""))
-                best = mg.get("best_table", None)
+                
+                
+                
+            else:
+                st.warning("未抽到疑似支撑矩阵表格。你可以：1) 在 PDF 更清晰时再试；2) 下面手工录入本课程支撑点。")
 
-                # 编辑“疑似矩阵表”
-                edited_best_table = None
-                if best and best.get("table"):
-                    st.markdown(f"**疑似矩阵表（第 {best.get('page')} 页）**：请直接改表格内容（包括表头）")
-                    #edited_best_table = render_table_editor(best["table"], key="tp_matrix_table_editor")
-                    
-                    edited_best_table, ok_table = render_table_editor(best["table"], key="tp_matrix_table_editor", title="毕业要求-课程目标矩阵（识别结果）")
-                    if ok_table:
-                        # 这里写入你的最终 content_json（示例）
-                        st.session_state["tp_matrix_table_confirmed"] = edited_best_table
-                        st.success("该表格已确认并缓存为最终版本。")
-                    else:
-                        st.info("请确认或修正表格后再采用。")
+            st.markdown("#### 4) 课程关系图（边表→可编辑 + Graphviz 预览）")
+            st.caption("很多 PDF 导图是图片，不易自动还原。这里用可编辑“边表”更可靠：你只需填“先修→后续”。")
 
-                    
-                    
-                    
-                else:
-                    st.warning("未抽到疑似支撑矩阵表格。你可以：1) 在 PDF 更清晰时再试；2) 下面手工录入本课程支撑点。")
-
-                st.markdown("#### 4) 课程关系图（边表→可编辑 + Graphviz 预览）")
-                st.caption("很多 PDF 导图是图片，不易自动还原。这里用可编辑“边表”更可靠：你只需填“先修→后续”。")
-
-                edges = ex.get("course_edges", [{"source": "", "target": ""}])
-                if pd is not None:
-                    df_e = pd.DataFrame(edges)
-                    df_e2 = st.data_editor(df_e, use_container_width=True, num_rows="dynamic", key="tp_edges_editor")
-                    edges_final = [{"source": str(r["source"]), "target": str(r["target"])} for _, r in df_e2.iterrows()]
-                else:
-                    edges_json = st.text_area(
-                        "边表 JSON（数组）",
-                        value=json.dumps(edges, ensure_ascii=False, indent=2),
-                        height=160,
-                        key="tp_edges_json",
-                    )
-                    try:
-                        edges_final = json.loads(edges_json) if edges_json.strip() else edges
-                    except Exception:
-                        edges_final = edges
-
-                dot = dot_from_edge_rows(edges_final)
-                st.graphviz_chart(dot)
-
-                st.markdown("#### 5) 从支撑矩阵中提取“某门课程的支撑指标点”（用于大纲默认填充）")
-                st.caption("如果你在上面的矩阵表里能看到课程行，可以在这里选择课程并勾选支撑点。")
-
-                # 简单：让用户手工录入当前项目“默认课程”的支撑点（后面大纲页可选课程名再映射）
-                support_points_text = st.text_input(
-                    "当前要重点支持的课程指标点（逗号分隔，如 1.1,2.3,3.2）",
-                    value="",
-                    key="tp_support_points_text",
+            edges = ex.get("course_edges", [{"source": "", "target": ""}])
+            if pd is not None:
+                df_e = pd.DataFrame(edges)
+                df_e2 = st.data_editor(df_e, use_container_width=True, num_rows="dynamic", key="tp_edges_editor")
+                edges_final = [{"source": str(r["source"]), "target": str(r["target"])} for _, r in df_e2.iterrows()]
+            else:
+                edges_json = st.text_area(
+                    "边表 JSON（数组）",
+                    value=json.dumps(edges, ensure_ascii=False, indent=2),
+                    height=160,
+                    key="tp_edges_json",
                 )
-                support_points = [x.strip() for x in re.split(r"[，,;\s]+", support_points_text) if x.strip()]
+                try:
+                    edges_final = json.loads(edges_json) if edges_json.strip() else edges
+                except Exception:
+                    edges_final = edges
 
-                st.markdown("---")
-                if st.button("✅ 确认并保存为培养方案底座", type="primary", disabled=not confirmed_flag):
-                    # 可选：用千问做一次“结构补全”（只对文本，不强依赖）
-                    text_final = ex.get("text", "") or ""
-                    if use_ai_fix and get_qwen_key():
-                        try:
-                            sys = "你是高校培养方案抽取与校正助手。输出必须是JSON+简短说明。"
-                            user = f"""
+            dot = dot_from_edge_rows(edges_final)
+            st.graphviz_chart(dot)
+
+            st.markdown("#### 5) 从支撑矩阵中提取“某门课程的支撑指标点”（用于大纲默认填充）")
+            st.caption("如果你在上面的矩阵表里能看到课程行，可以在这里选择课程并勾选支撑点。")
+
+            # 简单：让用户手工录入当前项目“默认课程”的支撑点（后面大纲页可选课程名再映射）
+            support_points_text = st.text_input(
+                "当前要重点支持的课程指标点（逗号分隔，如 1.1,2.3,3.2）",
+                value="",
+                key="tp_support_points_text",
+            )
+            support_points = [x.strip() for x in re.split(r"[，,;\s]+", support_points_text) if x.strip()]
+
+            st.markdown("---")
+            if st.button("✅ 确认并保存为培养方案底座", type="primary", disabled=not confirmed_flag):
+                # 可选：用千问做一次“结构补全”（只对文本，不强依赖）
+                text_final = ex.get("text", "") or ""
+                if use_ai_fix and get_qwen_key():
+                    try:
+                        sys = "你是高校培养方案抽取与校正助手。输出必须是JSON+简短说明。"
+                        user = f"""
 请对以下培养方案文本做结构化抽取并校正，重点抽取：培养目标、毕业要求列表（含编号与名称）、任何出现的“课程-毕业要求支撑关系”提示。
 返回JSON字段：goals(list[str]), outcomes(list[{{no,name}}]), notes(str)。
 文本（截断）：{text_final[:8000]}
 """
-                            out = qwen_chat([{"role": "system", "content": sys}, {"role": "user", "content": user}], temperature=0.2, max_tokens=1200)
-                            m = re.search(r"\{[\s\S]*\}", out)
-                            if m:
-                                js_ai = json.loads(m.group(0))
-                                # 仅在用户未填时补充
-                                if not goals_final and js_ai.get("goals"):
-                                    goals_final = js_ai.get("goals", [])
-                                if (not outcomes_final) and js_ai.get("outcomes"):
-                                    outcomes_final = js_ai.get("outcomes", [])
-                        except Exception as e:
-                            st.warning(f"AI校正失败（忽略，不影响保存）：{e}")
+                        out = qwen_chat([{"role": "system", "content": sys}, {"role": "user", "content": user}], temperature=0.2, max_tokens=1200)
+                        m = re.search(r"\{[\s\S]*\}", out)
+                        if m:
+                            js_ai = json.loads(m.group(0))
+                            # 仅在用户未填时补充
+                            if not goals_final and js_ai.get("goals"):
+                                goals_final = js_ai.get("goals", [])
+                            if (not outcomes_final) and js_ai.get("outcomes"):
+                                outcomes_final = js_ai.get("outcomes", [])
+                    except Exception as e:
+                        st.warning(f"AI校正失败（忽略，不影响保存）：{e}")
 
-                    # 组装结构化 content_json（确认版）
-                    content_json = {
-                        "source": ex.get("source", ""),
-                        "confirmed": True,
-                        "major": major2,
-                        "grade": grade2,
-                        "course_group": course_group2,
-                        "goals": goals_final,
-                        "outcomes": outcomes_final,
-                        "support_points_default": support_points,  # 默认/示例：可用于大纲
-                        "support_matrix_best_table": {
-                            "page": best.get("page") if best else None,
-                            "table": edited_best_table if edited_best_table is not None else (best.get("table") if best else None),
-                        },
-                        "course_edges": edges_final,
-                    }
+                # 组装结构化 content_json（确认版）
+                content_json = {
+                    "source": ex.get("source", ""),
+                    "confirmed": True,
+                    "major": major2,
+                    "grade": grade2,
+                    "course_group": course_group2,
+                    "goals": goals_final,
+                    "outcomes": outcomes_final,
+                    "support_points_default": support_points,  # 默认/示例：可用于大纲
+                    "support_matrix_best_table": {
+                        "page": best.get("page") if best else None,
+                        "table": edited_best_table if edited_best_table is not None else (best.get("table") if best else None),
+                    },
+                    "course_edges": edges_final,
+                }
 
-                    # 生成一份更“可读”的 md（方便预览）
-                    md = f"# 培养方案（上传识别-已确认）\n\n"
-                    md += f"- 专业：{major2}\n- 年级：{grade2}\n- 课程体系/方向：{course_group2}\n\n"
-                    md += "## 一、培养目标（确认版）\n" + ("\n".join([f"- {x}" for x in goals_final]) if goals_final else "- （未填）") + "\n\n"
-                    md += "## 二、毕业要求（确认版）\n" + ("\n".join([f"- {o.get('no','')}. {o.get('name','')}" for o in outcomes_final]) if outcomes_final else "- （未填）") + "\n\n"
-                    md += "## 三、课程支撑指标点（默认/示例）\n" + (("、".join(support_points)) if support_points else "（未填）") + "\n\n"
-                    md += "## 四、原始抽取文本（供追溯）\n\n" + (ex.get("text","")[:20000] if ex.get("text") else "")
+                # 生成一份更“可读”的 md（方便预览）
+                md = f"# 培养方案（上传识别-已确认）\n\n"
+                md += f"- 专业：{major2}\n- 年级：{grade2}\n- 课程体系/方向：{course_group2}\n\n"
+                md += "## 一、培养目标（确认版）\n" + ("\n".join([f"- {x}" for x in goals_final]) if goals_final else "- （未填）") + "\n\n"
+                md += "## 二、毕业要求（确认版）\n" + ("\n".join([f"- {o.get('no','')}. {o.get('name','')}" for o in outcomes_final]) if outcomes_final else "- （未填）") + "\n\n"
+                md += "## 三、课程支撑指标点（默认/示例）\n" + (("、".join(support_points)) if support_points else "（未填）") + "\n\n"
+                md += "## 四、原始抽取文本（供追溯）\n\n" + (ex.get("text","")[:20000] if ex.get("text") else "")
 
-                    title = f"培养方案（确认版）-{ex.get('source','上传')}"
-                    a2 = upsert_artifact(project_id, "training_plan", title, md, content_json, [], note="upload-confirm")
-                    st.success("已保存“确认版培养方案底座”。后续生成大纲会优先使用结构化字段。")
-                    st.session_state.pop("tp_extract", None)
-                    st.rerun()
+                title = f"培养方案（确认版）-{ex.get('source','上传')}"
+                a2 = upsert_artifact(project_id, "training_plan", title, md, content_json, [], note="upload-confirm")
+                st.success("已保存“确认版培养方案底座”。后续生成大纲会优先使用结构化字段。")
+                st.session_state.pop("tp_extract", None)
+                st.rerun()
 
-                if st.button("清除本次识别结果（不保存）"):
-                    st.session_state.pop("tp_extract", None)
-                    st.info("已清除。")
+            if st.button("清除本次识别结果（不保存）"):
+                st.session_state.pop("tp_extract", None)
+                st.info("已清除。")
 
     with tab2:
         if not a:
