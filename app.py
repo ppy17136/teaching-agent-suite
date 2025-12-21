@@ -1123,62 +1123,27 @@ def df_to_markdown_preview(df: "pd.DataFrame", max_rows: int = 30) -> str:
         # 兼容某些环境没有 tabulate
         return df2.to_string(index=False)
 
+def render_table_editor(table: Any, key: str, title: str = "表格编辑（可改表头）"):
+    st.markdown(f"**{title}**")
 
-def render_table_editor(table: Any, key: str, title: str = "识别到的表格") -> Tuple[Any, bool]:
-    """
-    返回 (edited_table, confirmed)
-    - edited_table: 以 list[dict] 形式返回，便于存 JSON
-    - confirmed: 用户是否点击确认采用
-    """
-    if pd is None:
-        st.warning("当前环境缺少 pandas，无法编辑表格。")
-        st.code(json.dumps(table, ensure_ascii=False, indent=2), language="json")
-        return table, False
+    # 兼容：table 可能是 list[list] / DataFrame
+    if pd is not None and isinstance(table, list):
+        df = pd.DataFrame(table)
+        df2 = st.data_editor(df, use_container_width=True, num_rows="dynamic", key=f"{key}_editor")
+        new_table = df2.values.tolist()
+    elif pd is not None:
+        df2 = st.data_editor(table, use_container_width=True, num_rows="dynamic", key=f"{key}_editor")
+        new_table = df2.values.tolist()
+    else:
+        txt = st.text_area("无 pandas 时请粘贴 JSON（二维数组）", value=json.dumps(table, ensure_ascii=False, indent=2),
+                           height=220, key=f"{key}_json")
+        try:
+            new_table = json.loads(txt)
+        except Exception:
+            new_table = table
 
-    df = table_to_df(table)
-
-    st.markdown(f"#### {title}")
-
-    view_mode = st.radio(
-        "显示方式（便于核对）",
-        ["表格编辑（推荐）", "Markdown预览（更适合确认）", "JSON（原始结构）"],
-        horizontal=True,
-        key=f"{key}_viewmode",
-    )
-
-    if view_mode == "JSON（原始结构）":
-        st.code(json.dumps(table, ensure_ascii=False, indent=2), language="json")
-        confirmed = st.checkbox("我确认该表格无误，采用此结果", key=f"{key}_confirm_json")
-        return table, confirmed
-
-    if view_mode == "Markdown预览（更适合确认）":
-        md = df_to_markdown_preview(df, max_rows=50)
-        st.markdown(md)
-        confirmed = st.checkbox("我确认该表格无误，采用此结果", key=f"{key}_confirm_md")
-        # 仍返回规范化后的数据
-        return df.fillna("").to_dict(orient="records"), confirmed
-
-    # 表格编辑
-    # 再次强制列名合规（保险）
-    df = df.copy()
-    df.columns = _make_unique_columns(df.columns)
-
-    edited_df = st.data_editor(
-        df,
-        use_container_width=True,
-        num_rows="dynamic",
-        key=key,
-    )
-
-    # 编辑后也再清洗一次列名（避免用户把表头改成空或重复）
-    edited_df = edited_df.copy()
-    edited_df.columns = _make_unique_columns(edited_df.columns)
-
-    st.caption("提示：如果你想更快核对，请切到“Markdown预览”。")
-    confirmed = st.checkbox("我确认该表格已修正完成，采用此结果", key=f"{key}_confirm_editor")
-
-    # 统一返回 list[dict] 方便保存进 content_json
-    return edited_df.fillna("").to_dict(orient="records"), confirmed
+    confirmed = st.checkbox("确认采用该表格作为最终版本", value=False, key=f"{key}_ok")
+    return new_table, confirmed
 
 
 def render_recognition_checklist(items: List[Dict[str, Any]], key_prefix: str) -> List[Dict[str, Any]]:
