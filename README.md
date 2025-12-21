@@ -1,4 +1,3 @@
-```markdown
 # 教学智能体平台（教评一体化 · 可验证生成 VGE · Streamlit Demo）
 
 本仓库提供一个可在线演示的教学文件智能生成与教评闭环平台（Streamlit 应用），面向“教评一体化”场景，支持从**培养方案**出发，自动生成并联动构建课程全套教学文件，并提供**可验证生成（Verifiable Generation, VGE）**的证据链与一致性校验能力。
@@ -36,7 +35,7 @@
 
 ## 🧠 运行模式
 
-- **演示模式（无API）**：无需配置任何 Key，平台可完整运行并自动生成示例数据（适合评审快速体验）。
+- **演示模式（无API）**：无需配置任何 Key，平台可完整运行并自动生成示例数据（适合快速体验）。
 - **在线模式（千问 API）**：配置 `QWEN_API_KEY` 后启用：
   - 文本智能生成（大纲/日历/教案/题库/报告）
   - 视觉AI课堂状态估计（可选，耗时/耗API）
@@ -77,10 +76,10 @@ streamlit run app.py
 
 ## ☁️ Streamlit Community Cloud 部署
 
-1. 将本仓库推送到 GitHub（公开仓库更方便演示）
+1. 将本仓库推送到 GitHub
 2. 打开 Streamlit Community Cloud → New app → 选择该仓库
 3. main file 选择 `app.py`
-4. （可选）在 **Settings → Secrets** 添加：
+4. 在 **Settings → Secrets** 添加：
 
 ```toml
 QWEN_API_KEY="你的DashScope Key"
@@ -106,7 +105,7 @@ QWEN_API_KEY="你的DashScope Key"
 4. 生成题库与试卷方案 → 生成审核表与达成评价报告
 5. 上传课堂照片 → 写入过程证据 → 生成授课手册
 6. 打开“证据链与可验证生成”页面 → 导出证据链日志 JSON
-7. 一键导出多份 DOCX（用于申报材料提交）
+7. 一键导出多份 DOCX
 
 ---
 
@@ -121,8 +120,7 @@ QWEN_API_KEY="你的DashScope Key"
 
 ## 📄 License
 
-建议选择 Apache-2.0（公开演示友好）或 MIT。
-如为申报材料内部使用，也可暂不添加 License。
+Apache-2.0
 
 ---
 
