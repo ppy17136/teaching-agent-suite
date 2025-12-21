@@ -1,14 +1,15 @@
 # -*- coding: utf-8 -*-
 """
-教学智能体平台（单文件版 app.py）
-新增模块：
-1) 依赖图可视化（树状图 + Graphviz）
-2) 模板化 DOCX 导出（docxtpl 字段映射填充，支持上传模板 .docx）
+教学智能体平台（单文件版 app.py）- 修改增强版
+增强点：
+1) 培养方案上传识别 -> 识别清单（可编辑）-> 用户确认/修正 -> 再保存（结构化+可追溯）
+2) 表格以 data_editor 形式展示，便于确认/修正；图/导图用“边表+Graphviz”替代识别还原不佳
+3) 侧边栏新增备份/还原（zip）
+4) 修复 ensure_db_schema 与 db() WAL 设置不一致导致的潜在 OperationalError
 
 说明：
-- Graphviz：使用 st.graphviz_chart(dot)（无需系统安装 graphviz）
-- 模板导出：优先使用 docxtpl；未安装则提示并回退“简版导出”
-- 兼容 Streamlit Cloud：所有依赖均可选，不阻塞启动
+- 不依赖 OCR；pdfplumber 能抽到表就用表，否则退化为“手工边表/手工矩阵”
+- 在线模式可用千问做进一步“纠错/补全”（可选）
 """
 
 import os
@@ -19,6 +20,8 @@ import time
 import base64
 import hashlib
 import sqlite3
+import zipfile
+import threading
 from typing import List, Optional, Dict, Any, Tuple
 
 import streamlit as st
@@ -48,6 +51,12 @@ try:
 except Exception:
     DocxTemplate = None
 
+# pandas（用于表格编辑更舒服，可选）
+try:
+    import pandas as pd
+except Exception:
+    pd = None
+
 
 # ---------------------------
 # 基础配置（云端友好）
@@ -62,6 +71,8 @@ DATA_DIR = "data"
 os.makedirs(DATA_DIR, exist_ok=True)
 DB_PATH = os.path.join(DATA_DIR, "app.db")
 
+_DB_LOCK = threading.Lock()
+
 
 # ---------------------------
 # UI 美化（CSS）
@@ -74,7 +85,6 @@ def inject_css():
 h1, h2, h3 { letter-spacing: .2px; }
 code { font-size: 0.9em; }
 
-/* 顶部标题条 */
 .topbar{
   padding: 18px 18px;
   border-radius: 18px;
@@ -85,7 +95,6 @@ code { font-size: 0.9em; }
 .topbar .title{ font-size: 30px; font-weight: 800; }
 .topbar .sub{ opacity: .9; margin-top: 6px; font-size: 14px; }
 
-/* 卡片 */
 .card{
   border: 1px solid rgba(0,0,0,.08);
   border-radius: 18px;
@@ -101,7 +110,6 @@ code { font-size: 0.9em; }
 .badge.warn { background:#fffbeb; color:#92400e; border-color:#fde68a; }
 .badge.bad { background:#fef2f2; color:#991b1b; border-color:#fecaca; }
 
-/* 依赖条 */
 .depbar{ display:flex; gap:8px; flex-wrap: wrap; padding: 10px 0; }
 .depitem{
   padding: 8px 10px; border-radius: 14px; border: 1px solid rgba(0,0,0,.10);
@@ -109,7 +117,6 @@ code { font-size: 0.9em; }
 }
 .depitem b{ margin-right:6px; }
 
-/* 文档预览区（纯HTML安全渲染） */
 .docbox{
   border: 1px solid rgba(0,0,0,.10);
   border-radius: 18px;
@@ -118,8 +125,6 @@ code { font-size: 0.9em; }
   line-height: 1.55;
   white-space: normal;
 }
-
-/* Sidebar 标题 */
 section[data-testid="stSidebar"] .stMarkdown h2{ font-size: 18px; font-weight: 800; }
 div[data-testid="stDataFrame"] { border-radius: 14px; overflow:hidden; }
 </style>
@@ -135,14 +140,10 @@ inject_css()
 # 数据层：SQLite + 版本管理 + 依赖边
 # ---------------------------
 def db() -> sqlite3.Connection:
-    # 确保目录存在（云端偶发工作目录变化时更稳）
     os.makedirs(DATA_DIR, exist_ok=True)
-
     conn = sqlite3.connect(DB_PATH, check_same_thread=False, timeout=30)
     conn.execute("PRAGMA foreign_keys=ON;")
-    conn.execute("PRAGMA busy_timeout=5000;")  # 避免并发瞬时锁导致直接报错
-
-    # WAL 在某些环境可能不稳定，失败就降级到 DELETE
+    conn.execute("PRAGMA busy_timeout=5000;")
     try:
         conn.execute("PRAGMA journal_mode=WAL;")
     except Exception:
@@ -150,11 +151,11 @@ def db() -> sqlite3.Connection:
     return conn
 
 
-
 def init_db():
-    conn = db()
-    conn.execute(
-        """
+    with _DB_LOCK:
+        conn = db()
+        conn.execute(
+            """
 CREATE TABLE IF NOT EXISTS projects(
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   name TEXT NOT NULL,
@@ -162,9 +163,9 @@ CREATE TABLE IF NOT EXISTS projects(
   created_at INTEGER NOT NULL
 );
 """
-    )
-    conn.execute(
-        """
+        )
+        conn.execute(
+            """
 CREATE TABLE IF NOT EXISTS artifacts(
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   project_id INTEGER NOT NULL,
@@ -178,9 +179,9 @@ CREATE TABLE IF NOT EXISTS artifacts(
   FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE CASCADE
 );
 """
-    )
-    conn.execute(
-        """
+        )
+        conn.execute(
+            """
 CREATE TABLE IF NOT EXISTS versions(
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   artifact_id INTEGER NOT NULL,
@@ -193,9 +194,9 @@ CREATE TABLE IF NOT EXISTS versions(
   FOREIGN KEY(artifact_id) REFERENCES artifacts(id) ON DELETE CASCADE
 );
 """
-    )
-    conn.execute(
-        """
+        )
+        conn.execute(
+            """
 CREATE TABLE IF NOT EXISTS edges(
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   project_id INTEGER NOT NULL,
@@ -207,79 +208,14 @@ CREATE TABLE IF NOT EXISTS edges(
   FOREIGN KEY(parent_artifact_id) REFERENCES artifacts(id) ON DELETE CASCADE
 );
 """
-    )
-    conn.commit()
-    conn.close()
+        )
+        conn.commit()
+        conn.close()
+
 
 def ensure_db_schema():
-    conn = db()
-    conn.execute("PRAGMA journal_mode=WAL;")
-    conn.execute("PRAGMA foreign_keys=ON;")
-
-    conn.execute("""
-    CREATE TABLE IF NOT EXISTS projects(
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      name TEXT NOT NULL,
-      meta_json TEXT DEFAULT '{}',
-      created_at INTEGER NOT NULL
-    );
-    """)
-
-    conn.execute("""
-    CREATE TABLE IF NOT EXISTS artifacts(
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      project_id INTEGER NOT NULL,
-      type TEXT NOT NULL,
-      title TEXT NOT NULL,
-      content_md TEXT NOT NULL,
-      content_json TEXT NOT NULL DEFAULT '{}',
-      hash TEXT NOT NULL,
-      created_at INTEGER NOT NULL,
-      updated_at INTEGER NOT NULL,
-      FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE CASCADE
-    );
-    """)
-
-    conn.execute("""
-    CREATE TABLE IF NOT EXISTS versions(
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      artifact_id INTEGER NOT NULL,
-      version_no INTEGER NOT NULL,
-      content_md TEXT NOT NULL,
-      content_json TEXT NOT NULL,
-      hash TEXT NOT NULL,
-      created_at INTEGER NOT NULL,
-      note TEXT DEFAULT '',
-      FOREIGN KEY(artifact_id) REFERENCES artifacts(id) ON DELETE CASCADE
-    );
-    """)
-
-    conn.execute("""
-    CREATE TABLE IF NOT EXISTS edges(
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      project_id INTEGER NOT NULL,
-      child_artifact_id INTEGER NOT NULL,
-      parent_artifact_id INTEGER NOT NULL,
-      created_at INTEGER NOT NULL,
-      FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE CASCADE,
-      FOREIGN KEY(child_artifact_id) REFERENCES artifacts(id) ON DELETE CASCADE,
-      FOREIGN KEY(parent_artifact_id) REFERENCES artifacts(id) ON DELETE CASCADE
-    );
-    """)
-
-    conn.commit()
-    conn.close()
-init_db()
-ensure_db_schema()
-
-def _table_cols(conn: sqlite3.Connection, table: str) -> set:
-    try:
-        rows = conn.execute(f"PRAGMA table_info({table});").fetchall()
-        return set([r[1] for r in rows])  # r[1] = column name
-    except Exception:
-        return set()
-
-
+    # 与 db() 行为保持一致，不在这里强制 WAL（某些环境会炸）
+    init_db()
 
 
 def now_ts() -> int:
@@ -315,48 +251,42 @@ def get_project_meta(project_id: int) -> Dict[str, Any]:
 
 
 def create_project(name: str, meta: Dict[str, Any]) -> int:
-    conn = db()
-    ts = now_ts()
-    cur = conn.execute(
-        "INSERT INTO projects(name, meta_json, created_at) VALUES(?,?,?)",
-        (name, json.dumps(meta, ensure_ascii=False), ts),
-    )
-    conn.commit()
-    pid = cur.lastrowid
-    conn.close()
-    return pid
+    with _DB_LOCK:
+        conn = db()
+        ts = now_ts()
+        cur = conn.execute(
+            "INSERT INTO projects(name, meta_json, created_at) VALUES(?,?,?)",
+            (name, json.dumps(meta, ensure_ascii=False), ts),
+        )
+        conn.commit()
+        pid = cur.lastrowid
+        conn.close()
+        return pid
 
 
 def list_artifacts(project_id: int) -> List[Dict[str, Any]]:
     conn = db()
     try:
-        try:
-            rows = conn.execute(
-                "SELECT id, type, title, hash, updated_at "
-                "FROM artifacts WHERE project_id=? ORDER BY updated_at DESC",
-                (project_id,),
-            ).fetchall()
-        except sqlite3.OperationalError:
-            # 旧库字段缺失/表缺失：自愈后重试一次
-            conn.close()
-            ensure_db_schema()
-            conn = db()
-            rows = conn.execute(
-                "SELECT id, type, title, hash, updated_at "
-                "FROM artifacts WHERE project_id=? ORDER BY updated_at DESC",
-                (project_id,),
-            ).fetchall()
-    finally:
-        try:
-            conn.close()
-        except Exception:
-            pass
+        rows = conn.execute(
+            "SELECT id, type, title, hash, updated_at "
+            "FROM artifacts WHERE project_id=? ORDER BY updated_at DESC",
+            (project_id,),
+        ).fetchall()
+    except sqlite3.OperationalError:
+        conn.close()
+        ensure_db_schema()
+        conn = db()
+        rows = conn.execute(
+            "SELECT id, type, title, hash, updated_at "
+            "FROM artifacts WHERE project_id=? ORDER BY updated_at DESC",
+            (project_id,),
+        ).fetchall()
+    conn.close()
 
     out = []
     for r in rows:
         out.append({"id": r[0], "type": r[1], "title": r[2], "hash": r[3], "updated_at": r[4]})
     return out
-
 
 
 def get_artifact(project_id: int, a_type: str) -> Optional[Dict[str, Any]]:
@@ -392,16 +322,17 @@ def get_versions(artifact_id: int) -> List[Dict[str, Any]]:
 
 
 def set_edges(project_id: int, child_id: int, parent_ids: List[int]):
-    conn = db()
-    conn.execute("DELETE FROM edges WHERE project_id=? AND child_artifact_id=?", (project_id, child_id))
-    ts = now_ts()
-    for pid in parent_ids:
-        conn.execute(
-            "INSERT INTO edges(project_id, child_artifact_id, parent_artifact_id, created_at) VALUES(?,?,?,?)",
-            (project_id, child_id, pid, ts),
-        )
-    conn.commit()
-    conn.close()
+    with _DB_LOCK:
+        conn = db()
+        conn.execute("DELETE FROM edges WHERE project_id=? AND child_artifact_id=?", (project_id, child_id))
+        ts = now_ts()
+        for pid in parent_ids:
+            conn.execute(
+                "INSERT INTO edges(project_id, child_artifact_id, parent_artifact_id, created_at) VALUES(?,?,?,?)",
+                (project_id, child_id, pid, ts),
+            )
+        conn.commit()
+        conn.close()
 
 
 def upsert_artifact(
@@ -415,7 +346,6 @@ def upsert_artifact(
 ) -> Dict[str, Any]:
     existing = get_artifact(project_id, a_type)
 
-    # 父hash
     parent_hashes: List[str] = []
     for pid in parent_ids:
         conn = db()
@@ -427,43 +357,43 @@ def upsert_artifact(
     new_hash = compute_hash(content_md, content_json, parent_hashes)
     ts = now_ts()
 
-    conn = db()
-    if existing:
-        # 写入版本表（旧版本）
-        cur_ver = conn.execute("SELECT MAX(version_no) FROM versions WHERE artifact_id=?", (existing["id"],)).fetchone()
-        next_ver = (cur_ver[0] or 0) + 1
-        conn.execute(
-            "INSERT INTO versions(artifact_id, version_no, content_md, content_json, hash, created_at, note) "
-            "VALUES(?,?,?,?,?,?,?)",
-            (
-                existing["id"],
-                next_ver,
-                existing["content_md"],
-                json.dumps(existing["content_json"], ensure_ascii=False),
-                existing["hash"],
-                ts,
-                note or "auto-save",
-            ),
-        )
-        conn.execute(
-            "UPDATE artifacts SET title=?, content_md=?, content_json=?, hash=?, updated_at=? "
-            "WHERE id=? AND project_id=?",
-            (title, content_md, json.dumps(content_json, ensure_ascii=False), new_hash, ts, existing["id"], project_id),
-        )
-        conn.commit()
-        aid = existing["id"]
-    else:
-        cur = conn.execute(
-            "INSERT INTO artifacts(project_id, type, title, content_md, content_json, hash, created_at, updated_at) "
-            "VALUES(?,?,?,?,?,?,?,?)",
-            (project_id, a_type, title, content_md, json.dumps(content_json, ensure_ascii=False), new_hash, ts, ts),
-        )
-        conn.commit()
-        aid = cur.lastrowid
-    conn.close()
+    with _DB_LOCK:
+        conn = db()
+        if existing:
+            cur_ver = conn.execute("SELECT MAX(version_no) FROM versions WHERE artifact_id=?", (existing["id"],)).fetchone()
+            next_ver = (cur_ver[0] or 0) + 1
+            conn.execute(
+                "INSERT INTO versions(artifact_id, version_no, content_md, content_json, hash, created_at, note) "
+                "VALUES(?,?,?,?,?,?,?)",
+                (
+                    existing["id"],
+                    next_ver,
+                    existing["content_md"],
+                    json.dumps(existing["content_json"], ensure_ascii=False),
+                    existing["hash"],
+                    ts,
+                    note or "auto-save",
+                ),
+            )
+            conn.execute(
+                "UPDATE artifacts SET title=?, content_md=?, content_json=?, hash=?, updated_at=? "
+                "WHERE id=? AND project_id=?",
+                (title, content_md, json.dumps(content_json, ensure_ascii=False), new_hash, ts, existing["id"], project_id),
+            )
+            conn.commit()
+        else:
+            conn.execute(
+                "INSERT INTO artifacts(project_id, type, title, content_md, content_json, hash, created_at, updated_at) "
+                "VALUES(?,?,?,?,?,?,?,?)",
+                (project_id, a_type, title, content_md, json.dumps(content_json, ensure_ascii=False), new_hash, ts, ts),
+            )
+            conn.commit()
+        conn.close()
 
-    set_edges(project_id, aid, parent_ids)
-    return get_artifact(project_id, a_type)
+    a = get_artifact(project_id, a_type)
+    if a:
+        set_edges(project_id, a["id"], parent_ids)
+    return a
 
 
 # ---------------------------
@@ -492,8 +422,8 @@ DEP_RULES = {
     "lesson_plan": ["calendar"],
     "assessment": ["syllabus"],
     "review": ["assessment", "syllabus"],
-    "report": ["syllabus"],      # 可扩展加入成绩
-    "manual": ["lesson_plan"],   # 可选加证据
+    "report": ["syllabus"],
+    "manual": ["lesson_plan"],
     "evidence": [],
     "vge": [],
     "overview": [],
@@ -536,6 +466,150 @@ def extract_text_from_upload(file) -> str:
         return ""
 
 
+def extract_pdf_tables(upload_file) -> List[Dict[str, Any]]:
+    """
+    尝试从 PDF 抽取表格，返回：
+    [
+      {"page": 12, "tables": [ [ [cell, ...], ... ], ... ]},
+      ...
+    ]
+    """
+    if pdfplumber is None:
+        return []
+    upload_file.seek(0)
+    out: List[Dict[str, Any]] = []
+    try:
+        with pdfplumber.open(upload_file) as pdf:
+            for i, p in enumerate(pdf.pages, start=1):
+                try:
+                    tabs = p.extract_tables() or []
+                except Exception:
+                    tabs = []
+                good_tabs = []
+                for t in tabs:
+                    # 过滤掉太小/太碎的
+                    if not t or len(t) < 2:
+                        continue
+                    max_cols = max([len(r) for r in t if r] + [0])
+                    if max_cols >= 3 and len(t) >= 3:
+                        good_tabs.append(t)
+                if good_tabs:
+                    out.append({"page": i, "tables": good_tabs})
+    except Exception:
+        return []
+    return out
+
+
+def table_to_dataframe(table_2d: List[List[Any]]) -> Optional["pd.DataFrame"]:
+    if pd is None:
+        return None
+    if not table_2d:
+        return pd.DataFrame()
+    # 取第一行为表头（若空则给默认）
+    header = table_2d[0]
+    header = [(h or "").strip() if isinstance(h, str) else (str(h) if h is not None else "") for h in header]
+    if all([h == "" for h in header]):
+        header = [f"col{i+1}" for i in range(len(header))]
+    rows = table_2d[1:]
+    # 补齐列数
+    ncol = len(header)
+    norm_rows = []
+    for r in rows:
+        r = r or []
+        rr = list(r)[:ncol] + [""] * max(0, ncol - len(r))
+        norm_rows.append(rr)
+    return pd.DataFrame(norm_rows, columns=header)
+
+
+def guess_course_support_matrix(tables_pack: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """
+    尝试在抽到的表格里猜“课程-毕业要求支撑矩阵”
+    输出：
+    {
+      "found": bool,
+      "hint": "...",
+      "matrix": [ {"course": "...", "supports": {"1.1":"H", "2.3":"M", ...}}, ... ],
+      "raw_tables": [...]
+    }
+    """
+    res = {"found": False, "hint": "未自动识别到支撑矩阵（可手工录入/修正）", "matrix": [], "raw_tables": []}
+    if not tables_pack:
+        return res
+
+    # 经验：支撑矩阵往往表头含“毕业要求/指标点/达成/支撑/H/M/L”等字样
+    key_words = ["毕业要求", "指标", "支撑", "达成", "H", "M", "L"]
+    candidates = []
+
+    for pack in tables_pack:
+        page = pack["page"]
+        for t in pack["tables"]:
+            flat = " ".join([" ".join([(c or "") for c in (r or [])]) for r in t if r])
+            hit = sum([1 for k in key_words if k in flat])
+            if hit >= 2:
+                candidates.append({"page": page, "table": t, "hit": hit})
+
+    if not candidates:
+        res["raw_tables"] = tables_pack
+        return res
+
+    candidates.sort(key=lambda x: x["hit"], reverse=True)
+    best = candidates[0]
+    res["found"] = True
+    res["hint"] = f"自动挑选了第 {best['page']} 页的疑似支撑矩阵（命中关键词数={best['hit']}）。请在下方确认/修正。"
+    res["raw_tables"] = tables_pack
+
+    # 先不做复杂智能解析：把 best table 原样交给用户编辑确认
+    res["best_table"] = {"page": best["page"], "table": best["table"]}
+    return res
+
+
+def extract_training_plan_checklist(text: str) -> Dict[str, Any]:
+    """
+    从文本粗抽一些清单字段（可编辑，最终以用户确认为准）
+    """
+    # 简单正则：培养目标通常“培养目标/目标”附近；毕业要求通常“毕业要求”附近
+    major = ""
+    grade = ""
+    # 从类似“2024版/2024级”等中猜年级
+    m = re.search(r"(\d{2,4})级", text)
+    if m:
+        grade = m.group(1)
+
+    # 专业名称猜测
+    m2 = re.search(r"(材料成型及控制工程|机械工程|电气工程及其自动化|计算机科学与技术|土木工程|航空航天|测控技术与仪器)", text)
+    if m2:
+        major = m2.group(1)
+
+    # 粗提“培养目标”段落
+    goals = []
+    m3 = re.search(r"(培养目标[\s\S]{0,2000}?)(毕业要求|三、|四、|五、|课程体系|$)", text)
+    if m3:
+        chunk = m3.group(1)
+        for line in chunk.splitlines():
+            line = line.strip()
+            if re.match(r"^(\d+[\.\、]|[-•])", line):
+                goals.append(re.sub(r"^(\d+[\.\、]|[-•])\s*", "", line))
+
+    # 粗提“毕业要求”编号行
+    outcomes = []
+    # 找到“毕业要求”后 2000 字内的 “1.”、“2.” 等
+    m4 = re.search(r"(毕业要求[\s\S]{0,2500})", text)
+    if m4:
+        chunk = m4.group(1)
+        for line in chunk.splitlines():
+            line = line.strip()
+            mm = re.match(r"^(\d{1,2})[\.、]\s*(.+)$", line)
+            if mm:
+                outcomes.append({"no": mm.group(1), "name": mm.group(2).strip()})
+
+    return {
+        "major_guess": major,
+        "grade_guess": grade,
+        "goals_guess": goals[:8],
+        "outcomes_guess": outcomes[:20],
+    }
+
+
 # ---------------------------
 # 千问：文本生成（可选）
 # ---------------------------
@@ -558,6 +632,39 @@ def qwen_chat(
     if resp.status_code != 200:
         raise RuntimeError(f"LLM接口错误：{resp.status_code} {resp.text[:300]}")
     return resp.json()["choices"][0]["message"]["content"]
+
+
+# ---------------------------
+# 备份/还原（zip）
+# ---------------------------
+def safe_extract_zip(zip_bytes: bytes, target_dir: str):
+    os.makedirs(target_dir, exist_ok=True)
+    with zipfile.ZipFile(io.BytesIO(zip_bytes), "r") as z:
+        for member in z.infolist():
+            # 防路径穿越
+            p = os.path.normpath(member.filename).replace("\\", "/")
+            if p.startswith("../") or p.startswith("..\\") or p.startswith("/"):
+                continue
+            out_path = os.path.join(target_dir, p)
+            # 创建目录
+            if member.is_dir():
+                os.makedirs(out_path, exist_ok=True)
+                continue
+            os.makedirs(os.path.dirname(out_path), exist_ok=True)
+            with z.open(member, "r") as src, open(out_path, "wb") as dst:
+                dst.write(src.read())
+
+
+def make_backup_zip_bytes() -> bytes:
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", compression=zipfile.ZIP_DEFLATED) as z:
+        if os.path.exists(DATA_DIR):
+            for root, _, files in os.walk(DATA_DIR):
+                for fn in files:
+                    ap = os.path.join(root, fn)
+                    rel = os.path.relpath(ap, ".")
+                    z.write(ap, rel)
+    return buf.getvalue()
 
 
 # ---------------------------
@@ -599,6 +706,7 @@ def template_syllabus(
     credits: float,
     extra_req: str,
     tp_text: str,
+    support_points: Optional[List[str]] = None,
 ) -> Tuple[str, Dict[str, Any]]:
     outcomes = []
     for line in tp_text.splitlines():
@@ -612,6 +720,8 @@ def template_syllabus(
         {"id": "CO2", "desc": "能基于案例进行建模/分析并解释结果", "map_to": outcomes[1]},
         {"id": "CO3", "desc": "能够使用软件工具完成课程实践任务", "map_to": outcomes[min(3, len(outcomes) - 1)]},
     ]
+    sp = support_points or []
+    sp_md = "、".join(sp) if sp else "（尚未从培养方案支撑矩阵中确认，可手工补充）"
 
     md = f"""# 《{course_name}》课程教学大纲（严格依赖培养方案）
 
@@ -620,26 +730,35 @@ def template_syllabus(
 - 总学时：{hours_total}
 - 课程性质：专业课/方向课（示例）
 
-## 2. 课程目标（CO）与毕业要求映射
+## 2. 本课程支撑的毕业要求指标点（来自培养方案确认）
+- {sp_md}
+
+## 3. 课程目标（CO）与毕业要求映射
 | 课程目标 | 描述 | 对应毕业要求 |
 |---|---|---|
 """ + "\n".join([f"| {x['id']} | {x['desc']} | {x['map_to']} |" for x in obj]) + f"""
 
-## 3. 考核方式与比例（可调整）
+## 4. 考核方式与比例（可调整）
 - 平时：30%
 - 作业/项目：20%
 - 期末：50%
 
-## 4. 教学内容与学时分配（示例）
+## 5. 教学内容与学时分配（示例）
 - 第1章：导论（2学时）
 - 第2章：方法与工具（6学时）
 - 第3章：案例与实践（10学时）
 - 第4章：综合项目与答辩（{max(2, hours_total-18)}学时）
 
-## 5. 实践与要求
+## 6. 实践与要求
 {extra_req or "结合工程案例，强调表达与规范文档产出。"}
 """
-    js = {"course_name": course_name, "hours_total": hours_total, "credits": credits, "CO": obj}
+    js = {
+        "course_name": course_name,
+        "hours_total": hours_total,
+        "credits": credits,
+        "support_points": sp,
+        "CO": obj
+    }
     return md, js
 
 
@@ -777,7 +896,7 @@ def template_manual(course_name: str, lesson_json: Dict[str, Any], evidence_md: 
 
 
 # ---------------------------
-# 课堂证据（可选）：上传图片→生成摘要（不做身份识别）
+# 课堂证据（可选）
 # ---------------------------
 def img_to_dataurl(img: Image.Image) -> str:
     buf = io.BytesIO()
@@ -864,7 +983,6 @@ import html as _html
 
 
 def render_doc_preview(md: str):
-    # 安全：先 escape 再把换行转为 <br>
     safe = _html.escape(md).replace("\n", "<br>")
     st.markdown(f'<div class="docbox">{safe}</div>', unsafe_allow_html=True)
 
@@ -897,7 +1015,6 @@ def artifact_toolbar(a: Dict[str, Any]):
 
 
 def export_docx_bytes_plaintext(md: str) -> bytes:
-    # 极简导出：把 Markdown 当作纯文本段落
     try:
         from docx import Document as DocxDoc
     except Exception:
@@ -911,7 +1028,7 @@ def export_docx_bytes_plaintext(md: str) -> bytes:
 
 
 # ---------------------------
-# 新增：依赖图可视化（树 + Graphviz）
+# 依赖图可视化（树 + Graphviz）
 # ---------------------------
 DOC_ORDER = [
     ("training_plan", "培养方案"),
@@ -928,9 +1045,6 @@ DOC_ORDER = [
 
 
 def build_edges_for_project(project_id: int) -> List[Tuple[str, str]]:
-    """
-    返回 (parent_type, child_type) 列表（按真实 edges 表）
-    """
     conn = db()
     rows = conn.execute(
         "SELECT p.type, c.type "
@@ -948,7 +1062,6 @@ def render_dep_tree_from_db(project_id: int):
     st.subheader("依赖关系（树状）")
     docs_present = {t for (t, _) in DOC_ORDER if get_artifact(project_id, t) is not None}
 
-    # 用“规则 + 实际存在”混合展示（申报时更直观）
     for k, name in DOC_ORDER:
         if k in docs_present:
             a = get_artifact(project_id, k)
@@ -962,7 +1075,6 @@ def render_dep_tree_from_db(project_id: int):
 
 def build_dot_from_db(project_id: int) -> str:
     labels = {k: name for k, name in DOC_ORDER}
-
     nodes = set()
     edges = build_edges_for_project(project_id)
 
@@ -970,7 +1082,6 @@ def build_dot_from_db(project_id: int) -> str:
         nodes.add(p)
         nodes.add(c)
 
-    # 把“规则链上存在的文档”也加入，便于看全局
     for k, _ in DOC_ORDER:
         if get_artifact(project_id, k) is not None:
             nodes.add(k)
@@ -990,11 +1101,9 @@ def build_dot_from_db(project_id: int) -> str:
         else:
             lines.append(f'"{n}" [label="{lab}\\n(缺失)", fillcolor="#FFEBEE", style="rounded,dashed,filled"];')
 
-    # 实际依赖边
     for p, c in edges:
         lines.append(f'"{p}" -> "{c}";')
 
-    # 若没有实际 edges（用户还没生成依赖型文档），补一条规则边（虚线），让图不空
     if not edges:
         for child, reqs in DEP_RULES.items():
             for parent in reqs:
@@ -1027,12 +1136,9 @@ def page_dep_graph():
 
 
 # ---------------------------
-# 新增：模板化 DOCX 导出（docxtpl）
+# 模板化 DOCX 导出（docxtpl）
 # ---------------------------
 def docx_render_from_template(template_bytes: bytes, context: Dict[str, Any]) -> bytes:
-    """
-    使用 docxtpl 渲染 docx 模板（模板内写 {{ field }}）。
-    """
     if DocxTemplate is None:
         raise RuntimeError("当前环境未安装 docxtpl。请在 requirements.txt 添加：docxtpl jinja2 lxml")
     tpl = DocxTemplate(io.BytesIO(template_bytes))
@@ -1051,7 +1157,7 @@ def flatten_syllabus_to_context(project_meta: Dict[str, Any], syllabus: Optional
         "credits": "",
         "hours_total": "",
         "course_objectives": "",
-        "co_table": [],  # 可用于模板中循环
+        "co_table": [],
         "assessment_ratio": "平时30%+作业/项目20%+期末50%",
     }
     if syllabus:
@@ -1091,7 +1197,6 @@ def page_docx_export():
     rp = get_artifact(project_id, "report")
     mn = get_artifact(project_id, "manual")
 
-    # 选择导出目标（影响默认字段预填）
     doc_kind = st.selectbox(
         "选择要导出的正式文件类型",
         [
@@ -1124,7 +1229,6 @@ def page_docx_export():
             )
         return
 
-    # 默认 context（按类型拼装）
     base_ctx = flatten_syllabus_to_context(meta, sy)
     base_ctx.update(flatten_calendar_to_context(cal))
     base_ctx.update(
@@ -1157,7 +1261,6 @@ def page_docx_export():
         height=120,
     )
 
-    # 高级：CO 表、日历表 以 JSON 方式可编辑（便于你马上试模板循环）
     with st.expander("高级字段：CO表 / 日历表（JSON，可用于模板循环）", expanded=False):
         co_json_str = st.text_area(
             "co_table（JSON 数组）",
@@ -1170,7 +1273,6 @@ def page_docx_export():
             height=180,
         )
 
-    # 汇总 context
     ctx = dict(base_ctx)
     ctx.update(
         {
@@ -1228,6 +1330,9 @@ def topbar():
     )
 
 
+# 初始化 DB
+ensure_db_schema()
+
 topbar()
 st.write("")
 
@@ -1236,6 +1341,21 @@ run_mode = st.sidebar.radio("运行模式", ["演示模式（无API）", "在线
 st.sidebar.caption("演示模式不需要 Key；在线模式请在 Secrets 中配置 QWEN_API_KEY。")
 
 st.sidebar.markdown("## 数据库维护")
+cA, cB = st.sidebar.columns(2)
+with cA:
+    if st.button("备份(zip)"):
+        b = make_backup_zip_bytes()
+        st.sidebar.download_button("下载备份", data=b, file_name="teaching_agent_backup.zip")
+with cB:
+    restore = st.sidebar.file_uploader("还原(zip)", type=["zip"], label_visibility="collapsed")
+    if restore is not None:
+        try:
+            safe_extract_zip(restore.read(), ".")
+            st.sidebar.success("已还原（建议刷新/重启应用）")
+            st.rerun()
+        except Exception as e:
+            st.sidebar.error(f"还原失败：{e}")
+
 if st.sidebar.button("⚠️ 重置数据库（删除 app.db）"):
     try:
         for p in [DB_PATH, DB_PATH + "-shm", DB_PATH + "-wal"]:
@@ -1245,8 +1365,6 @@ if st.sidebar.button("⚠️ 重置数据库（删除 app.db）"):
         st.rerun()
     except Exception as e:
         st.sidebar.error(f"重置失败：{e}")
-
-
 
 
 st.sidebar.markdown("## 项目（专业/年级/课程体系）")
@@ -1322,11 +1440,52 @@ def page_overview():
     st.markdown("### 快速入口")
     c1, c2, c3 = st.columns(3)
     with c1:
-        st.markdown('<div class="card"><b>① 从底座开始</b><br>先生成/上传培养方案，再生成大纲。</div>', unsafe_allow_html=True)
+        st.markdown('<div class="card"><b>① 从底座开始</b><br>先识别/确认培养方案，再生成大纲。</div>', unsafe_allow_html=True)
     with c2:
         st.markdown('<div class="card"><b>② 看依赖链</b><br>到“依赖图可视化”查看可追溯关系。</div>', unsafe_allow_html=True)
     with c3:
         st.markdown('<div class="card"><b>③ 正式导出</b><br>到“模板化DOCX导出”用学校模板生成正式文件。</div>', unsafe_allow_html=True)
+
+
+# ============ NEW：培养方案识别确认 UI ============
+
+def dot_from_edge_rows(edge_rows: List[Dict[str, str]]) -> str:
+    lines = [
+        "digraph G {",
+        'rankdir="LR";',
+        'node [shape=box, style="rounded,filled", fillcolor="#ffffff"];',
+        'edge [color="#64748b"];'
+    ]
+    for e in edge_rows:
+        s = (e.get("source") or "").strip()
+        t = (e.get("target") or "").strip()
+        if s and t:
+            lines.append(f'"{s}" -> "{t}";')
+    lines.append("}")
+    return "\n".join(lines)
+
+
+def render_table_editor(table_2d: List[List[Any]], key: str):
+    """
+    返回用户编辑后的 table_2d
+    """
+    if pd is None:
+        s = st.text_area("表格（JSON，可编辑）", value=json.dumps(table_2d, ensure_ascii=False, indent=2), height=220, key=key)
+        try:
+            return json.loads(s) if s.strip() else table_2d
+        except Exception:
+            st.warning("JSON 解析失败，已保留原表。")
+            return table_2d
+
+    df = table_to_dataframe(table_2d)
+    if df is None:
+        return table_2d
+    edited = st.data_editor(df, use_container_width=True, num_rows="dynamic", key=key)
+    # 转回 2d（含表头）
+    new_table = [list(edited.columns)]
+    for _, row in edited.iterrows():
+        new_table.append([("" if pd.isna(x) else str(x)) for x in list(row.values)])
+    return new_table
 
 
 def page_training_plan():
@@ -1335,12 +1494,13 @@ def page_training_plan():
     render_depbar(project_id, "training_plan")
 
     st.markdown("### 培养方案（底座）")
-    st.caption("①一键生成示例；②上传已有培养方案抽取文本；③在线编辑并保存版本。")
+    st.caption("推荐：上传培养方案 → 自动识别 → 识别清单确认/修正 → 保存（结构化底座）。")
 
-    tab1, tab2, tab3, tab4 = st.tabs(["生成/上传", "预览", "编辑", "版本/导出"])
+    tab1, tab2, tab3, tab4 = st.tabs(["生成/上传&识别确认", "预览", "编辑", "版本/导出"])
 
     with tab1:
         col1, col2 = st.columns([1, 1])
+
         with col1:
             st.markdown("#### 方式A：一键生成（演示/快速）")
             major = st.text_input("专业", value="材料成型及控制工程", key="tp_major")
@@ -1353,7 +1513,7 @@ def page_training_plan():
                     "training_plan",
                     f"{grade}级《{major}》培养方案",
                     md,
-                    {"major": major, "grade": grade, "course_group": group},
+                    {"major": major, "grade": grade, "course_group": group, "confirmed": True},
                     [],
                     note="generate",
                 )
@@ -1361,32 +1521,196 @@ def page_training_plan():
                 st.rerun()
 
         with col2:
-            st.markdown("#### 方式B：上传已有培养方案（建议用于申报）")
+            st.markdown("#### 方式B：上传已有培养方案（识别→确认→保存）")
             up = st.file_uploader("上传培养方案文件", type=["pdf", "doc", "docx", "txt"], key="tp_upload")
-            if up is not None and st.button("抽取并保存为培养方案", key="tp_extract"):
+
+            use_ai_fix = st.checkbox("（可选）用千问对识别结果做纠错/补全", value=False, disabled=not run_mode.startswith("在线"))
+            if up is not None and st.button("开始识别（生成清单）", key="tp_start_extract"):
                 txt = extract_text_from_upload(up)
-                if not txt.strip():
-                    st.error("未抽取到文本，请换更清晰的PDF或DOCX。")
+                tables_pack = extract_pdf_tables(up) if (up.name.lower().endswith(".pdf")) else []
+                checklist = extract_training_plan_checklist(txt)
+                matrix_guess = guess_course_support_matrix(tables_pack)
+
+                st.session_state["tp_extract"] = {
+                    "source": up.name,
+                    "text": txt,
+                    "tables_pack": tables_pack,
+                    "checklist": checklist,
+                    "matrix_guess": matrix_guess,
+                    # 初始边表：空，靠用户补
+                    "course_edges": [
+                        {"source": "先修课程A", "target": "后续课程B"},
+                    ],
+                }
+                st.success("已生成识别清单，请在下方确认/修正，然后再保存。")
+
+            if "tp_extract" in st.session_state:
+                ex = st.session_state["tp_extract"]
+                st.markdown("---")
+                st.markdown("### 识别清单（请确认/修正）")
+                st.caption("原则：系统先尽力抽取，最终以你的确认结果为准；确认后的结构化信息会用于后续大纲自动填充。")
+
+                ck = ex["checklist"]
+                colA, colB, colC = st.columns(3)
+                with colA:
+                    major2 = st.text_input("专业（可修正）", value=ck.get("major_guess", ""), key="tp_major_fix")
+                    grade2 = st.text_input("年级（可修正）", value=ck.get("grade_guess", ""), key="tp_grade_fix")
+                with colB:
+                    course_group2 = st.text_input("课程体系/方向（可补充）", value="", key="tp_group_fix")
+                    confirmed_flag = st.checkbox("我已确认以上信息大体正确", value=False, key="tp_confirm_flag")
+                with colC:
+                    st.markdown("**识别来源**")
+                    st.code(ex.get("source", ""), language="text")
+
+                st.markdown("#### 1) 培养目标（可编辑）")
+                goals_init = ck.get("goals_guess", []) or []
+                goals_text = st.text_area(
+                    "每行一个目标（可增删/改写）",
+                    value="\n".join(goals_init) if goals_init else "",
+                    height=140,
+                    key="tp_goals_edit",
+                )
+                goals_final = [x.strip() for x in goals_text.splitlines() if x.strip()]
+
+                st.markdown("#### 2) 毕业要求（可编辑）")
+                out_init = ck.get("outcomes_guess", []) or []
+                if pd is not None:
+                    df_out = pd.DataFrame(out_init) if out_init else pd.DataFrame(columns=["no", "name"])
+                    df_out2 = st.data_editor(df_out, use_container_width=True, num_rows="dynamic", key="tp_out_editor")
+                    outcomes_final = [{"no": str(r["no"]), "name": str(r["name"])} for _, r in df_out2.iterrows() if str(r.get("no","")).strip()]
                 else:
-                    md = "# 培养方案（上传抽取）\n\n" + txt
-                    a = upsert_artifact(
-                        project_id,
-                        "training_plan",
-                        f"培养方案（上传抽取）-{up.name}",
-                        md,
-                        {"source": up.name},
-                        [],
-                        note="upload",
+                    outcomes_json = st.text_area(
+                        "毕业要求 JSON（数组）",
+                        value=json.dumps(out_init, ensure_ascii=False, indent=2),
+                        height=160,
+                        key="tp_out_json",
                     )
-                    st.success("已保存培养方案（上传抽取版）")
+                    try:
+                        outcomes_final = json.loads(outcomes_json) if outcomes_json.strip() else []
+                    except Exception:
+                        outcomes_final = out_init
+
+                st.markdown("#### 3) 课程-毕业要求支撑矩阵（表格→可编辑）")
+                mg = ex["matrix_guess"]
+                st.info(mg.get("hint", ""))
+                best = mg.get("best_table", None)
+
+                # 编辑“疑似矩阵表”
+                edited_best_table = None
+                if best and best.get("table"):
+                    st.markdown(f"**疑似矩阵表（第 {best.get('page')} 页）**：请直接改表格内容（包括表头）")
+                    edited_best_table = render_table_editor(best["table"], key="tp_matrix_table_editor")
+                else:
+                    st.warning("未抽到疑似支撑矩阵表格。你可以：1) 在 PDF 更清晰时再试；2) 下面手工录入本课程支撑点。")
+
+                st.markdown("#### 4) 课程关系图（边表→可编辑 + Graphviz 预览）")
+                st.caption("很多 PDF 导图是图片，不易自动还原。这里用可编辑“边表”更可靠：你只需填“先修→后续”。")
+
+                edges = ex.get("course_edges", [{"source": "", "target": ""}])
+                if pd is not None:
+                    df_e = pd.DataFrame(edges)
+                    df_e2 = st.data_editor(df_e, use_container_width=True, num_rows="dynamic", key="tp_edges_editor")
+                    edges_final = [{"source": str(r["source"]), "target": str(r["target"])} for _, r in df_e2.iterrows()]
+                else:
+                    edges_json = st.text_area(
+                        "边表 JSON（数组）",
+                        value=json.dumps(edges, ensure_ascii=False, indent=2),
+                        height=160,
+                        key="tp_edges_json",
+                    )
+                    try:
+                        edges_final = json.loads(edges_json) if edges_json.strip() else edges
+                    except Exception:
+                        edges_final = edges
+
+                dot = dot_from_edge_rows(edges_final)
+                st.graphviz_chart(dot)
+
+                st.markdown("#### 5) 从支撑矩阵中提取“某门课程的支撑指标点”（用于大纲默认填充）")
+                st.caption("如果你在上面的矩阵表里能看到课程行，可以在这里选择课程并勾选支撑点。")
+
+                # 简单：让用户手工录入当前项目“默认课程”的支撑点（后面大纲页可选课程名再映射）
+                support_points_text = st.text_input(
+                    "当前要重点支持的课程指标点（逗号分隔，如 1.1,2.3,3.2）",
+                    value="",
+                    key="tp_support_points_text",
+                )
+                support_points = [x.strip() for x in re.split(r"[，,;\s]+", support_points_text) if x.strip()]
+
+                st.markdown("---")
+                if st.button("✅ 确认并保存为培养方案底座", type="primary", disabled=not confirmed_flag):
+                    # 可选：用千问做一次“结构补全”（只对文本，不强依赖）
+                    text_final = ex.get("text", "") or ""
+                    if use_ai_fix and get_qwen_key():
+                        try:
+                            sys = "你是高校培养方案抽取与校正助手。输出必须是JSON+简短说明。"
+                            user = f"""
+请对以下培养方案文本做结构化抽取并校正，重点抽取：培养目标、毕业要求列表（含编号与名称）、任何出现的“课程-毕业要求支撑关系”提示。
+返回JSON字段：goals(list[str]), outcomes(list[{{no,name}}]), notes(str)。
+文本（截断）：{text_final[:8000]}
+"""
+                            out = qwen_chat([{"role": "system", "content": sys}, {"role": "user", "content": user}], temperature=0.2, max_tokens=1200)
+                            m = re.search(r"\{[\s\S]*\}", out)
+                            if m:
+                                js_ai = json.loads(m.group(0))
+                                # 仅在用户未填时补充
+                                if not goals_final and js_ai.get("goals"):
+                                    goals_final = js_ai.get("goals", [])
+                                if (not outcomes_final) and js_ai.get("outcomes"):
+                                    outcomes_final = js_ai.get("outcomes", [])
+                        except Exception as e:
+                            st.warning(f"AI校正失败（忽略，不影响保存）：{e}")
+
+                    # 组装结构化 content_json（确认版）
+                    content_json = {
+                        "source": ex.get("source", ""),
+                        "confirmed": True,
+                        "major": major2,
+                        "grade": grade2,
+                        "course_group": course_group2,
+                        "goals": goals_final,
+                        "outcomes": outcomes_final,
+                        "support_points_default": support_points,  # 默认/示例：可用于大纲
+                        "support_matrix_best_table": {
+                            "page": best.get("page") if best else None,
+                            "table": edited_best_table if edited_best_table is not None else (best.get("table") if best else None),
+                        },
+                        "course_edges": edges_final,
+                    }
+
+                    # 生成一份更“可读”的 md（方便预览）
+                    md = f"# 培养方案（上传识别-已确认）\n\n"
+                    md += f"- 专业：{major2}\n- 年级：{grade2}\n- 课程体系/方向：{course_group2}\n\n"
+                    md += "## 一、培养目标（确认版）\n" + ("\n".join([f"- {x}" for x in goals_final]) if goals_final else "- （未填）") + "\n\n"
+                    md += "## 二、毕业要求（确认版）\n" + ("\n".join([f"- {o.get('no','')}. {o.get('name','')}" for o in outcomes_final]) if outcomes_final else "- （未填）") + "\n\n"
+                    md += "## 三、课程支撑指标点（默认/示例）\n" + (("、".join(support_points)) if support_points else "（未填）") + "\n\n"
+                    md += "## 四、原始抽取文本（供追溯）\n\n" + (ex.get("text","")[:20000] if ex.get("text") else "")
+
+                    title = f"培养方案（确认版）-{ex.get('source','上传')}"
+                    a2 = upsert_artifact(project_id, "training_plan", title, md, content_json, [], note="upload-confirm")
+                    st.success("已保存“确认版培养方案底座”。后续生成大纲会优先使用结构化字段。")
+                    st.session_state.pop("tp_extract", None)
                     st.rerun()
+
+                if st.button("清除本次识别结果（不保存）"):
+                    st.session_state.pop("tp_extract", None)
+                    st.info("已清除。")
 
     with tab2:
         if not a:
-            st.info("暂无培养方案。请先生成或上传。")
+            st.info("暂无培养方案。请先生成或上传并确认。")
         else:
             artifact_toolbar(a)
             render_doc_preview(a["content_md"])
+            st.markdown("#### 结构化（确认版）JSON")
+            st.json(a.get("content_json") or {})
+
+            # 额外展示：课程关系图
+            cj = a.get("content_json") or {}
+            edges = cj.get("course_edges", []) or []
+            if edges:
+                st.markdown("#### 课程关系图（Graphviz）")
+                st.graphviz_chart(dot_from_edge_rows(edges))
 
     with tab3:
         if not a:
@@ -1395,7 +1719,7 @@ def page_training_plan():
             edited = md_textarea("在线编辑培养方案（支持直接修改）", a["content_md"], key="tp_edit")
             note = st.text_input("保存说明（可选）", value="edit", key="tp_note")
             if st.button("保存修改（生成新版本）", type="primary", key="tp_save"):
-                a = upsert_artifact(project_id, "training_plan", a["title"], edited, a["content_json"], [], note=note)
+                a2 = upsert_artifact(project_id, "training_plan", a["title"], edited, a["content_json"], [], note=note)
                 st.success("已保存。后续依赖文件将引用更新后的培养方案。")
                 st.rerun()
 
@@ -1421,17 +1745,27 @@ def page_syllabus():
     a = get_artifact(project_id, "syllabus")
 
     st.markdown("### 课程教学大纲：严格依赖培养方案（可验证）")
-    st.caption("推荐流程：培养方案 → 大纲 → 日历 → 教案 → 试卷/审核 → 达成报告 → 授课手册。")
+    st.caption("增强：若培养方案已确认结构化支撑点，将自动填充到大纲。并支持上传已有大纲做对齐检查（简版）。")
 
-    tab1, tab2, tab3, tab4, tab5 = st.tabs(["填写/生成", "预览", "编辑", "版本/导出", "依赖追溯"])
+    tab1, tab2, tab3, tab4, tab5 = st.tabs(["填写/生成", "上传已有大纲&对齐检查", "预览", "编辑", "版本/导出"])
 
     with tab1:
         if not tp:
-            st.warning("缺少上游依赖：培养方案。请先到“培养方案（底座）”模块生成/上传。")
+            st.warning("缺少上游依赖：培养方案。请先到“培养方案（底座）”模块上传并确认。")
 
         course_name = st.text_input("课程名称", value="数值模拟在材料成型中的应用", key="sy_course")
         credits = st.number_input("学分", min_value=0.5, max_value=10.0, value=2.0, step=0.5)
         hours_total = st.number_input("总学时", min_value=8, max_value=128, value=32, step=2)
+
+        tp_json = (tp.get("content_json") if tp else {}) or {}
+        default_support = tp_json.get("support_points_default", []) or []
+        support_points_text = st.text_input(
+            "本课程支撑的毕业要求指标点（可改，逗号分隔）",
+            value=",".join(default_support) if default_support else "",
+            key="sy_support_points",
+        )
+        support_points = [x.strip() for x in re.split(r"[，,;\s]+", support_points_text) if x.strip()]
+
         extra = st.text_area(
             "对大纲的补充要求（考核比例/教学方法/实践要求等）",
             value="课程目标3-5个；平时30%+大作业20%+期末50%；强调工程表达与案例；写明CO-毕业要求映射。",
@@ -1448,10 +1782,11 @@ def page_syllabus():
                     sys = "你是高校教学文件撰写专家，输出必须规范、可落地。"
                     user = f"""请依据以下培养方案，为课程《{course_name}》撰写教学大纲。
 要求：给出课程信息、课程目标CO(3-5)、CO-毕业要求映射、学时分配、教学方法、考核比例、实践要求。
+并明确写出本课程支撑的毕业要求指标点：{support_points}
 补充要求：{extra}
 培养方案文本：
 {tp_text[:5000]}
-输出：先输出 JSON（字段：course_name, credits, hours_total, CO[{id,desc,map_to}], assessment, outline），然后输出一份Markdown大纲。
+输出：先输出 JSON（字段：course_name, credits, hours_total, support_points, CO[{id,desc,map_to}], assessment, outline），然后输出一份Markdown大纲。
 """
                     try:
                         out = qwen_chat(
@@ -1470,16 +1805,61 @@ def page_syllabus():
                         md = out
                     except Exception as e:
                         st.warning(f"AI生成失败，已回退到模板生成：{e}")
-                        md, js = template_syllabus(course_name, int(hours_total), float(credits), extra, tp_text)
+                        md, js = template_syllabus(course_name, int(hours_total), float(credits), extra, tp_text, support_points)
                 else:
-                    md, js = template_syllabus(course_name, int(hours_total), float(credits), extra, tp_text)
+                    md, js = template_syllabus(course_name, int(hours_total), float(credits), extra, tp_text, support_points)
 
                 parents = [tp["id"]]
-                a = upsert_artifact(project_id, "syllabus", f"《{course_name}》教学大纲", md, js, parents, note="generate")
+                a2 = upsert_artifact(project_id, "syllabus", f"《{course_name}》教学大纲", md, js, parents, note="generate")
                 st.success("已保存教学大纲（后续日历/教案/试卷等将依赖它）")
                 st.rerun()
 
     with tab2:
+        if not tp:
+            st.warning("请先有培养方案（确认版更好），否则对齐检查意义不大。")
+        st.markdown("#### 上传已有教学大纲（PDF/DOC/DOCX/TXT）")
+        up2 = st.file_uploader("上传已有课程教学大纲", type=["pdf", "doc", "docx", "txt"], key="sy_upload_existing")
+        if up2 is not None and st.button("分析并给出对齐检查（简版）", key="sy_check_align"):
+            sy_txt = extract_text_from_upload(up2)
+            tp_json = (tp.get("content_json") if tp else {}) or {}
+            tp_outcomes = tp_json.get("outcomes", []) or []
+            tp_support_default = tp_json.get("support_points_default", []) or []
+
+            # 简单对齐：是否包含默认支撑点字符串
+            missing = []
+            for p in tp_support_default:
+                if p and (p not in sy_txt):
+                    missing.append(p)
+
+            st.markdown("### 对齐检查结果（简版）")
+            st.write(f"- 大纲文件：{up2.name}")
+            st.write(f"- 培养方案默认支撑点：{', '.join(tp_support_default) if tp_support_default else '（未设置）'}")
+            if tp_support_default and missing:
+                st.warning("大纲文本中未明显出现以下支撑指标点（可能缺失或表述不一致）：")
+                st.write(", ".join(missing))
+            else:
+                st.success("大纲中已包含/或无需检查默认支撑点。")
+
+            # 建议（演示版）：在线模式可让 LLM 给修订建议
+            if run_mode.startswith("在线") and get_qwen_key():
+                if st.button("用千问给出修订建议（可选）", key="sy_llm_suggest"):
+                    sys = "你是教学大纲合规审校专家。输出简明的差异清单与建议改写段落。"
+                    user = f"""
+请基于培养方案毕业要求（可能含指标点）与该教学大纲文本，检查一致性与不足，并给出可执行的修订建议。
+培养方案（结构化摘要）：{json.dumps(tp_json, ensure_ascii=False)[:6000]}
+教学大纲文本（截断）：{sy_txt[:8000]}
+输出：1) 差异清单（条目化） 2) 建议修订段落（可直接替换） 3) 一句话总体评价。
+"""
+                    try:
+                        out = qwen_chat([{"role":"system","content":sys},{"role":"user","content":user}], temperature=0.2, max_tokens=1200)
+                        st.markdown(out)
+                    except Exception as e:
+                        st.error(f"生成失败：{e}")
+
+            with st.expander("查看大纲抽取文本（截断）", expanded=False):
+                st.code(sy_txt[:12000], language="text")
+
+    with tab3:
         if not a:
             st.info("暂无教学大纲。请在“填写/生成”中生成并保存。")
         else:
@@ -1490,10 +1870,12 @@ def page_syllabus():
             c1.metric("课程", js.get("course_name", "-"))
             c2.metric("学分", js.get("credits", "-"))
             c3.metric("总学时", js.get("hours_total", "-"))
+            st.markdown("#### 支撑指标点")
+            st.write("、".join(js.get("support_points", []) or []) or "（未填）")
             st.markdown("#### 大纲正文")
             render_doc_preview(a["content_md"])
 
-    with tab3:
+    with tab4:
         if not a:
             st.info("暂无教学大纲。")
         else:
@@ -1501,11 +1883,11 @@ def page_syllabus():
             note = st.text_input("保存说明（可选）", value="edit", key="sy_note")
             if st.button("保存修改（生成新版本）", type="primary", key="sy_save"):
                 parents = pick_parents_for(project_id, "syllabus")
-                a = upsert_artifact(project_id, "syllabus", a["title"], edited, a["content_json"], parents, note=note)
+                a2 = upsert_artifact(project_id, "syllabus", a["title"], edited, a["content_json"], parents, note=note)
                 st.success("已保存。")
                 st.rerun()
 
-    with tab4:
+    with tab5:
         if not a:
             st.info("暂无教学大纲。")
         else:
@@ -1521,25 +1903,6 @@ def page_syllabus():
                 data=json.dumps(a["content_json"], ensure_ascii=False, indent=2),
                 file_name="教学大纲.json",
             )
-
-    with tab5:
-        if not a:
-            st.info("暂无教学大纲。")
-        else:
-            st.markdown("#### 上游依赖（可验证）")
-            parents = pick_parents_for(project_id, "syllabus")
-            if not parents:
-                st.warning("未记录到依赖边。")
-            else:
-                conn = db()
-                rows = conn.execute(
-                    "SELECT id, type, title, hash FROM artifacts WHERE id IN (%s)"
-                    % ",".join(["?"] * len(parents)),
-                    parents,
-                ).fetchall()
-                conn.close()
-                for r in rows:
-                    st.write(f"- **{type_label(r[1])}**：{r[2]} ｜ hash={r[3][:16]}")
 
 
 def page_calendar():
@@ -1561,7 +1924,7 @@ def page_calendar():
             else:
                 md, js = template_calendar(sy["content_json"].get("course_name", "课程"), int(weeks), sy["content_json"])
                 parents = [sy["id"]]
-                a = upsert_artifact(
+                a2 = upsert_artifact(
                     project_id,
                     "calendar",
                     f"《{sy['content_json'].get('course_name','课程')}》教学日历",
@@ -1586,7 +1949,7 @@ def page_calendar():
             note = st.text_input("保存说明", value="edit", key="cal_note")
             if st.button("保存修改", type="primary", key="cal_save"):
                 parents = pick_parents_for(project_id, "calendar")
-                a = upsert_artifact(project_id, "calendar", a["title"], edited, a["content_json"], parents, note=note)
+                a2 = upsert_artifact(project_id, "calendar", a["title"], edited, a["content_json"], parents, note=note)
                 st.success("已保存。")
                 st.rerun()
     with tab4:
@@ -1621,7 +1984,7 @@ def page_lesson_plan():
                     course_name = sy["content_json"].get("course_name", "课程")
                 md, js = template_lesson_plan(course_name, cal["content_json"])
                 parents = [cal["id"]]
-                a = upsert_artifact(project_id, "lesson_plan", f"《{course_name}》教案", md, js, parents, note="generate")
+                a2 = upsert_artifact(project_id, "lesson_plan", f"《{course_name}》教案", md, js, parents, note="generate")
                 st.success("已保存教案。")
                 st.rerun()
 
@@ -1640,7 +2003,7 @@ def page_lesson_plan():
             note = st.text_input("保存说明", value="edit", key="lp_note")
             if st.button("保存修改", type="primary", key="lp_save"):
                 parents = pick_parents_for(project_id, "lesson_plan")
-                a = upsert_artifact(project_id, "lesson_plan", a["title"], edited, a["content_json"], parents, note=note)
+                a2 = upsert_artifact(project_id, "lesson_plan", a["title"], edited, a["content_json"], parents, note=note)
                 st.success("已保存。")
                 st.rerun()
 
@@ -1673,7 +2036,7 @@ def page_assessment():
                 course_name = sy["content_json"].get("course_name", "课程")
                 md, js = template_assessment(course_name, sy["content_json"])
                 parents = [sy["id"]]
-                a = upsert_artifact(project_id, "assessment", f"《{course_name}》试卷方案/题库", md, js, parents, note="generate")
+                a2 = upsert_artifact(project_id, "assessment", f"《{course_name}》试卷方案/题库", md, js, parents, note="generate")
                 st.success("已保存试卷方案。")
                 st.rerun()
 
@@ -1692,7 +2055,7 @@ def page_assessment():
             note = st.text_input("保存说明", value="edit", key="as_note")
             if st.button("保存修改", type="primary", key="as_save"):
                 parents = pick_parents_for(project_id, "assessment")
-                a = upsert_artifact(project_id, "assessment", a["title"], edited, a["content_json"], parents, note=note)
+                a2 = upsert_artifact(project_id, "assessment", a["title"], edited, a["content_json"], parents, note=note)
                 st.success("已保存。")
                 st.rerun()
 
@@ -1726,7 +2089,7 @@ def page_review():
                 course_name = sy["content_json"].get("course_name", "课程")
                 md, js = template_review_forms(course_name, ass["content_json"], sy["content_json"])
                 parents = [ass["id"], sy["id"]]
-                a = upsert_artifact(project_id, "review", f"《{course_name}》审核表集合", md, js, parents, note="generate")
+                a2 = upsert_artifact(project_id, "review", f"《{course_name}》审核表集合", md, js, parents, note="generate")
                 st.success("已保存审核表。")
                 st.rerun()
 
@@ -1745,7 +2108,7 @@ def page_review():
             note = st.text_input("保存说明", value="edit", key="rv_note")
             if st.button("保存修改", type="primary", key="rv_save"):
                 parents = pick_parents_for(project_id, "review")
-                a = upsert_artifact(project_id, "review", a["title"], edited, a["content_json"], parents, note=note)
+                a2 = upsert_artifact(project_id, "review", a["title"], edited, a["content_json"], parents, note=note)
                 st.success("已保存。")
                 st.rerun()
 
@@ -1782,7 +2145,7 @@ def page_report():
                 course_name = sy["content_json"].get("course_name", "课程")
                 md, js = template_report(course_name, sy["content_json"], note=note)
                 parents = [sy["id"]]
-                a = upsert_artifact(project_id, "report", f"《{course_name}》课程目标达成报告", md, js, parents, note="generate")
+                a2 = upsert_artifact(project_id, "report", f"《{course_name}》课程目标达成报告", md, js, parents, note="generate")
                 st.success("已保存达成报告。")
                 st.rerun()
 
@@ -1801,7 +2164,7 @@ def page_report():
             note2 = st.text_input("保存说明", value="edit", key="rp_note")
             if st.button("保存修改", type="primary", key="rp_save"):
                 parents = pick_parents_for(project_id, "report")
-                a = upsert_artifact(project_id, "report", a["title"], edited, a["content_json"], parents, note=note2)
+                a2 = upsert_artifact(project_id, "report", a["title"], edited, a["content_json"], parents, note=note2)
                 st.success("已保存。")
                 st.rerun()
 
@@ -1833,7 +2196,7 @@ def page_evidence():
             dataurl = img_to_dataurl(img)
             summary = qwen_vl_classroom_summary(dataurl, context)
             md = f"# 课堂过程证据摘要\n\n- 课堂内容：{context}\n\n{summary}\n"
-            a = upsert_artifact(
+            a2 = upsert_artifact(
                 project_id,
                 "evidence",
                 "课堂过程证据摘要",
@@ -1876,7 +2239,7 @@ def page_manual():
                 ev_md = ev["content_md"] if (use_ev and ev) else ""
                 md, js = template_manual(course_name, lp["content_json"], ev_md)
                 parents = pick_parents_for(project_id, "manual")
-                a = upsert_artifact(project_id, "manual", f"《{course_name}》授课手册", md, js, parents, note="generate")
+                a2 = upsert_artifact(project_id, "manual", f"《{course_name}》授课手册", md, js, parents, note="generate")
                 st.success("已保存授课手册。")
                 st.rerun()
 
@@ -1895,7 +2258,7 @@ def page_manual():
             note = st.text_input("保存说明", value="edit", key="mn_note")
             if st.button("保存修改", type="primary", key="mn_save"):
                 parents = pick_parents_for(project_id, "manual")
-                a = upsert_artifact(project_id, "manual", a["title"], edited, a["content_json"], parents, note=note)
+                a2 = upsert_artifact(project_id, "manual", a["title"], edited, a["content_json"], parents, note=note)
                 st.success("已保存。")
                 st.rerun()
 
@@ -1975,7 +2338,6 @@ ROUTES = {
     "docx_export": page_docx_export,
 }
 
-# Dispatch
 fn = ROUTES.get(current_type, page_overview)
 fn()
 
