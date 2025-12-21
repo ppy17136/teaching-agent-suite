@@ -135,10 +135,20 @@ inject_css()
 # 数据层：SQLite + 版本管理 + 依赖边
 # ---------------------------
 def db() -> sqlite3.Connection:
-    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
-    conn.execute("PRAGMA journal_mode=WAL;")
+    # 确保目录存在（云端偶发工作目录变化时更稳）
+    os.makedirs(DATA_DIR, exist_ok=True)
+
+    conn = sqlite3.connect(DB_PATH, check_same_thread=False, timeout=30)
     conn.execute("PRAGMA foreign_keys=ON;")
+    conn.execute("PRAGMA busy_timeout=5000;")  # 避免并发瞬时锁导致直接报错
+
+    # WAL 在某些环境可能不稳定，失败就降级到 DELETE
+    try:
+        conn.execute("PRAGMA journal_mode=WAL;")
+    except Exception:
+        conn.execute("PRAGMA journal_mode=DELETE;")
     return conn
+
 
 
 def init_db():
@@ -203,6 +213,55 @@ CREATE TABLE IF NOT EXISTS edges(
 
 
 init_db()
+ensure_db_schema()
+
+def _table_cols(conn: sqlite3.Connection, table: str) -> set:
+    try:
+        rows = conn.execute(f"PRAGMA table_info({table});").fetchall()
+        return set([r[1] for r in rows])  # r[1] = column name
+    except Exception:
+        return set()
+
+def ensure_db_schema():
+    """
+    解决云端/本地旧 app.db 导致的：
+    - no such table
+    - no such column
+    通过“补表 + 补列 + 回填默认值”自愈。
+    """
+    # 先确保基础表存在（你的 init_db 负责 CREATE TABLE IF NOT EXISTS）
+    init_db()
+
+    conn = db()
+    try:
+        # ---- projects: meta_json（你现在依赖它）
+        cols = _table_cols(conn, "projects")
+        if "meta_json" not in cols:
+            conn.execute("ALTER TABLE projects ADD COLUMN meta_json TEXT DEFAULT '{}';")
+
+        # ---- artifacts: content_json/hash/updated_at 等
+        cols = _table_cols(conn, "artifacts")
+        # 某些旧库可能没有 content_json / hash / updated_at
+        if "content_json" not in cols:
+            conn.execute("ALTER TABLE artifacts ADD COLUMN content_json TEXT NOT NULL DEFAULT '{}';")
+        if "hash" not in cols:
+            conn.execute("ALTER TABLE artifacts ADD COLUMN hash TEXT NOT NULL DEFAULT '';")
+        if "updated_at" not in cols:
+            conn.execute("ALTER TABLE artifacts ADD COLUMN updated_at INTEGER NOT NULL DEFAULT 0;")
+            # 回填：让 updated_at 至少等于 created_at
+            try:
+                conn.execute("UPDATE artifacts SET updated_at=created_at WHERE updated_at=0;")
+            except Exception:
+                pass
+
+        # ---- versions: note（你现在依赖它展示）
+        cols = _table_cols(conn, "versions")
+        if cols and "note" not in cols:
+            conn.execute("ALTER TABLE versions ADD COLUMN note TEXT DEFAULT '';")
+
+        conn.commit()
+    finally:
+        conn.close()
 
 
 def now_ts() -> int:
@@ -252,15 +311,34 @@ def create_project(name: str, meta: Dict[str, Any]) -> int:
 
 def list_artifacts(project_id: int) -> List[Dict[str, Any]]:
     conn = db()
-    rows = conn.execute(
-        "SELECT id, type, title, hash, updated_at FROM artifacts WHERE project_id=? ORDER BY updated_at DESC",
-        (project_id,),
-    ).fetchall()
-    conn.close()
+    try:
+        try:
+            rows = conn.execute(
+                "SELECT id, type, title, hash, updated_at "
+                "FROM artifacts WHERE project_id=? ORDER BY updated_at DESC",
+                (project_id,),
+            ).fetchall()
+        except sqlite3.OperationalError:
+            # 旧库字段缺失/表缺失：自愈后重试一次
+            conn.close()
+            ensure_db_schema()
+            conn = db()
+            rows = conn.execute(
+                "SELECT id, type, title, hash, updated_at "
+                "FROM artifacts WHERE project_id=? ORDER BY updated_at DESC",
+                (project_id,),
+            ).fetchall()
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
     out = []
     for r in rows:
         out.append({"id": r[0], "type": r[1], "title": r[2], "hash": r[3], "updated_at": r[4]})
     return out
+
 
 
 def get_artifact(project_id: int, a_type: str) -> Optional[Dict[str, Any]]:
