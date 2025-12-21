@@ -732,8 +732,12 @@ def render_depbar(project_id: int, a_type: str):
         unsafe_allow_html=True,
     )
 
+import html
+
 def render_doc_preview(md: str):
-    st.markdown(f'<div class="docbox">{md.replace("\\n","<br>")}</div>', unsafe_allow_html=True)
+    safe = html.escape(md).replace("\n", "<br>")
+    st.markdown(f'<div class="docbox">{safe}</div>', unsafe_allow_html=True)
+
 
 def md_textarea(label: str, value: str, height: int = 420, key: str = "") -> str:
     return st.text_area(label, value=value, height=height, key=key)
