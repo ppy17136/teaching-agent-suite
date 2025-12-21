@@ -1,4 +1,16 @@
 # -*- coding: utf-8 -*-
+"""
+教学智能体平台（单文件版 app.py）
+新增模块：
+1) 依赖图可视化（树状图 + Graphviz）
+2) 模板化 DOCX 导出（docxtpl 字段映射填充，支持上传模板 .docx）
+
+说明：
+- Graphviz：使用 st.graphviz_chart(dot)（无需系统安装 graphviz）
+- 模板导出：优先使用 docxtpl；未安装则提示并回退“简版导出”
+- 兼容 Streamlit Cloud：所有依赖均可选，不阻塞启动
+"""
+
 import os
 import io
 import re
@@ -7,7 +19,6 @@ import time
 import base64
 import hashlib
 import sqlite3
-from dataclasses import dataclass
 from typing import List, Optional, Dict, Any, Tuple
 
 import streamlit as st
@@ -15,7 +26,7 @@ import requests
 import numpy as np
 from PIL import Image, ImageOps
 
-# 可选：用于解析PDF/DOC/DOCX（你仓库已有这些依赖时就能用）
+# -------- 可选解析依赖（缺失也能跑） --------
 try:
     import pdfplumber
 except Exception:
@@ -31,6 +42,13 @@ try:
 except Exception:
     mammoth = None
 
+# docxtpl（模板化导出用，可选）
+try:
+    from docxtpl import DocxTemplate
+except Exception:
+    DocxTemplate = None
+
+
 # ---------------------------
 # 基础配置（云端友好）
 # ---------------------------
@@ -38,7 +56,7 @@ st.set_page_config(page_title="教学智能体平台", layout="wide")
 
 BASE_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1"
 DEFAULT_TEXT_MODEL = "qwen-max"
-DEFAULT_VL_MODEL = "qwen-vl-plus"  # 可选，用于“课堂照片→状态摘要”，不做身份识别
+DEFAULT_VL_MODEL = "qwen-vl-plus"
 
 DATA_DIR = "data"
 os.makedirs(DATA_DIR, exist_ok=True)
@@ -52,9 +70,9 @@ def inject_css():
     st.markdown(
         """
 <style>
-/* 全局排版 */
-.main .block-container { padding-top: 1.0rem; padding-bottom: 2rem; max-width: 1280px; }
+.main .block-container { padding-top: 1.0rem; padding-bottom: 2rem; max-width: 1320px; }
 h1, h2, h3 { letter-spacing: .2px; }
+code { font-size: 0.9em; }
 
 /* 顶部标题条 */
 .topbar{
@@ -84,29 +102,25 @@ h1, h2, h3 { letter-spacing: .2px; }
 .badge.bad { background:#fef2f2; color:#991b1b; border-color:#fecaca; }
 
 /* 依赖条 */
-.depbar{
-  display:flex; gap:8px; flex-wrap: wrap; padding: 10px 0;
-}
+.depbar{ display:flex; gap:8px; flex-wrap: wrap; padding: 10px 0; }
 .depitem{
   padding: 8px 10px; border-radius: 14px; border: 1px solid rgba(0,0,0,.10);
   background: rgba(255,255,255,.7); font-size: 13px;
 }
 .depitem b{ margin-right:6px; }
 
-/* 文档预览区 */
+/* 文档预览区（纯HTML安全渲染） */
 .docbox{
   border: 1px solid rgba(0,0,0,.10);
   border-radius: 18px;
   padding: 14px 16px;
   background: rgba(255,255,255,.75);
+  line-height: 1.55;
+  white-space: normal;
 }
 
 /* Sidebar 标题 */
-section[data-testid="stSidebar"] .stMarkdown h2{
-  font-size: 18px; font-weight: 800;
-}
-
-/* 表格更紧凑 */
+section[data-testid="stSidebar"] .stMarkdown h2{ font-size: 18px; font-weight: 800; }
 div[data-testid="stDataFrame"] { border-radius: 14px; overflow:hidden; }
 </style>
 """,
@@ -144,7 +158,7 @@ CREATE TABLE IF NOT EXISTS projects(
 CREATE TABLE IF NOT EXISTS artifacts(
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   project_id INTEGER NOT NULL,
-  type TEXT NOT NULL,                -- training_plan / syllabus / calendar / lesson_plan / assessment / review / report / manual / evidence
+  type TEXT NOT NULL,
   title TEXT NOT NULL,
   content_md TEXT NOT NULL,
   content_json TEXT NOT NULL DEFAULT '{}',
@@ -200,11 +214,7 @@ def sha256_text(s: str) -> str:
 
 
 def compute_hash(content_md: str, content_json: Dict[str, Any], parent_hashes: List[str]) -> str:
-    payload = {
-        "content_md": content_md,
-        "content_json": content_json,
-        "parents": parent_hashes,
-    }
+    payload = {"content_md": content_md, "content_json": content_json, "parents": parent_hashes}
     return sha256_text(json.dumps(payload, ensure_ascii=False, sort_keys=True))
 
 
@@ -213,6 +223,18 @@ def get_projects() -> List[Tuple[int, str]]:
     rows = conn.execute("SELECT id, name FROM projects ORDER BY id DESC;").fetchall()
     conn.close()
     return rows
+
+
+def get_project_meta(project_id: int) -> Dict[str, Any]:
+    conn = db()
+    row = conn.execute("SELECT meta_json FROM projects WHERE id=?", (project_id,)).fetchone()
+    conn.close()
+    if not row:
+        return {}
+    try:
+        return json.loads(row[0] or "{}")
+    except Exception:
+        return {}
 
 
 def create_project(name: str, meta: Dict[str, Any]) -> int:
@@ -273,17 +295,6 @@ def get_versions(artifact_id: int) -> List[Dict[str, Any]]:
     return [{"version_no": r[0], "hash": r[1], "created_at": r[2], "note": r[3]} for r in rows]
 
 
-def get_parent_hashes(project_id: int, child_id: int) -> List[str]:
-    conn = db()
-    rows = conn.execute(
-        "SELECT a.hash FROM edges e JOIN artifacts a ON e.parent_artifact_id=a.id "
-        "WHERE e.project_id=? AND e.child_artifact_id=?",
-        (project_id, child_id),
-    ).fetchall()
-    conn.close()
-    return [r[0] for r in rows]
-
-
 def set_edges(project_id: int, child_id: int, parent_ids: List[int]):
     conn = db()
     conn.execute("DELETE FROM edges WHERE project_id=? AND child_artifact_id=?", (project_id, child_id))
@@ -307,7 +318,9 @@ def upsert_artifact(
     note: str = "",
 ) -> Dict[str, Any]:
     existing = get_artifact(project_id, a_type)
-    parent_hashes = []
+
+    # 父hash
+    parent_hashes: List[str] = []
     for pid in parent_ids:
         conn = db()
         row = conn.execute("SELECT hash FROM artifacts WHERE id=? AND project_id=?", (pid, project_id)).fetchone()
@@ -347,30 +360,21 @@ def upsert_artifact(
         cur = conn.execute(
             "INSERT INTO artifacts(project_id, type, title, content_md, content_json, hash, created_at, updated_at) "
             "VALUES(?,?,?,?,?,?,?,?)",
-            (
-                project_id,
-                a_type,
-                title,
-                content_md,
-                json.dumps(content_json, ensure_ascii=False),
-                new_hash,
-                ts,
-                ts,
-            ),
+            (project_id, a_type, title, content_md, json.dumps(content_json, ensure_ascii=False), new_hash, ts, ts),
         )
         conn.commit()
         aid = cur.lastrowid
     conn.close()
 
     set_edges(project_id, aid, parent_ids)
-
     return get_artifact(project_id, a_type)
 
 
 # ---------------------------
-# 依赖规则（文档链）
+# 文档链 & 依赖规则
 # ---------------------------
 DOC_TYPES = [
+    ("overview", "首页总览"),
     ("training_plan", "培养方案（底座）"),
     ("syllabus", "课程教学大纲（依赖培养方案）"),
     ("calendar", "教学日历（依赖大纲）"),
@@ -381,6 +385,8 @@ DOC_TYPES = [
     ("manual", "授课手册（依赖教案/过程证据）"),
     ("evidence", "课堂状态与过程证据（可选）"),
     ("vge", "证据链与可验证生成（VGE）"),
+    ("dep_graph", "依赖图可视化（树/Graphviz）"),
+    ("docx_export", "模板化DOCX导出（字段映射填充）"),
 ]
 
 DEP_RULES = {
@@ -390,10 +396,15 @@ DEP_RULES = {
     "lesson_plan": ["calendar"],
     "assessment": ["syllabus"],
     "review": ["assessment", "syllabus"],
-    "report": ["syllabus"],  # 可选加成绩
-    "manual": ["lesson_plan"],  # 可选加证据
+    "report": ["syllabus"],      # 可扩展加入成绩
+    "manual": ["lesson_plan"],   # 可选加证据
     "evidence": [],
+    "vge": [],
+    "overview": [],
+    "dep_graph": [],
+    "docx_export": [],
 }
+
 
 # ---------------------------
 # 文件抽取（上传）
@@ -401,6 +412,7 @@ DEP_RULES = {
 def extract_text_from_upload(file) -> str:
     name = (file.name or "").lower()
     file.seek(0)
+
     if name.endswith(".pdf") and pdfplumber is not None:
         with pdfplumber.open(file) as pdf:
             texts = []
@@ -421,7 +433,6 @@ def extract_text_from_upload(file) -> str:
         res = mammoth.convert_to_text(file)
         return (res.value or "").strip()
 
-    # fallback
     file.seek(0)
     try:
         return file.read().decode("utf-8", errors="ignore")
@@ -435,17 +446,18 @@ def extract_text_from_upload(file) -> str:
 def get_qwen_key() -> str:
     return st.secrets.get("QWEN_API_KEY", os.environ.get("QWEN_API_KEY", "")).strip()
 
-def qwen_chat(messages: List[Dict[str, Any]], model: str = DEFAULT_TEXT_MODEL, temperature: float = 0.3, max_tokens: int = 1400) -> str:
+
+def qwen_chat(
+    messages: List[Dict[str, Any]],
+    model: str = DEFAULT_TEXT_MODEL,
+    temperature: float = 0.3,
+    max_tokens: int = 1400,
+) -> str:
     key = get_qwen_key()
     if not key:
         raise RuntimeError("未配置 QWEN_API_KEY（当前为演示模式可不填）")
     headers = {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}
-    data = {
-        "model": model,
-        "messages": messages,
-        "temperature": temperature,
-        "max_tokens": max_tokens,
-    }
+    data = {"model": model, "messages": messages, "temperature": temperature, "max_tokens": max_tokens}
     resp = requests.post(BASE_URL + "/chat/completions", headers=headers, json=data, timeout=60)
     if resp.status_code != 200:
         raise RuntimeError(f"LLM接口错误：{resp.status_code} {resp.text[:300]}")
@@ -484,8 +496,14 @@ def template_training_plan(major: str, grade: str, course_group: str) -> str:
 - 实践环节
 """
 
-def template_syllabus(course_name: str, hours_total: int, credits: float, extra_req: str, tp_text: str) -> Tuple[str, Dict[str, Any]]:
-    # 简化：从培养方案提取“毕业要求关键词”作为映射底座
+
+def template_syllabus(
+    course_name: str,
+    hours_total: int,
+    credits: float,
+    extra_req: str,
+    tp_text: str,
+) -> Tuple[str, Dict[str, Any]]:
     outcomes = []
     for line in tp_text.splitlines():
         m = re.match(r"^\s*\d+\.\s*(.+)$", line.strip())
@@ -496,7 +514,7 @@ def template_syllabus(course_name: str, hours_total: int, credits: float, extra_
     obj = [
         {"id": "CO1", "desc": "理解课程核心概念与基本方法", "map_to": outcomes[0]},
         {"id": "CO2", "desc": "能基于案例进行建模/分析并解释结果", "map_to": outcomes[1]},
-        {"id": "CO3", "desc": "能够使用软件工具完成课程实践任务", "map_to": outcomes[min(3, len(outcomes)-1)]},
+        {"id": "CO3", "desc": "能够使用软件工具完成课程实践任务", "map_to": outcomes[min(3, len(outcomes) - 1)]},
     ]
 
     md = f"""# 《{course_name}》课程教学大纲（严格依赖培养方案）
@@ -551,7 +569,7 @@ def template_calendar(course_name: str, weeks: int, syllabus_json: Dict[str, Any
 
 
 def template_lesson_plan(course_name: str, calendar_json: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
-    rows = calendar_json.get("rows", [])[:4]  # 演示先出前4周
+    rows = calendar_json.get("rows", [])[:4]
     md = f"# 《{course_name}》教案（依赖教学日历）\n\n"
     plans = []
     for r in rows:
@@ -582,11 +600,18 @@ def template_assessment(course_name: str, syllabus_json: Dict[str, Any]) -> Tupl
     md = f"""# 《{course_name}》作业/题库/试卷方案（依赖教学大纲）
 
 ## 题库（示例）
-""" + "\n".join([f"- **{q['qid']}**（{q['type']}，对应{q['target_co']}）：{q['stem']}\n  - 评分细则：{q['rubric']}" for q in bank])
+""" + "\n".join(
+        [
+            f"- **{q['qid']}**（{q['type']}，对应{q['target_co']}）：{q['stem']}\n  - 评分细则：{q['rubric']}"
+            for q in bank
+        ]
+    )
     return md, {"bank": bank}
 
 
-def template_review_forms(course_name: str, assessment_json: Dict[str, Any], syllabus_json: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
+def template_review_forms(
+    course_name: str, assessment_json: Dict[str, Any], syllabus_json: Dict[str, Any]
+) -> Tuple[str, Dict[str, Any]]:
     bank = assessment_json.get("bank", [])
     co = [x.get("id") for x in syllabus_json.get("CO", [])]
     cover = {c: 0 for c in co}
@@ -599,7 +624,9 @@ def template_review_forms(course_name: str, assessment_json: Dict[str, Any], syl
 ## A. 试题审核表（示例）
 | 题号 | 题型 | 对应CO | 覆盖说明 | 结论 |
 |---|---|---|---|---|
-""" + "\n".join([f"| {q['qid']} | {q['type']} | {q['target_co']} | 覆盖{q['target_co']}关键能力 | 通过 |" for q in bank]) + f"""
+""" + "\n".join(
+        [f"| {q['qid']} | {q['type']} | {q['target_co']} | 覆盖{q['target_co']}关键能力 | 通过 |" for q in bank]
+    ) + f"""
 
 ## B. 课程目标达成评价依据合理性审核（示例）
 | 课程目标 | 评价证据 | 证据充分性 | 备注 |
@@ -613,8 +640,7 @@ def template_review_forms(course_name: str, assessment_json: Dict[str, Any], syl
 
 def template_report(course_name: str, syllabus_json: Dict[str, Any], note: str = "") -> Tuple[str, Dict[str, Any]]:
     co = [x["id"] for x in syllabus_json.get("CO", [])] or ["CO1", "CO2", "CO3"]
-    # 演示：没有成绩就给一个合理的“占位达成度”
-    achieve = {c: round(0.72 - i*0.05, 2) for i, c in enumerate(co)}
+    achieve = {c: round(0.72 - i * 0.05, 2) for i, c in enumerate(co)}
     md = f"""# 《{course_name}》课程目标达成情况评价报告（依赖教学大纲）
 
 ## 1. 评价方法
@@ -655,8 +681,7 @@ def template_manual(course_name: str, lesson_json: Dict[str, Any], evidence_md: 
 
 
 # ---------------------------
-# 课堂证据（可选）：上传图片→生成“状态摘要”
-# 说明：不做身份识别，只输出 Stu 编号 + 概率估计
+# 课堂证据（可选）：上传图片→生成摘要（不做身份识别）
 # ---------------------------
 def img_to_dataurl(img: Image.Image) -> str:
     buf = io.BytesIO()
@@ -664,11 +689,12 @@ def img_to_dataurl(img: Image.Image) -> str:
     b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
     return f"data:image/jpeg;base64,{b64}"
 
+
 @st.cache_data(ttl=600, show_spinner=False)
 def qwen_vl_classroom_summary(image_dataurl: str, context: str) -> str:
     key = get_qwen_key()
     if not key:
-        return "（演示模式：未配置QWEN_API_KEY，课堂证据摘要暂用占位文本）\n- Stu1：专注\n- Stu2：需要关注"
+        return "（演示模式：未配置QWEN_API_KEY，课堂证据摘要暂用占位文本）\n- Stu1：专注（坐姿稳定）\n- Stu2：需要关注（目光游离）"
     headers = {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}
     prompt = f"""
 你是课堂过程证据记录助手。请仅根据课堂照片给出“班级状态摘要”。
@@ -683,10 +709,13 @@ def qwen_vl_classroom_summary(image_dataurl: str, context: str) -> str:
         "model": DEFAULT_VL_MODEL,
         "messages": [
             {"role": "system", "content": "你是严谨的课堂过程证据记录助手。"},
-            {"role": "user", "content": [
-                {"type": "text", "text": prompt},
-                {"type": "image_url", "image_url": {"url": image_dataurl}},
-            ]}
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": prompt},
+                    {"type": "image_url", "image_url": {"url": image_dataurl}},
+                ],
+            },
         ],
         "temperature": 0.2,
         "max_tokens": 450,
@@ -706,6 +735,7 @@ def type_label(a_type: str) -> str:
             return name
     return a_type
 
+
 def dep_status(project_id: int, a_type: str) -> Tuple[bool, List[Tuple[str, bool]]]:
     req = DEP_RULES.get(a_type, [])
     detail = []
@@ -715,6 +745,7 @@ def dep_status(project_id: int, a_type: str) -> Tuple[bool, List[Tuple[str, bool
         detail.append((r, exists))
         ok = ok and exists
     return ok, detail
+
 
 def render_depbar(project_id: int, a_type: str):
     ok, detail = dep_status(project_id, a_type)
@@ -732,15 +763,19 @@ def render_depbar(project_id: int, a_type: str):
         unsafe_allow_html=True,
     )
 
-import html
+
+import html as _html
+
 
 def render_doc_preview(md: str):
-    safe = html.escape(md).replace("\n", "<br>")
+    # 安全：先 escape 再把换行转为 <br>
+    safe = _html.escape(md).replace("\n", "<br>")
     st.markdown(f'<div class="docbox">{safe}</div>', unsafe_allow_html=True)
 
 
 def md_textarea(label: str, value: str, height: int = 420, key: str = "") -> str:
     return st.text_area(label, value=value, height=height, key=key)
+
 
 def artifact_toolbar(a: Dict[str, Any]):
     st.markdown(
@@ -748,7 +783,7 @@ def artifact_toolbar(a: Dict[str, Any]):
 <div class="card">
   <div style="display:flex; justify-content:space-between; gap:12px; align-items:center;">
     <div>
-      <div style="font-size:18px; font-weight:800;">{a['title']}</div>
+      <div style="font-size:18px; font-weight:800;">{_html.escape(a['title'])}</div>
       <div style="opacity:.75; font-size:12px; margin-top:4px;">
         类型：{type_label(a['type'])} ｜ Hash：<code>{a['hash'][:12]}</code> ｜ 更新时间：{time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(a['updated_at']))}
       </div>
@@ -764,7 +799,8 @@ def artifact_toolbar(a: Dict[str, Any]):
         unsafe_allow_html=True,
     )
 
-def export_docx_bytes(md: str) -> bytes:
+
+def export_docx_bytes_plaintext(md: str) -> bytes:
     # 极简导出：把 Markdown 当作纯文本段落
     try:
         from docx import Document as DocxDoc
@@ -776,6 +812,309 @@ def export_docx_bytes(md: str) -> bytes:
     buf = io.BytesIO()
     doc.save(buf)
     return buf.getvalue()
+
+
+# ---------------------------
+# 新增：依赖图可视化（树 + Graphviz）
+# ---------------------------
+DOC_ORDER = [
+    ("training_plan", "培养方案"),
+    ("syllabus", "教学大纲"),
+    ("calendar", "教学日历"),
+    ("lesson_plan", "教案"),
+    ("assessment", "作业/题库/试卷方案"),
+    ("review", "审核表"),
+    ("report", "达成评价报告"),
+    ("manual", "授课手册"),
+    ("evidence", "过程证据"),
+    ("vge", "证据链/VGE"),
+]
+
+
+def build_edges_for_project(project_id: int) -> List[Tuple[str, str]]:
+    """
+    返回 (parent_type, child_type) 列表（按真实 edges 表）
+    """
+    conn = db()
+    rows = conn.execute(
+        "SELECT p.type, c.type "
+        "FROM edges e "
+        "JOIN artifacts c ON e.child_artifact_id=c.id "
+        "JOIN artifacts p ON e.parent_artifact_id=p.id "
+        "WHERE e.project_id=?",
+        (project_id,),
+    ).fetchall()
+    conn.close()
+    return [(r[0], r[1]) for r in rows]
+
+
+def render_dep_tree_from_db(project_id: int):
+    st.subheader("依赖关系（树状）")
+    docs_present = {t for (t, _) in DOC_ORDER if get_artifact(project_id, t) is not None}
+
+    # 用“规则 + 实际存在”混合展示（申报时更直观）
+    for k, name in DOC_ORDER:
+        if k in docs_present:
+            a = get_artifact(project_id, k)
+            vcount = len(get_versions(a["id"])) if a else 0
+            deps = DEP_RULES.get(k, [])
+            dep_txt = "、".join(deps) if deps else "无"
+            st.markdown(f"- ✅ **{name}**  ｜版本：{vcount} ｜依赖：{dep_txt}")
+        else:
+            st.markdown(f"- ⬜ {name}（未生成/未上传）")
+
+
+def build_dot_from_db(project_id: int) -> str:
+    labels = {k: name for k, name in DOC_ORDER}
+
+    nodes = set()
+    edges = build_edges_for_project(project_id)
+
+    for p, c in edges:
+        nodes.add(p)
+        nodes.add(c)
+
+    # 把“规则链上存在的文档”也加入，便于看全局
+    for k, _ in DOC_ORDER:
+        if get_artifact(project_id, k) is not None:
+            nodes.add(k)
+
+    lines = [
+        "digraph G {",
+        'rankdir="LR";',
+        'node [shape=box, style="rounded,filled", fillcolor="#ffffff"];',
+        'edge [color="#64748b"];',
+    ]
+
+    for n in nodes:
+        a = get_artifact(project_id, n)
+        lab = labels.get(n, n)
+        if a:
+            lines.append(f'"{n}" [label="{lab}\\n{a["hash"][:8]}", fillcolor="#E8F5E9"];')
+        else:
+            lines.append(f'"{n}" [label="{lab}\\n(缺失)", fillcolor="#FFEBEE", style="rounded,dashed,filled"];')
+
+    # 实际依赖边
+    for p, c in edges:
+        lines.append(f'"{p}" -> "{c}";')
+
+    # 若没有实际 edges（用户还没生成依赖型文档），补一条规则边（虚线），让图不空
+    if not edges:
+        for child, reqs in DEP_RULES.items():
+            for parent in reqs:
+                lines.append(f'"{parent}" -> "{child}" [style=dashed];')
+
+    lines.append("}")
+    return "\n".join(lines)
+
+
+def page_dep_graph():
+    ensure_project()
+    st.markdown("### 依赖图可视化（树状图 / Graphviz）")
+    st.caption("用于展示“培养方案→大纲→日历→教案→试卷/审核→达成→手册→证据链”的依赖关系与可追溯性。")
+
+    c1, c2 = st.columns([1, 1])
+    with c1:
+        render_dep_tree_from_db(project_id)
+    with c2:
+        st.subheader("依赖关系（Graphviz）")
+        dot = build_dot_from_db(project_id)
+        st.graphviz_chart(dot)
+
+    st.markdown("---")
+    st.subheader("提示")
+    st.markdown(
+        "- 只有在生成/保存依赖型文档时，系统才会记录真实依赖边（edges）。\n"
+        "- 若你上传了某个文档作为底座（如培养方案/大纲），后续生成的文档会自动指向它。\n"
+        "- 申报展示时，可以把这张图作为“教评一体化、可验证生成、证据链”的核心亮点之一。"
+    )
+
+
+# ---------------------------
+# 新增：模板化 DOCX 导出（docxtpl）
+# ---------------------------
+def docx_render_from_template(template_bytes: bytes, context: Dict[str, Any]) -> bytes:
+    """
+    使用 docxtpl 渲染 docx 模板（模板内写 {{ field }}）。
+    """
+    if DocxTemplate is None:
+        raise RuntimeError("当前环境未安装 docxtpl。请在 requirements.txt 添加：docxtpl jinja2 lxml")
+    tpl = DocxTemplate(io.BytesIO(template_bytes))
+    tpl.render(context)
+    out = io.BytesIO()
+    tpl.save(out)
+    return out.getvalue()
+
+
+def flatten_syllabus_to_context(project_meta: Dict[str, Any], syllabus: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    ctx = {
+        "major": project_meta.get("major", ""),
+        "grade": project_meta.get("grade", ""),
+        "course_group": project_meta.get("course_group", ""),
+        "course_name": "",
+        "credits": "",
+        "hours_total": "",
+        "course_objectives": "",
+        "co_table": [],  # 可用于模板中循环
+        "assessment_ratio": "平时30%+作业/项目20%+期末50%",
+    }
+    if syllabus:
+        js = syllabus.get("content_json") or {}
+        ctx["course_name"] = js.get("course_name", "")
+        ctx["credits"] = js.get("credits", "")
+        ctx["hours_total"] = js.get("hours_total", "")
+        co = js.get("CO", []) or []
+        ctx["co_table"] = co
+        ctx["course_objectives"] = "\n".join([f"{x.get('id','')}：{x.get('desc','')}" for x in co]).strip()
+    return ctx
+
+
+def flatten_calendar_to_context(calendar: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    ctx = {"calendar_rows": []}
+    if calendar:
+        js = calendar.get("content_json") or {}
+        ctx["calendar_rows"] = js.get("rows", []) or []
+    return ctx
+
+
+def page_docx_export():
+    ensure_project()
+    st.markdown("### 模板化 DOCX 导出（字段映射填充）")
+    st.caption("把学校正式模板（docx）改成 {{字段}} 占位符，即可导出“像学校文件”的版本。")
+
+    if DocxTemplate is None:
+        st.warning("当前环境缺少 docxtpl。要启用模板化导出，请在 requirements.txt 添加：docxtpl jinja2 lxml")
+        st.info("你仍可使用各模块里的“简版DOCX导出”。")
+        return
+
+    meta = get_project_meta(project_id)
+    sy = get_artifact(project_id, "syllabus")
+    cal = get_artifact(project_id, "calendar")
+    tp = get_artifact(project_id, "training_plan")
+    rv = get_artifact(project_id, "review")
+    rp = get_artifact(project_id, "report")
+    mn = get_artifact(project_id, "manual")
+
+    # 选择导出目标（影响默认字段预填）
+    doc_kind = st.selectbox(
+        "选择要导出的正式文件类型",
+        [
+            "教学大纲（模板）",
+            "教学日历（模板）",
+            "试题审核表（模板）",
+            "评价依据合理性审核表（模板）",
+            "课程目标达成评价报告（模板）",
+            "授课手册（模板）",
+            "培养方案（模板）",
+        ],
+    )
+
+    tpl = st.file_uploader("上传对应 DOCX 模板（必须是 .docx）", type=["docx"])
+    if not tpl:
+        st.info("请先上传模板 docx（模板内用 {{字段}} 标注要填充的位置）。")
+        with st.expander("模板字段示例（复制到 Word 模板里）", expanded=False):
+            st.code(
+                """常用字段（你可按需取用）：
+{{ major }}  {{ grade }}  {{ course_group }}
+{{ course_name }} {{ credits }} {{ hours_total }}
+{{ course_objectives }}   （多行文本）
+{{ assessment_ratio }}
+
+循环表格（docxtpl）示例：
+- CO表循环：{% for x in co_table %} ... {{ x.id }} ... {{ x.desc }} ... {% endfor %}
+- 日历循环：{% for r in calendar_rows %} ... {{ r.week }} ... {{ r.topic }} ... {% endfor %}
+""",
+                language="text",
+            )
+        return
+
+    # 默认 context（按类型拼装）
+    base_ctx = flatten_syllabus_to_context(meta, sy)
+    base_ctx.update(flatten_calendar_to_context(cal))
+    base_ctx.update(
+        {
+            "training_plan_text": (tp["content_md"] if tp else ""),
+            "review_text": (rv["content_md"] if rv else ""),
+            "report_text": (rp["content_md"] if rp else ""),
+            "manual_text": (mn["content_md"] if mn else ""),
+            "export_time": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime()),
+        }
+    )
+
+    st.subheader("字段映射（可修改）")
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        major = st.text_input("major", value=str(base_ctx.get("major", "")))
+        grade = st.text_input("grade", value=str(base_ctx.get("grade", "")))
+        course_group = st.text_input("course_group", value=str(base_ctx.get("course_group", "")))
+    with c2:
+        course_name = st.text_input("course_name", value=str(base_ctx.get("course_name", "")))
+        credits = st.text_input("credits", value=str(base_ctx.get("credits", "")))
+        hours_total = st.text_input("hours_total", value=str(base_ctx.get("hours_total", "")))
+    with c3:
+        assessment_ratio = st.text_input("assessment_ratio", value=str(base_ctx.get("assessment_ratio", "")))
+        export_time = st.text_input("export_time", value=str(base_ctx.get("export_time", "")))
+
+    course_objectives = st.text_area(
+        "course_objectives（多行文本）",
+        value=str(base_ctx.get("course_objectives", "")),
+        height=120,
+    )
+
+    # 高级：CO 表、日历表 以 JSON 方式可编辑（便于你马上试模板循环）
+    with st.expander("高级字段：CO表 / 日历表（JSON，可用于模板循环）", expanded=False):
+        co_json_str = st.text_area(
+            "co_table（JSON 数组）",
+            value=json.dumps(base_ctx.get("co_table", []), ensure_ascii=False, indent=2),
+            height=180,
+        )
+        cal_json_str = st.text_area(
+            "calendar_rows（JSON 数组）",
+            value=json.dumps(base_ctx.get("calendar_rows", []), ensure_ascii=False, indent=2),
+            height=180,
+        )
+
+    # 汇总 context
+    ctx = dict(base_ctx)
+    ctx.update(
+        {
+            "major": major,
+            "grade": grade,
+            "course_group": course_group,
+            "course_name": course_name,
+            "credits": credits,
+            "hours_total": hours_total,
+            "assessment_ratio": assessment_ratio,
+            "course_objectives": course_objectives,
+            "export_time": export_time,
+        }
+    )
+
+    try:
+        ctx["co_table"] = json.loads(co_json_str) if co_json_str.strip() else []
+    except Exception:
+        st.warning("co_table JSON 解析失败，已回退为空。")
+        ctx["co_table"] = []
+
+    try:
+        ctx["calendar_rows"] = json.loads(cal_json_str) if cal_json_str.strip() else []
+    except Exception:
+        st.warning("calendar_rows JSON 解析失败，已回退为空。")
+        ctx["calendar_rows"] = []
+
+    if st.button("生成 DOCX（模板填充）", type="primary"):
+        try:
+            out_bytes = docx_render_from_template(tpl.read(), ctx)
+            fname = f"{doc_kind}-{course_name or '课程'}.docx"
+            st.success("已生成。")
+            st.download_button(
+                "下载 DOCX",
+                data=out_bytes,
+                file_name=fname,
+                mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            )
+        except Exception as e:
+            st.error(f"模板渲染失败：{e}")
 
 
 # ---------------------------
@@ -792,10 +1131,10 @@ def topbar():
         unsafe_allow_html=True,
     )
 
+
 topbar()
 st.write("")
 
-# Sidebar
 st.sidebar.markdown("## 运行模式")
 run_mode = st.sidebar.radio("运行模式", ["演示模式（无API）", "在线模式（千问API）"], index=0)
 st.sidebar.caption("演示模式不需要 Key；在线模式请在 Secrets 中配置 QWEN_API_KEY。")
@@ -820,12 +1159,7 @@ else:
     project_id = int(p_sel.split("·")[0].strip())
 
 st.sidebar.markdown("## 功能模块")
-module = st.sidebar.radio(
-    "导航",
-    [name for _, name in DOC_TYPES],
-    index=3,
-)
-
+module = st.sidebar.radio("导航", [name for _, name in DOC_TYPES], index=1)
 type_by_name = {name: t for t, name in DOC_TYPES}
 current_type = type_by_name[module]
 
@@ -838,19 +1172,20 @@ def ensure_project():
         st.info("请先在左侧创建并选择一个项目。")
         st.stop()
 
+
 def pick_parents_for(project_id: int, a_type: str) -> List[int]:
     req = DEP_RULES.get(a_type, [])
-    parent_ids = []
+    parent_ids: List[int] = []
     for r in req:
         pa = get_artifact(project_id, r)
         if pa:
             parent_ids.append(pa["id"])
-    # manual 可选加 evidence
     if a_type == "manual":
         ev = get_artifact(project_id, "evidence")
         if ev:
             parent_ids.append(ev["id"])
     return parent_ids
+
 
 def page_overview():
     ensure_project()
@@ -863,13 +1198,26 @@ def page_overview():
     st.markdown('<div class="card">📌 当前项目已有文档（最近更新在前）</div>', unsafe_allow_html=True)
     rows = []
     for a in arts:
-        rows.append({
-            "类型": type_label(a["type"]),
-            "标题": a["title"],
-            "Hash(前12)": a["hash"][:12],
-            "更新时间": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(a["updated_at"])),
-        })
+        rows.append(
+            {
+                "类型": type_label(a["type"]),
+                "标题": a["title"],
+                "Hash(前12)": a["hash"][:12],
+                "更新时间": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(a["updated_at"])),
+            }
+        )
     st.dataframe(rows, use_container_width=True)
+
+    st.markdown("---")
+    st.markdown("### 快速入口")
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        st.markdown('<div class="card"><b>① 从底座开始</b><br>先生成/上传培养方案，再生成大纲。</div>', unsafe_allow_html=True)
+    with c2:
+        st.markdown('<div class="card"><b>② 看依赖链</b><br>到“依赖图可视化”查看可追溯关系。</div>', unsafe_allow_html=True)
+    with c3:
+        st.markdown('<div class="card"><b>③ 正式导出</b><br>到“模板化DOCX导出”用学校模板生成正式文件。</div>', unsafe_allow_html=True)
+
 
 def page_training_plan():
     ensure_project()
@@ -877,12 +1225,12 @@ def page_training_plan():
     render_depbar(project_id, "training_plan")
 
     st.markdown("### 培养方案（底座）")
-    st.caption("你可以：①一键生成示例培养方案；②上传已有培养方案（PDF/DOC/DOCX）并抽取文本；③在线编辑并保存版本。")
+    st.caption("①一键生成示例；②上传已有培养方案抽取文本；③在线编辑并保存版本。")
 
     tab1, tab2, tab3, tab4 = st.tabs(["生成/上传", "预览", "编辑", "版本/导出"])
 
     with tab1:
-        col1, col2 = st.columns([1,1])
+        col1, col2 = st.columns([1, 1])
         with col1:
             st.markdown("#### 方式A：一键生成（演示/快速）")
             major = st.text_input("专业", value="材料成型及控制工程", key="tp_major")
@@ -890,20 +1238,36 @@ def page_training_plan():
             group = st.text_input("课程体系/方向", value="材料成型-数值模拟方向", key="tp_group")
             if st.button("生成培养方案并保存", type="primary"):
                 md = template_training_plan(major, grade, group)
-                a = upsert_artifact(project_id, "training_plan", f"{grade}级《{major}》培养方案", md, {"major": major, "grade": grade}, [], note="generate")
+                a = upsert_artifact(
+                    project_id,
+                    "training_plan",
+                    f"{grade}级《{major}》培养方案",
+                    md,
+                    {"major": major, "grade": grade, "course_group": group},
+                    [],
+                    note="generate",
+                )
                 st.success("已保存培养方案（可作为后续文件依赖底座）")
                 st.rerun()
 
         with col2:
             st.markdown("#### 方式B：上传已有培养方案（建议用于申报）")
-            up = st.file_uploader("上传培养方案文件", type=["pdf","doc","docx","txt"], key="tp_upload")
+            up = st.file_uploader("上传培养方案文件", type=["pdf", "doc", "docx", "txt"], key="tp_upload")
             if up is not None and st.button("抽取并保存为培养方案", key="tp_extract"):
                 txt = extract_text_from_upload(up)
                 if not txt.strip():
                     st.error("未抽取到文本，请换更清晰的PDF或DOCX。")
                 else:
                     md = "# 培养方案（上传抽取）\n\n" + txt
-                    a = upsert_artifact(project_id, "training_plan", f"培养方案（上传抽取）-{up.name}", md, {"source": up.name}, [], note="upload")
+                    a = upsert_artifact(
+                        project_id,
+                        "training_plan",
+                        f"培养方案（上传抽取）-{up.name}",
+                        md,
+                        {"source": up.name},
+                        [],
+                        note="upload",
+                    )
                     st.success("已保存培养方案（上传抽取版）")
                     st.rerun()
 
@@ -931,16 +1295,14 @@ def page_training_plan():
         else:
             vers = get_versions(a["id"])
             st.markdown("#### 版本记录")
-            if not vers:
-                st.caption("暂无历史版本（第一次保存后才会出现版本）。")
-            else:
-                st.dataframe(vers, use_container_width=True)
-            st.markdown("#### 导出")
-            docx_bytes = export_docx_bytes(a["content_md"])
+            st.dataframe(vers if vers else [], use_container_width=True)
+            st.markdown("#### 导出（简版）")
+            docx_bytes = export_docx_bytes_plaintext(a["content_md"])
             if docx_bytes:
                 st.download_button("下载 DOCX（简版导出）", data=docx_bytes, file_name="培养方案.docx")
             else:
                 st.warning("当前环境缺少 python-docx，无法导出 DOCX。")
+
 
 def page_syllabus():
     ensure_project()
@@ -949,26 +1311,30 @@ def page_syllabus():
     a = get_artifact(project_id, "syllabus")
 
     st.markdown("### 课程教学大纲：严格依赖培养方案（可验证）")
-    st.caption("推荐流程：上传/生成培养方案 → 在此生成大纲 → 预览/编辑 → 保存版本。")
+    st.caption("推荐流程：培养方案 → 大纲 → 日历 → 教案 → 试卷/审核 → 达成报告 → 授课手册。")
 
     tab1, tab2, tab3, tab4, tab5 = st.tabs(["填写/生成", "预览", "编辑", "版本/导出", "依赖追溯"])
 
     with tab1:
         if not tp:
             st.warning("缺少上游依赖：培养方案。请先到“培养方案（底座）”模块生成/上传。")
+
         course_name = st.text_input("课程名称", value="数值模拟在材料成型中的应用", key="sy_course")
         credits = st.number_input("学分", min_value=0.5, max_value=10.0, value=2.0, step=0.5)
         hours_total = st.number_input("总学时", min_value=8, max_value=128, value=32, step=2)
-        extra = st.text_area("对大纲的补充要求（考核比例/教学方法/实践要求等）", value="课程目标3-5个；平时30%+大作业20%+期末50%；强调工程表达与案例；写明CO-毕业要求映射。", height=120)
+        extra = st.text_area(
+            "对大纲的补充要求（考核比例/教学方法/实践要求等）",
+            value="课程目标3-5个；平时30%+大作业20%+期末50%；强调工程表达与案例；写明CO-毕业要求映射。",
+            height=120,
+        )
 
-        use_ai = st.checkbox("使用千问生成更完整的大纲（需要QWEN_API_KEY）", value=(run_mode.startswith("在线")))
+        use_ai = st.checkbox("使用千问生成更完整的大纲（需要QWEN_API_KEY）", value=run_mode.startswith("在线"))
         if st.button("生成并保存教学大纲（JSON+可读预览）", type="primary"):
             if not tp:
                 st.error("请先提供培养方案。")
             else:
                 tp_text = tp["content_md"]
                 if use_ai and get_qwen_key():
-                    # AI：生成结构化 JSON + Markdown
                     sys = "你是高校教学文件撰写专家，输出必须规范、可落地。"
                     user = f"""请依据以下培养方案，为课程《{course_name}》撰写教学大纲。
 要求：给出课程信息、课程目标CO(3-5)、CO-毕业要求映射、学时分配、教学方法、考核比例、实践要求。
@@ -979,12 +1345,11 @@ def page_syllabus():
 """
                     try:
                         out = qwen_chat(
-                            [{"role":"system","content":sys},{"role":"user","content":user}],
+                            [{"role": "system", "content": sys}, {"role": "user", "content": user}],
                             model=DEFAULT_TEXT_MODEL,
                             temperature=0.2,
-                            max_tokens=1600
+                            max_tokens=1600,
                         )
-                        # 尽量提取 JSON
                         m = re.search(r"\{[\s\S]*\}", out)
                         js = {}
                         if m:
@@ -1009,13 +1374,12 @@ def page_syllabus():
             st.info("暂无教学大纲。请在“填写/生成”中生成并保存。")
         else:
             artifact_toolbar(a)
-            # 更好看的预览：把 JSON 摘要成卡片 + 大纲正文
             js = a["content_json"] or {}
             st.markdown('<div class="card"><b>结构化摘要</b></div>', unsafe_allow_html=True)
             c1, c2, c3 = st.columns(3)
-            c1.metric("课程", js.get("course_name","-"))
-            c2.metric("学分", js.get("credits","-"))
-            c3.metric("总学时", js.get("hours_total","-"))
+            c1.metric("课程", js.get("course_name", "-"))
+            c2.metric("学分", js.get("credits", "-"))
+            c3.metric("总学时", js.get("hours_total", "-"))
             st.markdown("#### 大纲正文")
             render_doc_preview(a["content_md"])
 
@@ -1038,11 +1402,15 @@ def page_syllabus():
             vers = get_versions(a["id"])
             st.markdown("#### 版本记录")
             st.dataframe(vers if vers else [], use_container_width=True)
-            st.markdown("#### 导出")
-            docx_bytes = export_docx_bytes(a["content_md"])
+            st.markdown("#### 导出（简版）")
+            docx_bytes = export_docx_bytes_plaintext(a["content_md"])
             if docx_bytes:
                 st.download_button("下载 DOCX（简版导出）", data=docx_bytes, file_name="教学大纲.docx")
-            st.download_button("下载 JSON（结构化）", data=json.dumps(a["content_json"], ensure_ascii=False, indent=2), file_name="教学大纲.json")
+            st.download_button(
+                "下载 JSON（结构化）",
+                data=json.dumps(a["content_json"], ensure_ascii=False, indent=2),
+                file_name="教学大纲.json",
+            )
 
     with tab5:
         if not a:
@@ -1054,10 +1422,15 @@ def page_syllabus():
                 st.warning("未记录到依赖边。")
             else:
                 conn = db()
-                rows = conn.execute("SELECT id, type, title, hash FROM artifacts WHERE id IN (%s)" % ",".join(["?"]*len(parents)), parents).fetchall()
+                rows = conn.execute(
+                    "SELECT id, type, title, hash FROM artifacts WHERE id IN (%s)"
+                    % ",".join(["?"] * len(parents)),
+                    parents,
+                ).fetchall()
                 conn.close()
                 for r in rows:
                     st.write(f"- **{type_label(r[1])}**：{r[2]} ｜ hash={r[3][:16]}")
+
 
 def page_calendar():
     ensure_project()
@@ -1076,9 +1449,17 @@ def page_calendar():
             if not sy:
                 st.error("请先生成教学大纲。")
             else:
-                md, js = template_calendar(sy["content_json"].get("course_name","课程"), int(weeks), sy["content_json"])
+                md, js = template_calendar(sy["content_json"].get("course_name", "课程"), int(weeks), sy["content_json"])
                 parents = [sy["id"]]
-                a = upsert_artifact(project_id, "calendar", f"《{sy['content_json'].get('course_name','课程')}》教学日历", md, js, parents, note="generate")
+                a = upsert_artifact(
+                    project_id,
+                    "calendar",
+                    f"《{sy['content_json'].get('course_name','课程')}》教学日历",
+                    md,
+                    js,
+                    parents,
+                    note="generate",
+                )
                 st.success("已保存教学日历。")
                 st.rerun()
     with tab2:
@@ -1103,9 +1484,10 @@ def page_calendar():
             st.info("暂无教学日历。")
         else:
             st.dataframe(get_versions(a["id"]) or [], use_container_width=True)
-            docx_bytes = export_docx_bytes(a["content_md"])
+            docx_bytes = export_docx_bytes_plaintext(a["content_md"])
             if docx_bytes:
                 st.download_button("下载 DOCX（简版导出）", data=docx_bytes, file_name="教学日历.docx")
+
 
 def page_lesson_plan():
     ensure_project()
@@ -1126,7 +1508,7 @@ def page_lesson_plan():
                 course_name = "课程"
                 sy = get_artifact(project_id, "syllabus")
                 if sy:
-                    course_name = sy["content_json"].get("course_name","课程")
+                    course_name = sy["content_json"].get("course_name", "课程")
                 md, js = template_lesson_plan(course_name, cal["content_json"])
                 parents = [cal["id"]]
                 a = upsert_artifact(project_id, "lesson_plan", f"《{course_name}》教案", md, js, parents, note="generate")
@@ -1157,9 +1539,10 @@ def page_lesson_plan():
             st.info("暂无教案。")
         else:
             st.dataframe(get_versions(a["id"]) or [], use_container_width=True)
-            docx_bytes = export_docx_bytes(a["content_md"])
+            docx_bytes = export_docx_bytes_plaintext(a["content_md"])
             if docx_bytes:
                 st.download_button("下载 DOCX（简版导出）", data=docx_bytes, file_name="教案.docx")
+
 
 def page_assessment():
     ensure_project()
@@ -1177,7 +1560,7 @@ def page_assessment():
             if not sy:
                 st.error("请先生成教学大纲。")
             else:
-                course_name = sy["content_json"].get("course_name","课程")
+                course_name = sy["content_json"].get("course_name", "课程")
                 md, js = template_assessment(course_name, sy["content_json"])
                 parents = [sy["id"]]
                 a = upsert_artifact(project_id, "assessment", f"《{course_name}》试卷方案/题库", md, js, parents, note="generate")
@@ -1208,9 +1591,10 @@ def page_assessment():
             st.info("暂无试卷方案。")
         else:
             st.dataframe(get_versions(a["id"]) or [], use_container_width=True)
-            docx_bytes = export_docx_bytes(a["content_md"])
+            docx_bytes = export_docx_bytes_plaintext(a["content_md"])
             if docx_bytes:
                 st.download_button("下载 DOCX（简版导出）", data=docx_bytes, file_name="试卷方案.docx")
+
 
 def page_review():
     ensure_project()
@@ -1229,7 +1613,7 @@ def page_review():
             if not (sy and ass):
                 st.error("请先生成教学大纲与试卷方案。")
             else:
-                course_name = sy["content_json"].get("course_name","课程")
+                course_name = sy["content_json"].get("course_name", "课程")
                 md, js = template_review_forms(course_name, ass["content_json"], sy["content_json"])
                 parents = [ass["id"], sy["id"]]
                 a = upsert_artifact(project_id, "review", f"《{course_name}》审核表集合", md, js, parents, note="generate")
@@ -1260,9 +1644,10 @@ def page_review():
             st.info("暂无审核表。")
         else:
             st.dataframe(get_versions(a["id"]) or [], use_container_width=True)
-            docx_bytes = export_docx_bytes(a["content_md"])
+            docx_bytes = export_docx_bytes_plaintext(a["content_md"])
             if docx_bytes:
                 st.download_button("下载 DOCX（简版导出）", data=docx_bytes, file_name="审核表.docx")
+
 
 def page_report():
     ensure_project()
@@ -1284,7 +1669,7 @@ def page_report():
             if not sy:
                 st.error("请先生成教学大纲。")
             else:
-                course_name = sy["content_json"].get("course_name","课程")
+                course_name = sy["content_json"].get("course_name", "课程")
                 md, js = template_report(course_name, sy["content_json"], note=note)
                 parents = [sy["id"]]
                 a = upsert_artifact(project_id, "report", f"《{course_name}》课程目标达成报告", md, js, parents, note="generate")
@@ -1315,9 +1700,10 @@ def page_report():
             st.info("暂无达成报告。")
         else:
             st.dataframe(get_versions(a["id"]) or [], use_container_width=True)
-            docx_bytes = export_docx_bytes(a["content_md"])
+            docx_bytes = export_docx_bytes_plaintext(a["content_md"])
             if docx_bytes:
                 st.download_button("下载 DOCX（简版导出）", data=docx_bytes, file_name="达成报告.docx")
+
 
 def page_evidence():
     ensure_project()
@@ -1328,7 +1714,7 @@ def page_evidence():
     st.caption("合规提示：不做身份识别，仅输出 Stu 编号 + 状态估计，用于“过程证据”支撑。")
 
     context = st.text_input("课堂内容（用于生成更贴合的摘要）", value="微积分：链式法则讲解", key="ev_ctx")
-    up = st.file_uploader("上传课堂照片（JPG/PNG）", type=["jpg","jpeg","png"], key="ev_img")
+    up = st.file_uploader("上传课堂照片（JPG/PNG）", type=["jpg", "jpeg", "png"], key="ev_img")
 
     if up is not None:
         img = ImageOps.exif_transpose(Image.open(up)).convert("RGB")
@@ -1337,7 +1723,15 @@ def page_evidence():
             dataurl = img_to_dataurl(img)
             summary = qwen_vl_classroom_summary(dataurl, context)
             md = f"# 课堂过程证据摘要\n\n- 课堂内容：{context}\n\n{summary}\n"
-            a = upsert_artifact(project_id, "evidence", "课堂过程证据摘要", md, {"context": context, "source": up.name}, [], note="generate")
+            a = upsert_artifact(
+                project_id,
+                "evidence",
+                "课堂过程证据摘要",
+                md,
+                {"context": context, "source": up.name},
+                [],
+                note="generate",
+            )
             st.success("已保存过程证据摘要。可在“授课手册”模块自动引用。")
             st.rerun()
 
@@ -1347,6 +1741,7 @@ def page_evidence():
     else:
         artifact_toolbar(a)
         render_doc_preview(a["content_md"])
+
 
 def page_manual():
     ensure_project()
@@ -1367,7 +1762,7 @@ def page_manual():
                 st.error("请先生成教案。")
             else:
                 sy = get_artifact(project_id, "syllabus")
-                course_name = sy["content_json"].get("course_name","课程") if sy else "课程"
+                course_name = sy["content_json"].get("course_name", "课程") if sy else "课程"
                 ev_md = ev["content_md"] if (use_ev and ev) else ""
                 md, js = template_manual(course_name, lp["content_json"], ev_md)
                 parents = pick_parents_for(project_id, "manual")
@@ -1399,9 +1794,10 @@ def page_manual():
             st.info("暂无授课手册。")
         else:
             st.dataframe(get_versions(a["id"]) or [], use_container_width=True)
-            docx_bytes = export_docx_bytes(a["content_md"])
+            docx_bytes = export_docx_bytes_plaintext(a["content_md"])
             if docx_bytes:
                 st.download_button("下载 DOCX（简版导出）", data=docx_bytes, file_name="授课手册.docx")
+
 
 def page_vge():
     ensure_project()
@@ -1413,19 +1809,19 @@ def page_vge():
         st.info("暂无文档。请先生成培养方案/大纲等。")
         return
 
-    # 展示清单
     rows = []
     for a in arts:
-        rows.append({
-            "类型": a["type"],
-            "名称": a["title"],
-            "Hash": a["hash"][:16],
-            "更新时间": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(a["updated_at"])),
-        })
+        rows.append(
+            {
+                "类型": a["type"],
+                "名称": a["title"],
+                "Hash": a["hash"][:16],
+                "更新时间": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(a["updated_at"])),
+            }
+        )
     st.markdown('<div class="card"><b>文档清单（hash 作为可验证标识）</b></div>', unsafe_allow_html=True)
     st.dataframe(rows, use_container_width=True)
 
-    # 展示依赖边
     conn = db()
     e = conn.execute(
         "SELECT c.type, c.title, c.hash, p.type, p.title, p.hash "
@@ -1438,19 +1834,15 @@ def page_vge():
     conn.close()
 
     st.markdown('<div class="card"><b>依赖关系（child ← parent）</b></div>', unsafe_allow_html=True)
+    rows2 = []
     if not e:
         st.info("暂无依赖边（还未生成依赖型文件）。")
     else:
-        rows2 = []
         for r in e:
-            rows2.append({
-                "Child": f"{r[0]} | {r[1]} | {r[2][:12]}",
-                "Parent": f"{r[3]} | {r[4]} | {r[5][:12]}",
-            })
+            rows2.append({"Child": f"{r[0]} | {r[1]} | {r[2][:12]}", "Parent": f"{r[3]} | {r[4]} | {r[5][:12]}"})
         st.dataframe(rows2, use_container_width=True)
 
-    # 导出证据链日志
-    export = {"project_id": project_id, "artifacts": arts, "edges": rows2 if e else []}
+    export = {"project_id": project_id, "artifacts": arts, "edges": rows2}
     st.download_button("下载 VGE 证据链日志（JSON）", data=json.dumps(export, ensure_ascii=False, indent=2), file_name="vge_log.json")
 
 
@@ -1458,39 +1850,23 @@ def page_vge():
 # 路由：按模块显示
 # ---------------------------
 ROUTES = {
-    "首页总览": page_overview,
-    "培养方案（底座）": page_training_plan,
-    "课程教学大纲（依赖培养方案）": page_syllabus,
-    "教学日历（依赖大纲）": page_calendar,
-    "教案（依赖日历）": page_lesson_plan,
-    "作业/题库/试卷方案（依赖大纲）": page_assessment,
-    "审核表（依赖试卷方案/大纲）": page_review,
-    "课程目标达成报告（依赖大纲/成绩）": page_report,
-    "授课手册（依赖教案/过程证据）": page_manual,
-    "课堂状态与过程证据（可选）": page_evidence,
-    "证据链与可验证生成（VGE）": page_vge,
+    "overview": page_overview,
+    "training_plan": page_training_plan,
+    "syllabus": page_syllabus,
+    "calendar": page_calendar,
+    "lesson_plan": page_lesson_plan,
+    "assessment": page_assessment,
+    "review": page_review,
+    "report": page_report,
+    "manual": page_manual,
+    "evidence": page_evidence,
+    "vge": page_vge,
+    "dep_graph": page_dep_graph,
+    "docx_export": page_docx_export,
 }
 
-# 根据 sidebar 的 current_type 映射到路由
-if current_type == "training_plan":
-    ROUTES["培养方案（底座）"]()
-elif current_type == "syllabus":
-    ROUTES["课程教学大纲（依赖培养方案）"]()
-elif current_type == "calendar":
-    ROUTES["教学日历（依赖大纲）"]()
-elif current_type == "lesson_plan":
-    ROUTES["教案（依赖日历）"]()
-elif current_type == "assessment":
-    ROUTES["作业/题库/试卷方案（依赖大纲）"]()
-elif current_type == "review":
-    ROUTES["审核表（依赖试卷方案/大纲）"]()
-elif current_type == "report":
-    ROUTES["课程目标达成报告（依赖大纲/成绩）"]()
-elif current_type == "manual":
-    ROUTES["授课手册（依赖教案/过程证据）"]()
-elif current_type == "evidence":
-    ROUTES["课堂状态与过程证据（可选）"]()
-elif current_type == "vge":
-    ROUTES["证据链与可验证生成（VGE）"]()
-else:
-    ROUTES["首页总览"]()
+# Dispatch
+fn = ROUTES.get(current_type, page_overview)
+fn()
+
+st.caption("注：演示版支持无API生成；在线模式可启用千问；模板化DOCX导出需 docxtpl。")
