@@ -211,7 +211,64 @@ CREATE TABLE IF NOT EXISTS edges(
     conn.commit()
     conn.close()
 
+def ensure_db_schema():
+    conn = db()
+    conn.execute("PRAGMA journal_mode=WAL;")
+    conn.execute("PRAGMA foreign_keys=ON;")
 
+    conn.execute("""
+    CREATE TABLE IF NOT EXISTS projects(
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      name TEXT NOT NULL,
+      meta_json TEXT DEFAULT '{}',
+      created_at INTEGER NOT NULL
+    );
+    """)
+
+    conn.execute("""
+    CREATE TABLE IF NOT EXISTS artifacts(
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      project_id INTEGER NOT NULL,
+      type TEXT NOT NULL,
+      title TEXT NOT NULL,
+      content_md TEXT NOT NULL,
+      content_json TEXT NOT NULL DEFAULT '{}',
+      hash TEXT NOT NULL,
+      created_at INTEGER NOT NULL,
+      updated_at INTEGER NOT NULL,
+      FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE CASCADE
+    );
+    """)
+
+    conn.execute("""
+    CREATE TABLE IF NOT EXISTS versions(
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      artifact_id INTEGER NOT NULL,
+      version_no INTEGER NOT NULL,
+      content_md TEXT NOT NULL,
+      content_json TEXT NOT NULL,
+      hash TEXT NOT NULL,
+      created_at INTEGER NOT NULL,
+      note TEXT DEFAULT '',
+      FOREIGN KEY(artifact_id) REFERENCES artifacts(id) ON DELETE CASCADE
+    );
+    """)
+
+    conn.execute("""
+    CREATE TABLE IF NOT EXISTS edges(
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      project_id INTEGER NOT NULL,
+      child_artifact_id INTEGER NOT NULL,
+      parent_artifact_id INTEGER NOT NULL,
+      created_at INTEGER NOT NULL,
+      FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE CASCADE,
+      FOREIGN KEY(child_artifact_id) REFERENCES artifacts(id) ON DELETE CASCADE,
+      FOREIGN KEY(parent_artifact_id) REFERENCES artifacts(id) ON DELETE CASCADE
+    );
+    """)
+
+    conn.commit()
+    conn.close()
 init_db()
 ensure_db_schema()
 
@@ -222,46 +279,7 @@ def _table_cols(conn: sqlite3.Connection, table: str) -> set:
     except Exception:
         return set()
 
-def ensure_db_schema():
-    """
-    解决云端/本地旧 app.db 导致的：
-    - no such table
-    - no such column
-    通过“补表 + 补列 + 回填默认值”自愈。
-    """
-    # 先确保基础表存在（你的 init_db 负责 CREATE TABLE IF NOT EXISTS）
-    init_db()
 
-    conn = db()
-    try:
-        # ---- projects: meta_json（你现在依赖它）
-        cols = _table_cols(conn, "projects")
-        if "meta_json" not in cols:
-            conn.execute("ALTER TABLE projects ADD COLUMN meta_json TEXT DEFAULT '{}';")
-
-        # ---- artifacts: content_json/hash/updated_at 等
-        cols = _table_cols(conn, "artifacts")
-        # 某些旧库可能没有 content_json / hash / updated_at
-        if "content_json" not in cols:
-            conn.execute("ALTER TABLE artifacts ADD COLUMN content_json TEXT NOT NULL DEFAULT '{}';")
-        if "hash" not in cols:
-            conn.execute("ALTER TABLE artifacts ADD COLUMN hash TEXT NOT NULL DEFAULT '';")
-        if "updated_at" not in cols:
-            conn.execute("ALTER TABLE artifacts ADD COLUMN updated_at INTEGER NOT NULL DEFAULT 0;")
-            # 回填：让 updated_at 至少等于 created_at
-            try:
-                conn.execute("UPDATE artifacts SET updated_at=created_at WHERE updated_at=0;")
-            except Exception:
-                pass
-
-        # ---- versions: note（你现在依赖它展示）
-        cols = _table_cols(conn, "versions")
-        if cols and "note" not in cols:
-            conn.execute("ALTER TABLE versions ADD COLUMN note TEXT DEFAULT '';")
-
-        conn.commit()
-    finally:
-        conn.close()
 
 
 def now_ts() -> int:
