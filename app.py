@@ -23,7 +23,7 @@ import sqlite3
 import zipfile
 import threading
 from typing import List, Optional, Dict, Any, Tuple
-
+import pandas as pd
 import streamlit as st
 import requests
 import numpy as np
@@ -986,6 +986,250 @@ def render_doc_preview(md: str):
     safe = _html.escape(md).replace("\n", "<br>")
     st.markdown(f'<div class="docbox">{safe}</div>', unsafe_allow_html=True)
 
+# ====== 追加/确保有这个 import（放在顶部 import 区）======
+try:
+    import pandas as pd
+except Exception:
+    pd = None
+
+
+# ====== 表格工具：列名清洗 & 通用表格转DF ======
+def _make_unique_columns(cols) -> List[str]:
+    """
+    Streamlit st.data_editor 要求：列名必须是唯一、非空、可序列化的字符串。
+    这里把任意 cols 变成满足要求的列名。
+    """
+    seen = {}
+    out = []
+    for i, c in enumerate(list(cols)):
+        # 1) 统一转字符串
+        if c is None:
+            name = ""
+        else:
+            name = str(c).strip()
+
+        # 2) 空列名兜底
+        if not name:
+            name = f"col_{i+1}"
+
+        # 3) 去掉一些容易引起混乱的字符（可选，但建议）
+        name = name.replace("\n", " ").replace("\r", " ").strip()
+
+        # 4) 去重：同名加后缀 _2 _3 ...
+        if name in seen:
+            seen[name] += 1
+            name2 = f"{name}_{seen[name]}"
+            out.append(name2)
+        else:
+            seen[name] = 1
+            out.append(name)
+
+    return out
+
+
+def table_to_df(table: Any) -> "pd.DataFrame":
+    """
+    支持几种常见识别输出：
+    - list[list]：二维数组（可能包含表头行）
+    - list[dict]：每行一个dict（key作为列）
+    - dict: {"headers": [...], "rows": [[...], ...]}
+    - 其它：尽量转成一列文本
+    """
+    if pd is None:
+        raise RuntimeError("缺少 pandas，无法使用表格编辑功能。请在 requirements.txt 加入 pandas")
+
+    # dict 结构
+    if isinstance(table, dict):
+        headers = table.get("headers")
+        rows = table.get("rows")
+        if isinstance(headers, list) and isinstance(rows, list):
+            df = pd.DataFrame(rows, columns=headers)
+        else:
+            # 兜底：把 dict 展开成两列
+            df = pd.DataFrame([{"key": k, "value": v} for k, v in table.items()])
+        df.columns = _make_unique_columns(df.columns)
+        return df
+
+    # list[dict]
+    if isinstance(table, list) and table and all(isinstance(x, dict) for x in table):
+        df = pd.DataFrame(table)
+        df.columns = _make_unique_columns(df.columns)
+        return df
+
+    # list[list] 或 list[tuple]
+    if isinstance(table, list) and table and all(isinstance(x, (list, tuple)) for x in table):
+        # 尝试把第一行当表头：如果第一行“更像字符串”，就当 header
+        first = list(table[0])
+        rest = table[1:]
+
+        def _stringish_ratio(row):
+            if not row:
+                return 0.0
+            s = 0
+            for x in row:
+                if isinstance(x, str):
+                    s += 1
+            return s / max(1, len(row))
+
+        if _stringish_ratio(first) >= 0.5 and len(first) >= 2:
+            headers = [str(x).strip() if x is not None else "" for x in first]
+            headers = _make_unique_columns(headers)
+            # 行长度对齐
+            maxw = max(len(headers), max((len(r) for r in rest), default=0))
+            headers = headers + [f"col_{i+1}" for i in range(len(headers), maxw)]
+            headers = _make_unique_columns(headers)
+            rows2 = []
+            for r in rest:
+                r = list(r)
+                if len(r) < maxw:
+                    r = r + [""] * (maxw - len(r))
+                else:
+                    r = r[:maxw]
+                rows2.append(r)
+            df = pd.DataFrame(rows2, columns=headers)
+        else:
+            # 不把第一行当表头，直接生成默认列名
+            maxw = max(len(r) for r in table)
+            cols = _make_unique_columns([f"col_{i+1}" for i in range(maxw)])
+            rows2 = []
+            for r in table:
+                r = list(r)
+                if len(r) < maxw:
+                    r = r + [""] * (maxw - len(r))
+                else:
+                    r = r[:maxw]
+                rows2.append(r)
+            df = pd.DataFrame(rows2, columns=cols)
+
+        df.columns = _make_unique_columns(df.columns)
+        return df
+
+    # 其它：兜底成单列
+    df = pd.DataFrame({"text": [json.dumps(table, ensure_ascii=False)]})
+    df.columns = _make_unique_columns(df.columns)
+    return df
+
+
+def df_to_markdown_preview(df: "pd.DataFrame", max_rows: int = 30) -> str:
+    """用于让用户更好地核对表格：转成Markdown表格预览。"""
+    if pd is None:
+        return ""
+    df2 = df.head(max_rows).copy()
+    # 避免 Nan 影响观感
+    df2 = df2.fillna("")
+    try:
+        return df2.to_markdown(index=False)
+    except Exception:
+        # 兼容某些环境没有 tabulate
+        return df2.to_string(index=False)
+
+
+def render_table_editor(table: Any, key: str, title: str = "识别到的表格") -> Tuple[Any, bool]:
+    """
+    返回 (edited_table, confirmed)
+    - edited_table: 以 list[dict] 形式返回，便于存 JSON
+    - confirmed: 用户是否点击确认采用
+    """
+    if pd is None:
+        st.warning("当前环境缺少 pandas，无法编辑表格。")
+        st.code(json.dumps(table, ensure_ascii=False, indent=2), language="json")
+        return table, False
+
+    df = table_to_df(table)
+
+    st.markdown(f"#### {title}")
+
+    view_mode = st.radio(
+        "显示方式（便于核对）",
+        ["表格编辑（推荐）", "Markdown预览（更适合确认）", "JSON（原始结构）"],
+        horizontal=True,
+        key=f"{key}_viewmode",
+    )
+
+    if view_mode == "JSON（原始结构）":
+        st.code(json.dumps(table, ensure_ascii=False, indent=2), language="json")
+        confirmed = st.checkbox("我确认该表格无误，采用此结果", key=f"{key}_confirm_json")
+        return table, confirmed
+
+    if view_mode == "Markdown预览（更适合确认）":
+        md = df_to_markdown_preview(df, max_rows=50)
+        st.markdown(md)
+        confirmed = st.checkbox("我确认该表格无误，采用此结果", key=f"{key}_confirm_md")
+        # 仍返回规范化后的数据
+        return df.fillna("").to_dict(orient="records"), confirmed
+
+    # 表格编辑
+    # 再次强制列名合规（保险）
+    df = df.copy()
+    df.columns = _make_unique_columns(df.columns)
+
+    edited_df = st.data_editor(
+        df,
+        use_container_width=True,
+        num_rows="dynamic",
+        key=key,
+    )
+
+    # 编辑后也再清洗一次列名（避免用户把表头改成空或重复）
+    edited_df = edited_df.copy()
+    edited_df.columns = _make_unique_columns(edited_df.columns)
+
+    st.caption("提示：如果你想更快核对，请切到“Markdown预览”。")
+    confirmed = st.checkbox("我确认该表格已修正完成，采用此结果", key=f"{key}_confirm_editor")
+
+    # 统一返回 list[dict] 方便保存进 content_json
+    return edited_df.fillna("").to_dict(orient="records"), confirmed
+
+
+def render_recognition_checklist(items: List[Dict[str, Any]], key_prefix: str) -> List[Dict[str, Any]]:
+    """
+    items: [{'name': '表1 ...', 'type': 'table', 'payload': ...}, ...]
+    返回：用户确认后的 items（payload可能被编辑过）
+    """
+    confirmed_items = []
+    if not items:
+        st.info("暂无可确认的识别结果。")
+        return confirmed_items
+
+    st.markdown("### 识别结果清单（请确认/修正）")
+    st.caption("建议：先在这里把识别出的表格/图表逐个确认，确认后再写入文档或数据库。")
+
+    for i, it in enumerate(items):
+        it_key = f"{key_prefix}_{i}"
+        with st.expander(f"{i+1}. {it.get('name','未命名')}（{it.get('type','unknown')}）", expanded=(i == 0)):
+            t = it.get("type")
+            payload = it.get("payload")
+
+            if t == "table":
+                edited_payload, ok = render_table_editor(payload, key=f"{it_key}_table", title=it.get("name", "表格"))
+                if ok:
+                    it2 = dict(it)
+                    it2["payload"] = edited_payload
+                    confirmed_items.append(it2)
+                    st.success("已确认采用该表格。")
+                else:
+                    st.warning("未确认：该表格不会写入最终结果。")
+
+            elif t == "chart":
+                # 图表先用“结构化信息 + 用户确认”方式（更稳）
+                st.markdown("#### 图表（结构化显示，便于核对）")
+                st.code(json.dumps(payload, ensure_ascii=False, indent=2), language="json")
+                ok = st.checkbox("我确认该图表信息无误，采用此结果", key=f"{it_key}_chart_ok")
+                if ok:
+                    confirmed_items.append(it)
+                    st.success("已确认采用该图表。")
+                else:
+                    st.warning("未确认：该图表不会写入最终结果。")
+
+            else:
+                # 其它类型：直接文本确认
+                st.markdown("#### 文本/其它识别内容")
+                st.text_area("内容（可修正）", value=str(payload), height=180, key=f"{it_key}_text")
+                ok = st.checkbox("确认采用", key=f"{it_key}_text_ok")
+                if ok:
+                    confirmed_items.append(it)
+
+    return confirmed_items
 
 def md_textarea(label: str, value: str, height: int = 420, key: str = "") -> str:
     return st.text_area(label, value=value, height=height, key=key)
@@ -1599,7 +1843,19 @@ def page_training_plan():
                 edited_best_table = None
                 if best and best.get("table"):
                     st.markdown(f"**疑似矩阵表（第 {best.get('page')} 页）**：请直接改表格内容（包括表头）")
-                    edited_best_table = render_table_editor(best["table"], key="tp_matrix_table_editor")
+                    #edited_best_table = render_table_editor(best["table"], key="tp_matrix_table_editor")
+                    
+                    edited_best_table, ok_table = render_table_editor(best["table"], key="tp_matrix_table_editor", title="毕业要求-课程目标矩阵（识别结果）")
+                    if ok_table:
+                        # 这里写入你的最终 content_json（示例）
+                        st.session_state["tp_matrix_table_confirmed"] = edited_best_table
+                        st.success("该表格已确认并缓存为最终版本。")
+                    else:
+                        st.info("请确认或修正表格后再采用。")
+
+                    
+                    
+                    
                 else:
                     st.warning("未抽到疑似支撑矩阵表格。你可以：1) 在 PDF 更清晰时再试；2) 下面手工录入本课程支撑点。")
 
