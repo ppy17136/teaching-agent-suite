@@ -1217,6 +1217,20 @@ st.sidebar.markdown("## 运行模式")
 run_mode = st.sidebar.radio("运行模式", ["演示模式（无API）", "在线模式（千问API）"], index=0)
 st.sidebar.caption("演示模式不需要 Key；在线模式请在 Secrets 中配置 QWEN_API_KEY。")
 
+st.sidebar.markdown("## 数据库维护")
+if st.sidebar.button("⚠️ 重置数据库（删除 app.db）"):
+    try:
+        for p in [DB_PATH, DB_PATH + "-shm", DB_PATH + "-wal"]:
+            if os.path.exists(p):
+                os.remove(p)
+        st.sidebar.success("已删除数据库文件，将自动重建。")
+        st.rerun()
+    except Exception as e:
+        st.sidebar.error(f"重置失败：{e}")
+
+
+
+
 st.sidebar.markdown("## 项目（专业/年级/课程体系）")
 projects = get_projects()
 p_names = ["（新建项目）"] + [f"{pid} · {name}" for pid, name in projects]
