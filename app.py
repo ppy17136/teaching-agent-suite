@@ -2321,152 +2321,6 @@ def page_training_plan():
     tab1, tab2, tab3, tab4, tab5 = st.tabs(["PDF上传/抽取/确认", "查看当前", "编辑", "版本", "PDF全量抽取独立界面（增强）"])
     
     with tab1:
-        # ... (保留原有上传和确认逻辑)
-    
-    with tab5:
-        st.markdown("### PDF全量抽取独立界面（增强版）")
-        st.caption("确保显示所有章节（如一到六）和所有附表（如附表1到5，对应七到十一）")
-        
-        if "extract_result" not in st.session_state:
-            st.session_state["extract_result"] = None
-        
-        uploaded = st.file_uploader("上传培养方案 PDF", type=["pdf"], key="full_extract_upload")
-        use_ocr = st.checkbox("对无文本页启用 OCR（可选）", value=True, key="full_extract_ocr")  # 默认启用OCR以确保完整
-        
-        if uploaded and st.button("开始全量抽取", type="primary", key="full_extract_btn"):
-            pdf_bytes = uploaded.getvalue()
-            with st.spinner("正在抽取所有内容…"):
-                extract_result = run_full_extract(pdf_bytes, use_ocr=use_ocr)
-                st.session_state["extract_result"] = extract_result
-        
-        result = st.session_state.get("extract_result")
-        if result is None:
-            st.stop()
-        
-        # 概览指标
-        c1, c2, c3, c4 = st.columns(4)
-        c1.metric("总页数", result.page_count)
-        c2.metric("表格总数", result.table_count)
-        c3.metric("OCR启用", "是" if result.ocr_used else "否")
-        c4.caption(f"SHA256: {result.file_sha256[:16]}...")
-        
-        tabs_full = st.tabs(["概览与下载", "章节大标题（全部）", "培养目标", "毕业要求", "附表表格（全部）", "分页原文与表格"])
-        
-        with tabs_full[0]:
-            # ... (保留下载逻辑)
-        
-        with tabs_full[1]:
-            st.markdown("### 章节大标题（全部，包括一到十一）")
-            st.caption("显示所有大标题及其内容，确保无遗漏")
-            for k in sorted(result.sections.keys()):  # 排序显示
-                with st.expander(k, expanded=True):  # 默认展开以确保查看
-                    st.text(result.sections.get(k, ""))
-      
-
-        with tabs_full[2]:
-            st.markdown("### 培养目标")
-            obj = result.training_objectives
-            st.write(f"识别条目数：**{obj.get('count', 0)}**")
-            st.text_area("培养目标（逐条）", value="\n".join(obj.get("items", [])), height=220, key="full_obj")
-            with st.expander("原始文本"):
-                st.text(obj.get("raw", ""))
-        
-        with tabs_full[3]:
-            st.markdown("### 毕业要求（12条 + 分项）")
-            grad = result.graduation_requirements
-            st.write(f"识别主条目数：**{grad.get('count', 0)}**")
-            
-            items = grad.get("items", [])
-            if not items:
-                st.warning("未识别到毕业要求")
-            else:
-                for it in items:
-                    no = it.get("no")
-                    title = it.get("title") or ""
-                    body = it.get("body") or ""
-                    header = f"{no}. {title}".strip()
-                    with st.expander(header, expanded=(no in [1, 2])):
-                        st.write(body)
-                        subs = it.get("subitems", [])
-                        if subs:
-                            st.markdown("**分项：**")
-                            for s in subs:
-                                st.write(f"- {s.get('no')}: {s.get('body')}")
-            with st.expander("原始文本"):
-                st.text(grad.get("raw", ""))
-
-
-        
-        with tabs_full[4]:
-            st.markdown("### 附表表格（全部，包括附表1到5，对应七到十一）")
-            if not result.tables:
-                st.info("未检测到表格。请检查PDF是否有表格，或尝试启用OCR。")
-            else:
-                all_dirs = sorted({clean_text(t.get("direction") or "") for t in result.tables if clean_text(t.get("direction") or "")})
-                opt_dirs = ["全部"] + all_dirs
-                sel = st.selectbox("方向过滤", opt_dirs, index=0)
-                
-                for t in sorted(result.tables, key=lambda x: x.get('page', 0)):  # 按页排序
-                    direction = clean_text(t.get("direction") or "")
-                    if sel != "全部" and direction != sel:
-                        continue
-                    
-                    st.subheader(f"第{t.get('page')}页｜{t.get('title')}")
-                    if direction:
-                        st.caption(f"页面方向提示：{direction}")
-                    
-                    df = safe_df_from_tablepack(t)
-                    st.dataframe(df, use_container_width=True, hide_index=True)
-        
-        with tabs_full[5]:
-            st.markdown("### 分页原文与表格（用于溯源/调试抽取缺失）")
-            
-            for page_data in pages_data:
-                page_no = page_data["page"]
-                page_text = page_data["text"]
-                page_tables = page_data["tables"]
-                
-                with st.expander(f"第{page_no}页（{len(page_tables)}个表格）", expanded=False):
-                    st.text(page_text)
-                    
-                    if page_tables:
-                        st.markdown(f"**表格 ({len(page_tables)}个):**")
-                        for i, table_data in enumerate(page_tables, start=1):
-                            df = table_to_df(table_data)
-                            if not df.empty:
-                                st.markdown(f"**表格 {i}:**")
-                                st.dataframe(df, use_container_width=True)
-                            else:
-                                st.info(f"表格 {i} 为空")
-
-
-
-
-
-
-
-
-
-
-
-# ... (其余框架代码保持不变)
-
-
-
-
-
-
-def page_training_plan():
-    ensure_project()
-    a = get_artifact(project_id, "training_plan")
-    render_depbar(project_id, "training_plan")
-    
-    st.markdown("### 培养方案（底座）")
-    st.caption("推荐：上传培养方案PDF → 全量抽取 → 识别清单确认/修正 → 保存（结构化底座）。")
-    
-    tab1, tab2, tab3, tab4, tab5 = st.tabs(["生成/上传&识别确认", "预览", "编辑", "版本/导出", "PDF全量抽取界面"])
-    
-    with tab1:
         col1, col2 = st.columns([1, 1])
         
         with col1:
@@ -2687,19 +2541,18 @@ def page_training_plan():
             st.dataframe(vers if vers else [], use_container_width=True)
     
     with tab5:
-        # 完整的PDF全量抽取界面
-        st.markdown("### PDF全量抽取独立界面")
-        st.caption("这是完整的PDF抽取界面，包含所有抽取结果的展示和编辑功能")
+        st.markdown("### PDF全量抽取独立界面（增强版）")
+        st.caption("确保显示所有章节（如一到六）和所有附表（如附表1到5，对应七到十一）")
         
         if "extract_result" not in st.session_state:
             st.session_state["extract_result"] = None
         
         uploaded = st.file_uploader("上传培养方案 PDF", type=["pdf"], key="full_extract_upload")
-        use_ocr = st.checkbox("对无文本页启用 OCR（可选）", value=False, key="full_extract_ocr")
+        use_ocr = st.checkbox("对无文本页启用 OCR（可选）", value=True, key="full_extract_ocr")  # 默认启用OCR以确保完整
         
         if uploaded and st.button("开始全量抽取", type="primary", key="full_extract_btn"):
             pdf_bytes = uploaded.getvalue()
-            with st.spinner("正在抽取…"):
+            with st.spinner("正在抽取所有内容…"):
                 extract_result = run_full_extract(pdf_bytes, use_ocr=use_ocr)
                 st.session_state["extract_result"] = extract_result
         
@@ -2714,7 +2567,7 @@ def page_training_plan():
         c3.metric("OCR启用", "是" if result.ocr_used else "否")
         c4.caption(f"SHA256: {result.file_sha256[:16]}...")
         
-        tabs_full = st.tabs(["概览与下载", "章节大标题", "培养目标", "毕业要求", "附表表格", "分页原文"])
+        tabs_full = st.tabs(["概览与下载", "章节大标题（全部）", "培养目标", "毕业要求", "附表表格（全部）", "分页原文与表格"])
         
         with tabs_full[0]:
             st.markdown("### 结构化识别结果（可先在这里校对）")
@@ -2746,11 +2599,13 @@ def page_training_plan():
                 st.info("未检测到附表标题映射。")
         
         with tabs_full[1]:
-            st.markdown("### 章节大标题")
-            for k in result.sections.keys():
-                with st.expander(k, expanded=False):
+            st.markdown("### 章节大标题（全部，包括一到十一）")
+            st.caption("显示所有大标题及其内容，确保无遗漏")
+            for k in sorted(result.sections.keys()):  # 排序显示
+                with st.expander(k, expanded=True):  # 默认展开以确保查看
                     st.text(result.sections.get(k, ""))
-        
+      
+
         with tabs_full[2]:
             st.markdown("### 培养目标")
             obj = result.training_objectives
@@ -2782,15 +2637,50 @@ def page_training_plan():
                                 st.write(f"- {s.get('no')}: {s.get('body')}")
             with st.expander("原始文本"):
                 st.text(grad.get("raw", ""))
+
+
         
-
-
-
-
-
-
-
-
+        with tabs_full[4]:
+            st.markdown("### 附表表格（全部，包括附表1到5，对应七到十一）")
+            if not result.tables:
+                st.info("未检测到表格。请检查PDF是否有表格，或尝试启用OCR。")
+            else:
+                all_dirs = sorted({clean_text(t.get("direction") or "") for t in result.tables if clean_text(t.get("direction") or "")})
+                opt_dirs = ["全部"] + all_dirs
+                sel = st.selectbox("方向过滤", opt_dirs, index=0)
+                
+                for t in sorted(result.tables, key=lambda x: x.get('page', 0)):  # 按页排序
+                    direction = clean_text(t.get("direction") or "")
+                    if sel != "全部" and direction != sel:
+                        continue
+                    
+                    st.subheader(f"第{t.get('page')}页｜{t.get('title')}")
+                    if direction:
+                        st.caption(f"页面方向提示：{direction}")
+                    
+                    df = safe_df_from_tablepack(t)
+                    st.dataframe(df, use_container_width=True, hide_index=True)
+        
+        with tabs_full[5]:
+            st.markdown("### 分页原文与表格（用于溯源/调试抽取缺失）")
+            
+            for page_data in pages_data:
+                page_no = page_data["page"]
+                page_text = page_data["text"]
+                page_tables = page_data["tables"]
+                
+                with st.expander(f"第{page_no}页（{len(page_tables)}个表格）", expanded=False):
+                    st.text(page_text)
+                    
+                    if page_tables:
+                        st.markdown(f"**表格 ({len(page_tables)}个):**")
+                        for i, table_data in enumerate(page_tables, start=1):
+                            df = table_to_df(table_data)
+                            if not df.empty:
+                                st.markdown(f"**表格 {i}:**")
+                                st.dataframe(df, use_container_width=True)
+                            else:
+                                st.info(f"表格 {i} 为空")
 
 
 # ---------------------------
