@@ -1395,7 +1395,7 @@ def page_training_plan():
                 st.info("已清除。")
     
     with tab2:
-        if not a:
+        if not tp:
             st.info("暂无培养方案。请先生成或上传并确认。")
         else:
             artifact_toolbar(a)
@@ -1405,7 +1405,7 @@ def page_training_plan():
             st.markdown(a["content_md"][:2000] + "..." if len(a["content_md"]) > 2000 else a["content_md"])
     
     with tab3:
-        if not a:
+        if not tp:
             st.info("暂无培养方案。请先生成或上传。")
         else:
             edited = md_textarea("在线编辑培养方案（支持直接修改）", a["content_md"], key="tp_edit")
@@ -1416,7 +1416,7 @@ def page_training_plan():
                 st.rerun()
     
     with tab4:
-        if not a:
+        if not tp:
             st.info("暂无培养方案。")
         else:
             vers = get_versions(a["id"])
