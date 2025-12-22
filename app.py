@@ -1992,7 +1992,10 @@ def page_training_plan():
             st.markdown("#### Markdown预览")
             st.markdown(a["content_md"][:2000] + "..." if len(a["content_md"]) > 2000 else a["content_md"])
     
+        result: Optional[ExtractResult] = st.session_state.get("extract_result")
 
+        if result is None:
+            st.stop()
         
         # 概览指标
         c1, c2, c3, c4 = st.columns(4)
