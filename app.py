@@ -1160,7 +1160,7 @@ def page_training_plan():
     st.markdown("### 培养方案底座（training_plan）")
     st.caption("培养方案是教学文档链的起点，需上传PDF并确认提取结果，或直接编辑。")
     
-    tab1, tab2, tab3, tab4, tab5 = st.tabs(["PDF全量抽取独立界面（增强）", "PDF上传/抽取/确认", "查看当前", "编辑", "版本"])
+    tab1, tab2, tab3, tab4, tab5 = st.tabs(["PDF全量抽取独立界面（增强）", "一键生成", "查看当前", "编辑", "版本"])
     
 
     with tab1:
@@ -1312,7 +1312,7 @@ def page_training_plan():
                                     st.info(f"表格 {i} 为空或无法解析")
 
     with tab2:
-            st.markdown("#### 方式A：一键生成（演示/快速）")
+            st.markdown("#### 一键生成（演示/快速）")
             major = st.text_input("专业", value="材料成型及控制工程", key="tp_major")
             grade = st.text_input("年级", value="22", key="tp_grade")
             group = st.text_input("课程体系/方向", value="材料成型-数值模拟方向", key="tp_group")
