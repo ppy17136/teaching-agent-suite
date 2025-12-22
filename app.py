@@ -1,719 +1,595 @@
 # app.py
-# -*- coding: utf-8 -*-
-"""
-培养方案 PDF 全量抽取（文本 + 表格 + 结构化解析）
-- 目标：尽量“全量、可追溯、可扩展”。后续所有教学文件都可以以该基础库为依据。
-- 设计原则：
-  1) 全文/分页文本保留（用于溯源与二次解析）
-  2) 所有附表尽量抽取为结构化表格（并做合并单元格“向下填充”修复）
-  3) 关键结构化信息：培养目标、毕业要求（12条+分项）、各大章标题
-  4) 明确专业方向：焊接 / 无损检测（页面级 + 行级提示）
-"""
-
-from __future__ import annotations
+# 培养方案 PDF 全量抽取（文本 + 表格 + 结构化解析）— 基础底库
+# 依赖建议：streamlit, pdfplumber, pandas
+# 可选：openpyxl 或 xlsxwriter（用于导出xlsx）；pytesseract（用于OCR）
 
 import io
-import json
 import re
+import json
+import hashlib
 import zipfile
-from dataclasses import asdict, dataclass
-from typing import Any, Dict, List, Optional, Tuple
+from datetime import datetime
 
-import numpy as np
 import pandas as pd
 import streamlit as st
 
-# 依赖：pdfplumber + camelot
-import pdfplumber
-
 try:
-    import camelot
-except Exception:  # pragma: no cover
-    camelot = None
+    import pdfplumber
+except Exception as e:
+    pdfplumber = None
+
+# ----------------------------
+# UI config
+# ----------------------------
+st.set_page_config(page_title="培养方案PDF全量抽取（基础底库）", layout="wide")
+
+st.markdown(
+    """
+<style>
+/* 让主区域更“铺满”，减少左右空白 */
+.block-container { padding-top: 1.2rem; padding-bottom: 2rem; max-width: 98vw; }
+</style>
+""",
+    unsafe_allow_html=True,
+)
+
+st.title("培养方案 PDF 全量抽取（文本 + 表格 + 结构化解析）")
+st.caption("目标：把培养方案作为“基础底库”尽可能完整抽取，供后续所有教学文件生成/校核使用。")
 
 
 # ----------------------------
-# 基础工具
+# helpers
 # ----------------------------
-def clean_text(s: str) -> str:
-    if s is None:
+def sha256_bytes(data: bytes) -> str:
+    h = hashlib.sha256()
+    h.update(data)
+    return h.hexdigest()
+
+
+def safe_strip(x):
+    if x is None:
         return ""
-    s = str(s)
-    s = s.replace("\u00a0", " ")
-    s = re.sub(r"[ \t]+", " ", s)
-    return s.strip()
+    return str(x).strip()
 
 
-def normalize_multiline(text: str) -> str:
-    """保留换行，做基础清理，便于正则分段。"""
-    if text is None:
+def normalize_table(raw_table):
+    """
+    pdfplumber.extract_tables() 返回 list[list[str|None]]
+    这里做基础清洗：去空行、补齐列数、去掉全空列
+    """
+    if not raw_table:
+        return None
+
+    rows = []
+    max_cols = 0
+    for r in raw_table:
+        if r is None:
+            continue
+        rr = [safe_strip(c) for c in r]
+        # 跳过全空行
+        if all(c == "" for c in rr):
+            continue
+        rows.append(rr)
+        max_cols = max(max_cols, len(rr))
+
+    if not rows or max_cols == 0:
+        return None
+
+    # 补齐列数
+    for i in range(len(rows)):
+        if len(rows[i]) < max_cols:
+            rows[i] = rows[i] + [""] * (max_cols - len(rows[i]))
+
+    # 去掉全空列
+    keep_cols = []
+    for j in range(max_cols):
+        col = [rows[i][j] for i in range(len(rows))]
+        if any(c != "" for c in col):
+            keep_cols.append(j)
+
+    if not keep_cols:
+        return None
+
+    cleaned = [[row[j] for j in keep_cols] for row in rows]
+    return cleaned
+
+
+def table_to_df(cleaned_table):
+    """
+    尝试把第一行当表头；如果表头太差就用默认列名。
+    """
+    if not cleaned_table or len(cleaned_table) == 0:
+        return None
+    if len(cleaned_table) == 1:
+        # 只有一行，做单行df
+        return pd.DataFrame([cleaned_table[0]])
+
+    header = cleaned_table[0]
+    body = cleaned_table[1:]
+
+    # 表头判定：至少有一半单元格非空
+    non_empty = sum(1 for x in header if safe_strip(x) != "")
+    if non_empty >= max(1, len(header) // 2):
+        cols = [h if h else f"col_{i+1}" for i, h in enumerate(header)]
+        return pd.DataFrame(body, columns=cols)
+
+    # 否则不用表头
+    return pd.DataFrame(cleaned_table)
+
+
+def try_ocr_page(plumber_page) -> str:
+    """
+    可选OCR：仅在 pytesseract 存在且系统有 tesseract 时可用。
+    不满足条件则返回空串，不抛异常。
+    """
+    try:
+        import pytesseract  # noqa
+        from PIL import Image  # noqa
+    except Exception:
         return ""
-    text = str(text).replace("\r\n", "\n").replace("\r", "\n")
-    lines = [clean_text(ln) for ln in text.split("\n")]
-    out: List[str] = []
-    blank = 0
-    for ln in lines:
-        if ln.strip() == "":
-            blank += 1
-            if blank <= 2:
-                out.append("")
+
+    try:
+        img = plumber_page.to_image(resolution=220).original
+        # pytesseract 对中文需要 chi_sim；若环境没装中文语言包也可能效果一般
+        text = pytesseract.image_to_string(img, lang="chi_sim+eng")
+        return text.strip()
+    except Exception:
+        return ""
+
+
+# ----------------------------
+# core: extract
+# ----------------------------
+@st.cache_data(show_spinner=False)
+def extract_pdf_all(pdf_bytes: bytes, enable_ocr: bool = False):
+    if pdfplumber is None:
+        raise RuntimeError("缺少依赖 pdfplumber，请先在 requirements.txt 安装：pdfplumber")
+
+    meta = {
+        "sha256": sha256_bytes(pdf_bytes),
+        "extracted_at": datetime.now().isoformat(timespec="seconds"),
+        "ocr_enabled": bool(enable_ocr),
+    }
+
+    pages = []
+    total_tables = 0
+
+    with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+        meta["n_pages"] = len(pdf.pages)
+
+        # table settings：偏“宽松”，提升跨页/复杂表格提取成功率
+        table_settings = {
+            "vertical_strategy": "lines",
+            "horizontal_strategy": "lines",
+            "intersection_tolerance": 5,
+            "snap_tolerance": 3,
+            "join_tolerance": 3,
+            "edge_min_length": 3,
+            "min_words_vertical": 1,
+            "min_words_horizontal": 1,
+            "text_tolerance": 2,
+        }
+
+        for idx, page in enumerate(pdf.pages, start=1):
+            text = page.extract_text() or ""
+            text = text.strip()
+
+            # 如果这一页几乎没字且用户勾选OCR，就尝试OCR补救
+            if enable_ocr and len(text) < 20:
+                ocr_text = try_ocr_page(page)
+                if len(ocr_text) > len(text):
+                    text = ocr_text
+
+            raw_tables = []
+            try:
+                raw_tables = page.extract_tables(table_settings=table_settings) or []
+            except Exception:
+                raw_tables = []
+
+            cleaned_tables = []
+            for t in raw_tables:
+                ct = normalize_table(t)
+                if ct:
+                    cleaned_tables.append(ct)
+
+            total_tables += len(cleaned_tables)
+
+            pages.append(
+                {
+                    "page": idx,
+                    "text": text,
+                    "tables": cleaned_tables,  # list of list-of-rows
+                }
+            )
+
+    meta["n_tables"] = total_tables
+    return {"meta": meta, "pages": pages}
+
+
+# ----------------------------
+# core: structure parse
+# ----------------------------
+def join_all_text(pages):
+    chunks = []
+    for p in pages:
+        t = safe_strip(p.get("text", ""))
+        if t:
+            chunks.append(f"[PAGE {p['page']}]\n{t}")
+    return "\n\n".join(chunks)
+
+
+def extract_section(full_text: str, start_keywords, end_keywords):
+    """
+    从全文中按“起止关键词”粗切片（适用于培养目标、毕业要求等）
+    """
+    start_pat = "|".join(map(re.escape, start_keywords))
+    end_pat = "|".join(map(re.escape, end_keywords))
+
+    m = re.search(rf"({start_pat})", full_text)
+    if not m:
+        return ""
+
+    start = m.start()
+    tail = full_text[start:]
+
+    m2 = re.search(rf"({end_pat})", tail[10:])  # 略过开头10字符，避免同词误触
+    if not m2:
+        return tail.strip()
+
+    end = 10 + m2.start()
+    return tail[:end].strip()
+
+
+def parse_objectives(section_text: str):
+    """
+    培养目标常见格式：(1)(2)... 或 1. 2. / 1、2、
+    """
+    if not section_text:
+        return []
+
+    # 去掉页码标记
+    txt = re.sub(r"\[PAGE\s+\d+\]", "", section_text)
+
+    # 先抓 (1) (2)...
+    items = re.split(r"\(\s*\d+\s*\)", txt)
+    items = [i.strip() for i in items if i.strip()]
+    if len(items) >= 2:
+        return items
+
+    # 再抓 1. / 1、 2.
+    parts = re.split(r"(?m)^\s*\d+\s*[\.、]\s*", txt)
+    parts = [p.strip() for p in parts if p.strip()]
+    # 过滤掉明显是标题/过短
+    parts = [p for p in parts if len(p) >= 10]
+    return parts
+
+
+def parse_graduation_requirements(section_text: str):
+    """
+    目标：尽量整理出 1-12 条毕业要求
+    """
+    if not section_text:
+        return {}
+
+    txt = re.sub(r"\[PAGE\s+\d+\]", "", section_text)
+    txt = txt.replace("：", ":")
+    # 常见： "毕业要求1" / "毕业要求 1" / "1." / "1、"
+    # 先统一把“毕业要求X”变成换行 + X.
+    txt = re.sub(r"毕业要求\s*([1-9]|1[0-2])\s*", r"\n\1. ", txt)
+
+    # 用行首数字切
+    chunks = re.split(r"(?m)^\s*([1-9]|1[0-2])\s*[\.、]\s*", txt)
+    # re.split 会得到： [pre, num1, text1, num2, text2,...]
+    req = {}
+    if len(chunks) >= 3:
+        pre = chunks[0].strip()
+        it = chunks[1:]
+        for i in range(0, len(it) - 1, 2):
+            num = int(it[i])
+            content = it[i + 1].strip()
+            # 截断到下一个大标题前的残留（经验性）
+            content = re.split(r"\n\s*(课程体系|课程设置|课程结构|课程一览|学分|附表)", content)[0].strip()
+            if content:
+                req[num] = content
+
+    # 若仍不够，尝试再从文本中找“X）/X)” 形式
+    if len(req) < 10:
+        alt = re.split(r"(?m)^\s*([1-9]|1[0-2])\s*[\)）]\s*", txt)
+        if len(alt) >= 3:
+            it = alt[1:]
+            for i in range(0, len(it) - 1, 2):
+                num = int(it[i])
+                content = it[i + 1].strip()
+                content = re.split(r"\n\s*(课程体系|课程设置|课程结构|课程一览|学分|附表)", content)[0].strip()
+                if content and num not in req:
+                    req[num] = content
+
+    # 保序输出
+    return dict(sorted(req.items(), key=lambda x: x[0]))
+
+
+def collect_course_tables(pages):
+    """
+    从所有表格里找“像课程表”的表：包含关键词（课程/学分/学时/性质/类别等）
+    并将同类表尽量合并。
+    """
+    dfs = []
+    for p in pages:
+        for t in p.get("tables", []):
+            df = table_to_df(t)
+            if df is None or df.empty:
+                continue
+            # 判断是否像课程表
+            flat = " ".join([safe_strip(c) for c in df.columns]) + " " + " ".join(
+                safe_strip(x) for x in df.head(3).astype(str).values.flatten().tolist()
+            )
+            key_hits = sum(
+                1
+                for kw in ["课程", "学分", "学时", "性质", "类别", "必修", "选修", "开课", "理论", "实践", "周学时"]
+                if kw in flat
+            )
+            if key_hits >= 2:
+                df2 = df.copy()
+                df2.insert(0, "__page__", p["page"])
+                dfs.append(df2)
+
+    if not dfs:
+        return None
+
+    # 简单合并：按列名完全一致优先concat；否则直接返回列表
+    # 这里保守处理，避免强行对齐导致错位
+    groups = {}
+    for df in dfs:
+        sig = tuple(df.columns.tolist())
+        groups.setdefault(sig, []).append(df)
+
+    merged = []
+    for sig, group in groups.items():
+        if len(group) == 1:
+            merged.append(group[0])
         else:
-            blank = 0
-            out.append(ln)
-    return "\n".join(out).strip()
+            merged.append(pd.concat(group, ignore_index=True))
+
+    return merged
 
 
-def make_unique_columns(cols: List[str]) -> List[str]:
-    seen: Dict[str, int] = {}
-    out: List[str] = []
-    for c in cols:
-        c0 = clean_text(c) or "col"
-        if c0 not in seen:
-            seen[c0] = 1
-            out.append(c0)
-        else:
-            seen[c0] += 1
-            out.append(f"{c0}_{seen[c0]}")
-    return out
+def parse_structured(extracted):
+    pages = extracted["pages"]
+    full_text = join_all_text(pages)
+
+    # 根据常见培养方案结构做粗切
+    objectives_text = extract_section(
+        full_text,
+        start_keywords=["培养目标", "一、培养目标", "（一）培养目标"],
+        end_keywords=["毕业要求", "二、毕业要求", "（二）毕业要求", "课程体系", "课程设置", "课程结构"],
+    )
+
+    gradreq_text = extract_section(
+        full_text,
+        start_keywords=["毕业要求", "二、毕业要求", "（二）毕业要求"],
+        end_keywords=["课程体系", "课程设置", "课程结构", "课程一览", "课程表", "学分要求", "附表"],
+    )
+
+    objectives = parse_objectives(objectives_text)
+    gradreq = parse_graduation_requirements(gradreq_text)
+
+    course_tables = collect_course_tables(pages)
+
+    structured = {
+        "objectives": objectives,
+        "graduation_requirements": gradreq,  # dict {1: "...", ..., 12:"..."}
+        "course_tables_count": 0 if not course_tables else len(course_tables),
+    }
+
+    return structured, full_text, course_tables
 
 
-def postprocess_table_df(df: pd.DataFrame) -> pd.DataFrame:
-    """表格后处理：去空白、去 NaN、合并格造成的空白做向下填充。"""
-    if df is None or df.empty:
-        return df
-
-    df = df.copy()
-    df = df.replace({None: ""}).fillna("")
-    for c in df.columns:
-        df[c] = df[c].astype(str).map(lambda x: clean_text(x))
-
-    # 1) 删除完全空行
-    mask_all_empty = df.apply(lambda r: all((clean_text(x) == "" for x in r.values.tolist())), axis=1)
-    df = df.loc[~mask_all_empty].reset_index(drop=True)
-
-    # 2) 向下填充（合并格常见列）
-    fill_down_keywords = ["课程体系", "课程模块", "课程性质", "课程类别", "类别", "模块", "环节", "学期", "方向"]
-    for c in df.columns:
-        if any(k in str(c) for k in fill_down_keywords):
-            last = ""
-            new_col = []
-            for v in df[c].tolist():
-                if v != "":
-                    last = v
-                    new_col.append(v)
-                else:
-                    new_col.append(last)
-            df[c] = new_col
-
-    return df
+# ----------------------------
+# export builders
+# ----------------------------
+def build_json_bytes(extracted, structured, full_text):
+    pack = {
+        "meta": extracted["meta"],
+        "structured": structured,
+        "full_text": full_text,
+        "pages": extracted["pages"],
+    }
+    return json.dumps(pack, ensure_ascii=False, indent=2).encode("utf-8")
 
 
-def safe_df_from_tablepack(t: Dict[str, Any]) -> pd.DataFrame:
-    """rows/columns 不匹配时也能生成 DataFrame，避免 ValueError。"""
-    cols = t.get("columns") or []
-    rows = t.get("rows") or []
-
-    cols = make_unique_columns([clean_text(c) for c in cols]) if cols else []
-
-    if rows and isinstance(rows[0], dict):
-        df = pd.DataFrame(rows)
-        if cols:
-            df = df.reindex(columns=cols, fill_value="")
-        else:
-            df.columns = make_unique_columns([str(c) for c in df.columns])
-        return postprocess_table_df(df)
-
-    if rows and isinstance(rows[0], (str, int, float)):
-        df = pd.DataFrame({cols[0] if cols else "text": rows})
-        return postprocess_table_df(df)
-
-    # list[list]
-    max_len = max((len(r) for r in rows), default=0)
-    if not cols:
-        cols = make_unique_columns([f"col{i+1}" for i in range(max_len)])
-    else:
-        max_len = max(max_len, len(cols))
-        if len(cols) < max_len:
-            cols = cols + [f"col{len(cols)+i+1}" for i in range(max_len - len(cols))]
-
-    fixed_rows: List[List[Any]] = []
-    for r in rows:
-        r = list(r) if isinstance(r, (list, tuple)) else [r]
-        if len(r) < len(cols):
-            r = r + [""] * (len(cols) - len(r))
-        elif len(r) > len(cols):
-            r = r[: len(cols)]
-        fixed_rows.append(r)
-
-    df = pd.DataFrame(fixed_rows, columns=cols)
-    return postprocess_table_df(df)
-
-
-def make_tables_zip(tables: List[Dict[str, Any]]) -> bytes:
-    """CSV + tables.json 打包（不依赖 openpyxl）。"""
+def build_csv_zip_bytes(extracted, course_tables):
     buf = io.BytesIO()
-    with zipfile.ZipFile(buf, "w", compression=zipfile.ZIP_DEFLATED) as zf:
-        zf.writestr("tables.json", json.dumps(tables, ensure_ascii=False, indent=2))
-        for idx, t in enumerate(tables, start=1):
-            title = clean_text(t.get("title") or f"table_{idx}")
-            title_safe = re.sub(r"[^0-9A-Za-z\u4e00-\u9fff_\-]+", "_", title)[:80].strip("_") or f"table_{idx}"
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+        # pages text
+        rows = []
+        for p in extracted["pages"]:
+            rows.append({"page": p["page"], "text": p.get("text", "")})
+        df_pages = pd.DataFrame(rows)
+        z.writestr("pages_text.csv", df_pages.to_csv(index=False, encoding="utf-8-sig"))
 
-            df = safe_df_from_tablepack(t)
+        # all tables as csv (逐表输出)
+        t_index = 0
+        for p in extracted["pages"]:
+            for t in p.get("tables", []):
+                t_index += 1
+                df = table_to_df(t)
+                if df is None:
+                    continue
+                name = f"tables/page_{p['page']}_table_{t_index}.csv"
+                z.writestr(name, df.to_csv(index=False, encoding="utf-8-sig"))
 
-            # 方向列（便于后续）
-            direction = clean_text(t.get("direction") or "")
-            if direction and "专业方向" not in df.columns:
-                df.insert(0, "专业方向", direction)
+        # course tables merged
+        if course_tables:
+            for i, df in enumerate(course_tables, start=1):
+                z.writestr(f"course_tables_merged_{i}.csv", df.to_csv(index=False, encoding="utf-8-sig"))
 
-            csv_bytes = df.to_csv(index=False, encoding="utf-8-sig")
-            zf.writestr(f"{idx:02d}_{title_safe}.csv", csv_bytes)
     return buf.getvalue()
 
 
-# ----------------------------
-# PDF 抽取：文本 + 表格
-# ----------------------------
-def extract_pages_text(pdf_bytes: bytes) -> Tuple[List[str], str]:
-    """返回：每页文本列表 + 全文"""
-    pages: List[str] = []
-    with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
-        for p in pdf.pages:
-            txt = p.extract_text() or ""
-            pages.append(normalize_multiline(txt))
-    full_text = "\n".join(pages)
-    return pages, full_text
-
-
-def extract_tables_by_page(pdf_path: str) -> Dict[int, List[pd.DataFrame]]:
+def build_excel_bytes(extracted, structured, course_tables):
     """
-    Camelot 抽表。返回：page_no -> list[DataFrame]
-    注意：Streamlit Cloud 环境通常只能用 flavor=stream（无需 Ghostscript）。
+    尝试导出 xlsx：
+    - 若 openpyxl 或 xlsxwriter 存在则可用
+    - 两者都不存在则返回 None
     """
-    if camelot is None:
-        return {}
-
-    # 先试 stream；如果失败，再小范围兜底
+    engine = None
     try:
-        tables = camelot.read_pdf(pdf_path, pages="all", flavor="stream")
+        import openpyxl  # noqa
+        engine = "openpyxl"
     except Exception:
-        return {}
+        pass
 
-    by_page: Dict[int, List[pd.DataFrame]] = {}
-    for t in tables:
+    if engine is None:
         try:
-            page = int(getattr(t, "page", "1"))
+            import xlsxwriter  # noqa
+            engine = "xlsxwriter"
         except Exception:
-            page = 1
+            pass
 
-        df = t.df.copy()
-        # 尝试把第一行当表头（常见）
-        if len(df) >= 2:
-            header = [clean_text(x) for x in df.iloc[0].tolist()]
-            body = df.iloc[1:].copy()
-            # 如果 header 比较“像标题行”，用它当 columns
-            if sum(1 for x in header if x) >= max(2, len(header) // 3):
-                body.columns = make_unique_columns(header)
-                df2 = body.reset_index(drop=True)
-            else:
-                df2 = df.reset_index(drop=True)
-                df2.columns = make_unique_columns([f"col{i+1}" for i in range(df2.shape[1])])
-        else:
-            df2 = df.reset_index(drop=True)
-            df2.columns = make_unique_columns([f"col{i+1}" for i in range(df2.shape[1])])
+    if engine is None:
+        return None, "未检测到 openpyxl/xlsxwriter，无法导出xlsx（已提供JSON/CSV导出）。"
 
-        df2 = postprocess_table_df(df2)
-        by_page.setdefault(page, []).append(df2)
+    output = io.BytesIO()
+    with pd.ExcelWriter(output, engine=engine) as writer:
+        # meta
+        meta_df = pd.DataFrame([extracted["meta"]])
+        meta_df.to_excel(writer, index=False, sheet_name="meta")
 
-    return by_page
+        # objectives
+        obj_df = pd.DataFrame(
+            [{"idx": i + 1, "培养目标": t} for i, t in enumerate(structured.get("objectives", []))]
+        )
+        obj_df.to_excel(writer, index=False, sheet_name="培养目标")
 
+        # graduation requirements
+        gr = structured.get("graduation_requirements", {})
+        gr_df = pd.DataFrame([{"编号": k, "毕业要求": v} for k, v in gr.items()])
+        gr_df.to_excel(writer, index=False, sheet_name="毕业要求")
 
-# ----------------------------
-# 结构化解析：章节/毕业要求/培养目标/附表标题
-# ----------------------------
-def split_sections(full_text: str) -> Dict[str, str]:
-    """
-    按 “一、/二、/三、...” 大章切分。
-    兼容：三、 / 三. / 三．
-    """
-    text = normalize_multiline(full_text)
-    lines = text.splitlines()
-    pat = re.compile(r"^\s*([一二三四五六七八九十]+)\s*[、\.．]\s*([^\n\r]+?)\s*$")
+        # pages text (长文本放一列)
+        pages_df = pd.DataFrame([{"page": p["page"], "text": p.get("text", "")} for p in extracted["pages"]])
+        pages_df.to_excel(writer, index=False, sheet_name="pages_text")
 
-    sections: Dict[str, List[str]] = {}
-    cur_key = "封面/前言"
+        # course tables merged
+        if course_tables:
+            for i, df in enumerate(course_tables, start=1):
+                sheet = f"课程表合并_{i}"
+                # sheet名最长31字符
+                sheet = sheet[:31]
+                df.to_excel(writer, index=False, sheet_name=sheet)
 
-    for ln in lines:
-        m = pat.match(ln)
-        if m:
-            num = m.group(1)
-            title = clean_text(m.group(2))
-            cur_key = f"{num}、{title}"
-            sections.setdefault(cur_key, [])
-        else:
-            sections.setdefault(cur_key, []).append(ln)
-
-    return {k: "\n".join(v).strip() for k, v in sections.items()}
-
-
-def extract_appendix_titles(full_text: str) -> Dict[str, str]:
-    """抽取“附表X -> 标题（可能含七、八…）”"""
-    titles: Dict[str, str] = {}
-    text = normalize_multiline(full_text)
-    for raw in text.splitlines():
-        line = raw.strip()
-        if not line:
-            continue
-
-        # 1) 附表1：XXXX
-        m = re.search(r"(附表\s*\d+)\s*[:：]\s*(.+)$", line)
-        if m:
-            key = re.sub(r"\s+", "", m.group(1))
-            val = clean_text(m.group(2))
-            if val:
-                titles[key] = val
-            continue
-
-        # 2) 七、XXXX（附表1）
-        m = re.search(r"^(?P<title>.+?)\s*[（(]\s*(?P<key>附表\s*\d+)\s*[)）]\s*$", line)
-        if m:
-            key = re.sub(r"\s+", "", m.group("key"))
-            val = clean_text(m.group("title"))
-            if val:
-                titles[key] = val
-            continue
-
-        # 3) 行内出现（附表X）
-        m = re.search(r"(?P<title>.+?)\s*[（(]\s*(?P<key>附表\s*\d+)\s*[)）]", line)
-        if m:
-            key = re.sub(r"\s+", "", m.group("key"))
-            val = clean_text(m.group("title"))
-            if val and key not in titles:
-                titles[key] = val
-
-    return titles
-
-
-def parse_training_objectives(section_text: str) -> Dict[str, Any]:
-    """
-    提取“培养目标”条目。返回 items(list[str]) + raw。
-    尽量包容：1) / 1． / 1、 / （1）等。
-    """
-    raw = normalize_multiline(section_text)
-    lines = [ln.strip() for ln in raw.splitlines() if ln.strip()]
-    items: List[str] = []
-
-    pat = re.compile(r"^(?:（?\s*\d+\s*）?|\d+\s*[\.、．])\s*(.+)$")
-    for ln in lines:
-        m = pat.match(ln)
-        if m:
-            body = clean_text(m.group(1))
-            if body:
-                items.append(body)
-
-    # 如果没抓到编号条目，退化：取前若干行（不丢信息）
-    if not items:
-        items = lines[:30]
-
-    return {"count": len(items), "items": items, "raw": raw}
-
-
-def parse_graduation_requirements(text_any: str) -> Dict[str, Any]:
-    """
-    抽取 12 条毕业要求及其分项 1.1/1.2…
-    返回结构：{"count":..,"items":[{"no":1,"title":"工程知识","body":"...","subitems":[...]}], "raw":...}
-    """
-    text = normalize_multiline(text_any or "")
-
-    # 定位“二、毕业要求”
-    start = re.search(r"(?m)^\s*(二\s*[、\.．]?\s*毕业要求|毕业要求)\s*$", text)
-    if start:
-        tail = text[start.start():]
-    else:
-        tail = text
-
-    # 截断到下一大章
-    end = re.search(r"(?m)^\s*[三四五六七八九十]\s*[、\.．]", tail)
-    if end:
-        tail = tail[:end.start()]
-
-    lines = [ln.strip() for ln in tail.splitlines()]
-
-    main_pat = re.compile(r"^(?P<no>\d{1,2})\s*[\.、](?!\d)\s*(?P<body>.+)$")   # 1. xxx (排除 1.1)
-    sub_pat = re.compile(r"^(?P<no>\d{1,2}\.\d{1,2})\s+(?P<body>.+)$")       # 1.1 xxx
-
-    items: List[Dict[str, Any]] = []
-    cur: Optional[Dict[str, Any]] = None
-    cur_sub: Optional[Dict[str, Any]] = None
-
-    def flush_sub():
-        nonlocal cur_sub, cur
-        if cur is not None and cur_sub is not None:
-            cur.setdefault("subitems", []).append(cur_sub)
-        cur_sub = None
-
-    def flush_item():
-        nonlocal cur
-        if cur is not None:
-            cur["title"] = clean_text(cur.get("title", ""))
-            cur["body"] = clean_text(cur.get("body", ""))
-            for s in cur.get("subitems", []):
-                s["body"] = clean_text(s.get("body", ""))
-            items.append(cur)
-        cur = None
-
-    for ln in lines:
-        if not ln:
-            continue
-
-        m_main = main_pat.match(ln)
-        m_sub = sub_pat.match(ln)
-
-        if m_main:
-            flush_sub()
-            flush_item()
-            no = int(m_main.group("no"))
-            body_full = clean_text(m_main.group("body"))
-
-            # 处理“工程知识：...”这种
-            title = ""
-            body = body_full
-            if "：" in body_full:
-                title, body = body_full.split("：", 1)
-                title = clean_text(title)
-                body = clean_text(body)
-
-            cur = {"no": no, "title": title, "body": body, "subitems": []}
-            continue
-
-        if m_sub and cur is not None:
-            flush_sub()
-            cur_sub = {"no": m_sub.group("no"), "body": clean_text(m_sub.group("body"))}
-            continue
-
-        # 续行
-        if cur_sub is not None:
-            cur_sub["body"] += " " + ln
-        elif cur is not None:
-            cur["body"] += " " + ln
-
-    flush_sub()
-    flush_item()
-
-    items = sorted(items, key=lambda x: x.get("no", 999))
-    if len(items) > 12:
-        items = [x for x in items if 1 <= x.get("no", 0) <= 12]
-
-    return {"count": len(items), "items": items, "raw": tail.strip()}
+    return output.getvalue(), f"已使用 {engine} 导出xlsx。"
 
 
 # ----------------------------
-# 表格标题/方向
+# UI
 # ----------------------------
-def guess_table_appendix_by_page(page_no: int) -> Optional[str]:
-    """
-    针对常见培养方案（本样例 18 页）：
-    10-11 附表1，12 附表2，13-14 附表3，15 附表4，16 附表5
-    如果换不同模板，请自行调整或改为更智能的页内检测。
-    """
-    mapping = {
-        10: "附表1", 11: "附表1",
-        12: "附表2",
-        13: "附表3", 14: "附表3",
-        15: "附表4",
-        16: "附表5",
-    }
-    return mapping.get(page_no)
-
-
-def infer_table_title_from_page_text(page_text: str, appendix: Optional[str], appendix_titles: Dict[str, str], page_no: int) -> str:
-    if appendix and appendix in appendix_titles:
-        return appendix_titles[appendix]
-
-    if appendix:
-        m = re.search(rf"(?P<title>[^\n\r]{{2,120}}?)\s*[（(]\s*{re.escape(appendix)}\s*[)）]", page_text)
-        if m:
-            return clean_text(m.group("title"))
-
-    m = re.search(r"(附表\s*\d+)\s*[:：]\s*([^\n\r]{2,120})", page_text)
-    if m:
-        return clean_text(m.group(2))
-
-    return appendix or f"第{page_no}页表格"
-
-
-def infer_direction_for_page(page_text: str) -> str:
-    has_weld = "焊接" in page_text
-    has_ndt = ("无损" in page_text) or ("无损检测" in page_text)
-    if has_weld and has_ndt:
-        return "混合（焊接+无损检测）"
-    if has_weld:
-        return "焊接"
-    if has_ndt:
-        return "无损检测"
-    return ""
-
-
-def add_direction_column_rowwise(df: pd.DataFrame, page_direction: str) -> pd.DataFrame:
-    """
-    行级方向识别：若表内有“焊接方向/无损检测方向”分隔行，则从该行开始向下标注。
-    若识别不到，则使用 page_direction。
-    """
-    if df is None or df.empty:
-        return df
-
-    df = df.copy()
-    cur_dir = ""
-    dirs = []
-    for _, row in df.iterrows():
-        row_txt = " ".join([clean_text(x) for x in row.values.tolist()])
-        if re.search(r"焊接.*方向", row_txt):
-            cur_dir = "焊接"
-        elif re.search(r"无损.*方向", row_txt) or re.search(r"无损检测.*方向", row_txt):
-            cur_dir = "无损检测"
-
-        dirs.append(cur_dir or page_direction)
-
-    # 插到最前
-    if "专业方向" not in df.columns:
-        df.insert(0, "专业方向", dirs)
-    else:
-        df["专业方向"] = [d or page_direction for d in dirs]
-
-    return df
-
-
-# ----------------------------
-# 输出结构
-# ----------------------------
-@dataclass
-class TablePack:
-    page: int
-    title: str
-    appendix: str
-    direction: str
-    columns: List[str]
-    rows: List[List[Any]]
-
-
-@dataclass
-class ExtractResult:
-    page_count: int
-    table_count: int
-    ocr_used: bool
-    file_sha256: str
-    pages_text: List[str]
-    sections: Dict[str, str]
-    appendix_titles: Dict[str, str]
-    training_objectives: Dict[str, Any]
-    graduation_requirements: Dict[str, Any]
-    tables: List[Dict[str, Any]]  # TablePack as dict
-
-
-# ----------------------------
-# 主流程
-# ----------------------------
-def sha256_bytes(data: bytes) -> str:
-    import hashlib
-    return hashlib.sha256(data).hexdigest()
-
-
-def run_full_extract(pdf_bytes: bytes, use_ocr: bool = False) -> ExtractResult:
-    # 1) 文本
-    pages_text, full_text = extract_pages_text(pdf_bytes)
-    sections = split_sections(full_text)
-    appendix_titles = extract_appendix_titles(full_text)
-
-    # 2) 关键结构化：培养目标、毕业要求
-    #   - 培养目标通常在“一、培养目标”
-    obj_key = next((k for k in sections.keys() if "培养目标" in k), "")
-    obj = parse_training_objectives(sections.get(obj_key, "") or full_text)
-
-    grad = parse_graduation_requirements(full_text)
-
-    # 3) 表格（需要落盘一个临时文件给 camelot）
-    tables_by_page: Dict[int, List[pd.DataFrame]] = {}
-    tables: List[TablePack] = []
-    if camelot is not None:
-        tmp_path = "/tmp/training_plan.pdf"
-        with open(tmp_path, "wb") as f:
-            f.write(pdf_bytes)
-        tables_by_page = extract_tables_by_page(tmp_path)
-
-        for page_no, dfs in tables_by_page.items():
-            page_txt = pages_text[page_no - 1] if 0 <= page_no - 1 < len(pages_text) else ""
-            appendix = guess_table_appendix_by_page(page_no) or ""
-            base_title = infer_table_title_from_page_text(page_txt, appendix or None, appendix_titles, page_no)
-            title = f"{base_title}（{appendix}）" if appendix and appendix not in base_title else base_title
-            page_dir = infer_direction_for_page(page_txt)
-
-            for i, df in enumerate(dfs):
-                df2 = add_direction_column_rowwise(df, page_dir)
-                sub_title = title if len(dfs) == 1 else f"{title} - 表{i+1}"
-                pack = TablePack(
-                    page=page_no,
-                    title=sub_title,
-                    appendix=appendix,
-                    direction=page_dir,
-                    columns=[str(c) for c in df2.columns],
-                    rows=df2.values.tolist(),
-                )
-                tables.append(pack)
-
-    result = ExtractResult(
-        page_count=len(pages_text),
-        table_count=sum(len(v) for v in tables_by_page.values()) if tables_by_page else 0,
-        ocr_used=bool(use_ocr),
-        file_sha256=sha256_bytes(pdf_bytes),
-        pages_text=pages_text,
-        sections=sections,
-        appendix_titles=appendix_titles,
-        training_objectives=obj,
-        graduation_requirements=grad,
-        tables=[asdict(t) for t in tables],
-    )
-    return result
-
-
-# ----------------------------
-# Streamlit UI
-# ----------------------------
-st.set_page_config(page_title="培养方案PDF全量抽取（基础库）", layout="wide")
-
-st.markdown("# 培养方案 PDF 全量抽取（文本 + 表格 + 结构化解析）")
-st.info("上传培养方案 PDF → 一键抽取全文文本、章节结构、毕业要求、培养目标、附表表格，并可下载 JSON/CSV。")
-
 with st.sidebar:
-    st.markdown("## 上传与抽取")
-    uploaded = st.file_uploader("上传培养方案 PDF", type=["pdf"])
-    use_ocr = st.checkbox("对无文本页启用 OCR（可选）", value=False, help="本版本默认不做 OCR（避免部署复杂度），保留开关以便后续扩展。")
-    run_btn = st.button("开始全量抽取", type="primary")
+    st.header("上传与抽取")
+    pdf_file = st.file_uploader("上传培养方案 PDF", type=["pdf"])
+    enable_ocr = st.checkbox("对于无文字页启用 OCR（可选）", value=False)
+    start_btn = st.button("开始全量抽取", type="primary")
 
-if "extract_result" not in st.session_state:
-    st.session_state["extract_result"] = None
-
-if run_btn:
-    if not uploaded:
-        st.warning("请先上传 PDF。")
-    else:
-        pdf_bytes = uploaded.getvalue()
-        with st.spinner("正在抽取…"):
-            st.session_state["extract_result"] = run_full_extract(pdf_bytes, use_ocr=use_ocr)
-
-result: Optional[ExtractResult] = st.session_state.get("extract_result")
-
-if result is None:
+if not pdf_file:
+    st.info("请先在左侧上传你的《2024培养方案.pdf》之类的培养方案文件，然后点击“开始全量抽取”。")
     st.stop()
 
-# 概览指标
-c1, c2, c3, c4 = st.columns(4)
-c1.metric("总页数", result.page_count)
-c2.metric("表格总数", result.table_count)
-c3.metric("OCR启用", "是" if result.ocr_used else "否")
-c4.caption(f"SHA256: {result.file_sha256}")
+pdf_bytes = pdf_file.read()
 
-tabs = st.tabs(["概览与下载", "章节大标题（全部）", "培养目标", "毕业要求（12条）", "附表表格（可下载CSV）", "分页原文（溯源）"])
+if start_btn:
+    with st.spinner("正在逐页抽取（文本 + 表格）..."):
+        extracted = extract_pdf_all(pdf_bytes, enable_ocr=enable_ocr)
 
-# ---- Tab 0 概览与下载
-with tabs[0]:
-    st.markdown("### 结构化识别结果（可先在这里校对）")
+    structured, full_text, course_tables = parse_structured(extracted)
 
-    # 下载 JSON（全量）
-    json_bytes = json.dumps(asdict(result), ensure_ascii=False, indent=2).encode("utf-8")
+    # 顶部指标
+    c1, c2, c3, c4 = st.columns([1, 1, 1, 3])
+    c1.metric("总页数", extracted["meta"]["n_pages"])
+    c2.metric("表格总数", extracted["meta"]["n_tables"])
+    c3.metric("OCR启用", "是" if extracted["meta"]["ocr_enabled"] else "否")
+    c4.caption(f"SHA256: {extracted['meta']['sha256']}")
+
+    # 结构化结果区
+    st.subheader("结构化识别结果（可先在这里核对）")
+
+    left, right = st.columns([1, 1])
+
+    with left:
+        st.markdown("### 培养目标（抽取）")
+        obj = structured.get("objectives", [])
+        if not obj:
+            st.warning("未识别到培养目标（可能标题写法不同/扫描页）。建议勾选OCR或检查PDF是否为图片版。")
+        else:
+            for i, t in enumerate(obj, start=1):
+                st.write(f"{i}. {t}")
+
+    with right:
+        st.markdown("### 毕业要求（抽取）")
+        gr = structured.get("graduation_requirements", {})
+        st.caption(f"当前识别到：{len(gr)} 条（目标通常为 12 条）")
+        if not gr:
+            st.warning("未识别到毕业要求。建议勾选OCR或检查该部分是否在表格/图片中。")
+        else:
+            gr_df = pd.DataFrame([{"编号": k, "毕业要求": v} for k, v in gr.items()])
+            st.dataframe(gr_df, use_container_width=True, height=260)
+
+    # 课程表
+    st.markdown("### 课程相关表格（自动筛选/跨页合并）")
+    if not course_tables:
+        st.info("未筛选到明显的课程表（可能课程表被识别为图片或表格线不规则）。可尝试启用OCR，或后续增强表格提取策略。")
+    else:
+        for i, df in enumerate(course_tables, start=1):
+            st.markdown(f"**合并表 {i}**（含页码列 __page__）")
+            st.dataframe(df, use_container_width=True, height=260)
+
+    # 下载区
+    st.divider()
+    st.subheader("导出（基础底库）")
+
+    json_bytes = build_json_bytes(extracted, structured, full_text)
     st.download_button(
-        "下载抽取结果 JSON（全量基础库）",
+        "下载抽取结果 JSON（全量底库）",
         data=json_bytes,
         file_name="training_plan_full_extract.json",
         mime="application/json",
         use_container_width=True,
     )
 
-    if result.tables:
-        zip_bytes = make_tables_zip(result.tables)
+    zip_bytes = build_csv_zip_bytes(extracted, course_tables)
+    st.download_button(
+        "下载 CSV(zip)（逐页文本 + 逐表CSV + 课程表合并CSV）",
+        data=zip_bytes,
+        file_name="training_plan_extract_csv.zip",
+        mime="application/zip",
+        use_container_width=True,
+    )
+
+    xlsx_bytes, xlsx_msg = build_excel_bytes(extracted, structured, course_tables)
+    if xlsx_bytes is None:
+        st.warning(xlsx_msg)
+    else:
+        st.success(xlsx_msg)
         st.download_button(
-            "下载表格 ZIP（CSV + tables.json）",
-            data=zip_bytes,
-            file_name="training_plan_tables.zip",
-            mime="application/zip",
+            "下载 Excel(xlsx)（meta/培养目标/毕业要求/pages_text/课程表合并）",
+            data=xlsx_bytes,
+            file_name="training_plan_extract.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             use_container_width=True,
         )
 
-    st.markdown("#### 附表标题映射（用于给表格命名）")
-    if result.appendix_titles:
-        st.json(result.appendix_titles)
-    else:
-        st.info("未在正文中检测到附表标题映射（不影响表格抽取，但表名可能不够精准）。")
+    # 原始核查
+    with st.expander("查看逐页原始抽取（文本/表格）", expanded=False):
+        for p in extracted["pages"]:
+            st.markdown(f"#### Page {p['page']}")
+            st.text_area("text", value=p.get("text", ""), height=180, key=f"t_{p['page']}")
+            if p.get("tables"):
+                st.caption(f"tables: {len(p['tables'])}")
+                for ti, t in enumerate(p["tables"], start=1):
+                    df = table_to_df(t)
+                    if df is not None:
+                        st.markdown(f"- table {ti}")
+                        st.dataframe(df, use_container_width=True, height=200)
+            st.divider()
 
-# ---- Tab 1 章节大标题
-with tabs[1]:
-    st.markdown("### 章节大标题（用于确保“三~六”等内容不丢）")
-    st.caption("这里展示 split_sections 抽到的全部大章标题，点击可展开查看正文（用于溯源和校对）。")
-    for k in result.sections.keys():
-        with st.expander(k, expanded=False):
-            st.text(result.sections.get(k, ""))
-
-# ---- Tab 2 培养目标
-with tabs[2]:
-    st.markdown("### 1）培养目标（可编辑/校对）")
-    st.caption("若培养目标有多方向版本（焊接/无损），后续可在此基础上增强为分方向抽取。")
-
-    obj = result.training_objectives
-    st.write(f"识别条目数：**{obj.get('count', 0)}**")
-    st.text_area("培养目标（逐条）", value="\n".join(obj.get("items", [])), height=220)
-    with st.expander("原始文本（培养目标段）"):
-        st.text(obj.get("raw", ""))
-
-# ---- Tab 3 毕业要求
-with tabs[3]:
-    st.markdown("### 2）毕业要求（12条 + 分项）")
-    grad = result.graduation_requirements
-    st.write(f"识别主条目数：**{grad.get('count', 0)}**（理想为 12）")
-
-    items = grad.get("items", [])
-    if not items:
-        st.warning("未识别到毕业要求，请在“分页原文”中确认 PDF 是否可提取文本。")
-    else:
-        for it in items:
-            no = it.get("no")
-            title = it.get("title") or ""
-            body = it.get("body") or ""
-            header = f"{no}. {title}".strip()
-            with st.expander(header, expanded=(no in [1, 2])):
-                st.write(body)
-                subs = it.get("subitems", [])
-                if subs:
-                    st.markdown("**分项：**")
-                    for s in subs:
-                        st.write(f"- {s.get('no')}: {s.get('body')}")
-    with st.expander("原始文本（毕业要求段）"):
-        st.text(grad.get("raw", ""))
-
-# ---- Tab 4 表格
-with tabs[4]:
-    st.markdown("### 3）附表表格（表名 + 方向尽量清晰）")
-    if not result.tables:
-        st.info("未检测到表格。若在本地能抽到而云端抽不到，通常是 camelot 依赖缺失。")
-    else:
-        # 方向过滤
-        all_dirs = sorted({clean_text(t.get("direction") or "") for t in result.tables if clean_text(t.get("direction") or "")})
-        opt_dirs = ["全部"] + all_dirs
-        sel = st.selectbox("方向过滤", opt_dirs, index=0)
-
-        for t in result.tables:
-            direction = clean_text(t.get("direction") or "")
-            if sel != "全部" and direction != sel:
-                continue
-
-            st.subheader(f"第{t.get('page')}页｜{t.get('title')}")
-            if direction:
-                st.caption(f"页面方向提示：{direction}")
-
-            df = safe_df_from_tablepack(t)
-            # 这里 df 已含“专业方向”列（行级），且对合并格做了向下填充
-            st.dataframe(df, use_container_width=True, hide_index=True)
-
-# ---- Tab 5 分页原文
-with tabs[5]:
-    st.markdown("### 4）分页原文（用于溯源/调试抽取缺失）")
-    for i, txt in enumerate(result.pages_text, start=1):
-        with st.expander(f"第{i}页文本", expanded=False):
-            st.text(txt)
+else:
+    st.info("已上传 PDF。点击左侧 **开始全量抽取**。")
