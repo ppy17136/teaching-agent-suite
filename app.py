@@ -1,1074 +1,869 @@
 # -*- coding: utf-8 -*-
-"""培养方案 PDF 全量抽取（文本 + 表格 + 结构化解析）
-
-你关心的点：
-- 毕业要求必须完整（1~12 + 1.1/1.2…）
-- 三~六等章节大标题内容要完整显示
-- 附表 1~5 的表名要显示，并尽可能把表格抽取出来
-- 表格中合并单元格导致的空白要尽量补全
-- 焊接/无损检测两方向要尽量在展示与导出里区分
-
-实现策略（不依赖大模型）：
-- 使用 pdfplumber 抽取每页文本（分页原文可溯源）
-- 用规则解析“培养目标/毕业要求/章节内容”
-- 用 pdfplumber 线框策略抽取表格（无需 camelot/ghostscript）
-- 对表格做“行长度对齐 + 空列剔除 + 合并格常见空白填充 + 方向推断”
-- 提供 JSON / CSV(zip) / Excel 三种导出
-
-备注：OCR 开关保留，但 Streamlit Cloud 若未安装 OCR 依赖将自动降级为仅文本抽取。
 """
+Teaching Agent Suite (Training Plan Extractor)
+Robust, full-content extraction for Chinese "培养方案" PDFs:
+- Chapters/sections (一/二/三…)
+- 培养目标 (list)
+- 毕业要求 (1–12, with subitems)
+- All appendices/tables (附表1–5 etc.) with best-effort merged-cell filling
+- Optional LLM "校对与修正" layer (OpenAI-compatible endpoint)
 
+This file is designed to be a drop-in Streamlit app.py.
+"""
 from __future__ import annotations
 
 import io
 import json
 import re
-import hashlib
 import zipfile
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
 import pandas as pd
-import requests
 import streamlit as st
 
 try:
-    import pdfplumber
-except Exception as e:  # pragma: no cover
+    import pdfplumber  # type: ignore
+except Exception as e:
     pdfplumber = None
 
-# -----------------------------
-# Streamlit/pyarrow can fail when DataFrame has mixed object types (lists/dicts, etc.).
-# This helper coerces unsafe columns to strings so they can be displayed reliably.
-def safe_dataframe_for_streamlit(df: pd.DataFrame) -> pd.DataFrame:
-    if df is None:
-        return pd.DataFrame()
-    out = df.copy()
-    # Ensure unique column names (pyarrow can be picky)
-    if out.columns.duplicated().any():
-        cols = []
-        seen = {}
-        for c in out.columns:
-            k = str(c)
-            seen[k] = seen.get(k, 0) + 1
-            cols.append(k if seen[k] == 1 else f"{k}_{seen[k]}")
-        out.columns = cols
-
-    for c in out.columns:
-        s = out[c]
-        # Convert complex objects to JSON strings; keep numeric/datetime as-is.
-        if pd.api.types.is_object_dtype(s) or pd.api.types.is_string_dtype(s):
-            def _coerce(x):
-                if x is None:
-                    return ""
-                try:
-                    if pd.isna(x):
-                        return ""
-                except Exception:
-                    pass
-                if isinstance(x, (dict, list, tuple, set)):
-                    try:
-                        return json.dumps(x, ensure_ascii=False)
-                    except Exception:
-                        return str(x)
-                return str(x)
-            out[c] = s.map(_coerce)
-    return out
+try:
+    import requests  # type: ignore
+except Exception:
+    requests = None
 
 
 # -----------------------------
-# Optional LLM refinement (for post-processing)
+# Text utils
 # -----------------------------
-
-@dataclass
-class LLMConfig:
-    enabled: bool = False
-    provider: str = "openai_compat"  # "openai_compat" | "dashscope"
-    model: str = ""
-    api_key: str = ""
-    base_url: str = ""  # only for openai_compat
-    timeout: int = 60
-    temperature: float = 0.0
-    max_tokens: int = 2000
-
-
-def _get_secret(key: str, default: str = "") -> str:
-    try:
-        if hasattr(st, "secrets") and key in st.secrets:
-            return str(st.secrets.get(key, default))
-    except Exception:
-        pass
-    return os.environ.get(key, default)
-
-
-def _openai_compat_url(base_url: str) -> str:
-    base_url = (base_url or "").strip()
-    if not base_url:
-        return ""
-    if base_url.endswith("/chat/completions") or base_url.endswith("/v1/chat/completions"):
-        return base_url
-    if base_url.endswith("/v1"):
-        return base_url.rstrip("/") + "/chat/completions"
-    return base_url.rstrip("/") + "/v1/chat/completions"
-
-
-def llm_chat(messages: List[Dict[str, str]], cfg: LLMConfig) -> str:
-    if not cfg.enabled:
-        return ""
-    if not cfg.model:
-        raise ValueError("LLM 已启用，但未填写 model。")
-    if not cfg.api_key:
-        raise ValueError("LLM 已启用，但未填写 API Key。")
-
-    provider = (cfg.provider or "openai_compat").lower().strip()
-
-    if provider == "dashscope":
-        try:
-            import dashscope  # type: ignore
-            from dashscope import Generation  # type: ignore
-        except Exception as e:
-            raise RuntimeError("未安装 dashscope SDK（requirements.txt 需要加入 dashscope）。") from e
-
-        dashscope.api_key = cfg.api_key
-        resp = Generation.call(
-            model=cfg.model,
-            messages=messages,
-            result_format="message",
-            temperature=cfg.temperature,
-            max_tokens=cfg.max_tokens,
-        )
-        try:
-            return resp.output.choices[0].message["content"]
-        except Exception:
-            return str(resp)
-
-    # openai-compatible
-    url = _openai_compat_url(cfg.base_url)
-    if not url:
-        raise ValueError("OpenAI-compatible 模式需要填写 base_url（例如 .../v1 或完整 chat/completions 端点）。")
-
-    headers = {"Authorization": f"Bearer {cfg.api_key}", "Content-Type": "application/json"}
-    payload = {
-        "model": cfg.model,
-        "messages": messages,
-        "temperature": cfg.temperature,
-        "max_tokens": cfg.max_tokens,
-    }
-    r = requests.post(url, headers=headers, json=payload, timeout=cfg.timeout)
-    r.raise_for_status()
-    data = r.json()
-    try:
-        return data["choices"][0]["message"]["content"]
-    except Exception:
-        return json.dumps(data, ensure_ascii=False)
-
-
-def _extract_context_snippets(pages_text: List[str]) -> Dict[str, str]:
-    all_text = "\n".join([t or "" for t in pages_text])
-
-    def clip_around(keyword: str, window: int = 3500) -> str:
-        idx = all_text.find(keyword)
-        if idx < 0:
-            return ""
-        s = max(0, idx - window // 3)
-        e = min(len(all_text), idx + window)
-        return all_text[s:e]
-
-    return {
-        "objectives": clip_around("培养目标"),
-        "grad_reqs": clip_around("毕业要求"),
-        "sections": clip_around("专业定位") + "\n" + clip_around("主干学科") + "\n" + clip_around("标准学制") + "\n" + clip_around("毕业条件"),
-        "tables": clip_around("附表"),
-    }
-
-
-def llm_refine_result(result: Dict[str, Any], pages_text: List[str], cfg: LLMConfig) -> Dict[str, Any]:
-    snippets = _extract_context_snippets(pages_text)
-
-    system = (
-        "你是高校培养方案结构化抽取的校对助手。\n"
-        "在不捏造内容的前提下，基于提供的 PDF 片段与已抽取结果，修正/补全：\n"
-        "1) 培养目标 objectives；\n"
-        "2) 毕业要求 graduate_requirements（必须包含 1-12 大条及子条 1.1..）；\n"
-        "3) 大标题 sections（如 三、专业定位与特色 等）；\n"
-        "4) 附表标题 appendix_titles（附表1..5 对应的中文表名）。\n"
-        "只输出 JSON，不要输出其它文字。"
-    )
-
-    compact = {
-        "objectives": result.get("objectives", []),
-        "graduate_requirements": result.get("graduate_requirements", []),
-        "sections": result.get("sections", []),
-        "appendix_titles": result.get("appendix_titles", {}),
-    }
-
-    user_payload = {
-        "pdf_snippets": snippets,
-        "extracted": compact,
-        "output_schema": {
-            "objectives": ["string", "..."],
-            "graduate_requirements": [{"id": "1..12", "title": "string", "text": "string", "sub": [{"id": "1.1", "text": "string"}]}],
-            "sections": [{"no": "三", "title": "string", "text": "string"}],
-            "appendix_titles": {"附表1": "string", "附表2": "string", "附表3": "string", "附表4": "string", "附表5": "string"},
-        },
-    }
-
-    content = llm_chat(
-        messages=[
-            {"role": "system", "content": system},
-            {"role": "user", "content": json.dumps(user_payload, ensure_ascii=False)},
-        ],
-        cfg=cfg,
-    )
-
-    fixed = json.loads(content)
-
-    for k in ["objectives", "graduate_requirements", "sections", "appendix_titles"]:
-        if k in fixed and fixed[k]:
-            result[k] = fixed[k]
-    result["_llm_refined"] = True
-    return result
-
-# Utilities
-# -----------------------------
-
-def sha256_bytes(b: bytes) -> str:
-    return hashlib.sha256(b).hexdigest()
-
+_CN_NUM = {
+    "零":0,"〇":0,"一":1,"二":2,"三":3,"四":4,"五":5,"六":6,"七":7,"八":8,"九":9,
+    "十":10,"十一":11,"十二":12,"十三":13,"十四":14,"十五":15,"十六":16,"十七":17,"十八":18,"十九":19,"二十":20
+}
 
 def clean_text(s: Any) -> str:
     if s is None:
         return ""
-    return str(s).replace("\u00a0", " ").strip()
+    s = str(s)
+    s = s.replace("\u3000", " ")  # full-width space
+    s = re.sub(r"[ \t]+", " ", s)
+    return s.strip()
 
-
-def is_empty(s: Any) -> bool:
-    return clean_text(s) == ""
-
-
-def safe_int(x: str, default: int = 0) -> int:
-    try:
-        return int(x)
-    except Exception:
-        return default
-
+def normalize_for_match(s: str) -> str:
+    """Aggressive normalize for heading matching: remove whitespace & punctuation."""
+    s = clean_text(s)
+    # keep Chinese/letters/digits only
+    s = re.sub(r"[\s·•●■◆◇★☆※\-\—–_~`!！?？:：;；,，。\.（）\(\)\[\]【】{}<>《》“”\"'’‘/\\|]+", "", s)
+    return s
 
 def normalize_lines(text: str) -> List[str]:
-    lines = [clean_text(x) for x in (text or "").splitlines()]
-    return [x for x in lines if x]
+    text = text or ""
+    lines = [clean_text(x) for x in text.splitlines()]
+    # Drop purely decorative lines
+    out = []
+    for ln in lines:
+        if not ln:
+            continue
+        if re.fullmatch(r"[-_=—–·•●■◆◇★☆※ ]{3,}", ln):
+            continue
+        out.append(ln)
+    return out
 
 
 # -----------------------------
-# Text extraction
+# PDF text extraction
 # -----------------------------
-
 def extract_pages_text(pdf_bytes: bytes) -> List[str]:
     if pdfplumber is None:
-        raise RuntimeError("pdfplumber 未安装，无法解析 PDF")
-
+        raise RuntimeError("pdfplumber 未安装或不可用。请在 requirements.txt 添加 pdfplumber。")
+    pages_text: List[str] = []
     with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
-        pages = []
         for p in pdf.pages:
-            pages.append(p.extract_text() or "")
-        return pages
+            t = p.extract_text() or ""
+            pages_text.append(t)
+    return pages_text
 
 
 # -----------------------------
-# Section parsing (rule-based)
+# Chapter locating (robust)
 # -----------------------------
+@dataclass
+class HeadingHit:
+    key: str
+    display: str
+    page_idx: int  # 0-based
+    line_idx: int  # 0-based in that page
+    score: float
+    raw_line: str
 
-CHAPTER_KEYS = [
-    ("一", "培养目标"),
-    ("二", "毕业要求"),
-    ("三", "专业定位与特色"),
-    ("四", "主干学科、专业核心课程和主要实践性教学环节"),
-    ("五", "标准学制与授予学位"),
-    ("六", "毕业条件"),
-    ("七", "专业教学计划表"),
-    ("八", "学分统计表"),
-    ("九", "教学进程表"),
-    ("十", "课程设置对毕业要求支撑关系表"),
-    ("十一", "课程设置逻辑思维导图"),
-]
+def _heading_patterns() -> List[Tuple[str, str, List[str]]]:
+    """
+    Returns list of (key, display_title, keywords).
+    key is stable id; display_title is shown in UI.
+    keywords are used for fuzzy match.
+    """
+    return [
+        ("obj", "一、培养目标", ["培养目标"]),
+        ("gradreq", "二、毕业要求", ["毕业要求"]),
+        ("pos", "三、专业定位与特色", ["专业定位", "特色"]),
+        ("core", "四、主干学科、专业核心课程和主要实践性教学环节", ["主干学科", "专业核心课程", "实践性", "教学环节"]),
+        ("degree", "五、标准学制与授予学位", ["标准学制", "授予学位"]),
+        ("gradcond", "六、毕业条件", ["毕业条件"]),
+        # Appendices often appear as headings too
+        ("app1", "七、专业教学计划表（附表1）", ["专业教学计划表", "附表1"]),
+        ("app2", "八、学分统计表（附表2）", ["学分统计表", "附表2"]),
+        ("app3", "九、教学进程表（附表3）", ["教学进程表", "附表3"]),
+        ("app4", "十、课程设置对毕业要求支撑关系表（附表4）", ["支撑关系表", "毕业要求", "附表4"]),
+        ("app5", "十一、课程设置逻辑思维导图（附表5）", ["逻辑思维导图", "附表5"]),
+    ]
 
+def locate_heading_hits(pages_text: List[str]) -> List[HeadingHit]:
+    hits: List[HeadingHit] = []
+    patterns = _heading_patterns()
 
-def find_first_index(pages_text: List[str], pattern: str) -> Optional[int]:
-    for i, t in enumerate(pages_text):
-        if re.search(pattern, t):
-            return i
-    return None
+    for page_idx, page_text in enumerate(pages_text):
+        for line_idx, raw in enumerate(normalize_lines(page_text)):
+            nrm = normalize_for_match(raw)
+            if not nrm:
+                continue
 
+            for key, display, kws in patterns:
+                # scoring: keywords coverage + optional numeral prefix bonus
+                cov = 0
+                for kw in kws:
+                    if normalize_for_match(kw) in nrm:
+                        cov += 1
+                if cov == 0:
+                    continue
+                score = cov / max(1, len(kws))
 
-def concat_pages(pages_text: List[str], start: int, end: int) -> str:
-    start = max(0, start)
-    end = min(len(pages_text), end)
-    return "\n".join(pages_text[start:end])
+                # bonus if line starts with Chinese numeral + delimiter (e.g., 四、 or 4.)
+                if re.match(r"^[一二三四五六七八九十\d]{1,3}[、\.\s]", raw):
+                    score += 0.15
 
+                # small bonus if display's main keyword appears early
+                main_kw = normalize_for_match(kws[0])
+                pos = nrm.find(main_kw)
+                if pos != -1 and pos < 3:
+                    score += 0.05
 
-def locate_chapter_ranges(pages_text: List[str]) -> Dict[str, Tuple[int, int]]:
-    """Return {chapter_name: (start_page_idx, end_page_idx_exclusive)}"""
-    # locate page indices by chapter headings
-    hits: List[Tuple[int, str]] = []
-    for cn, title in CHAPTER_KEYS:
-        # match like "三、专业定位与特色" or "三 专业定位与特色"
-        pat = rf"{cn}[、\s]+{re.escape(title)}"
-        idx = find_first_index(pages_text, pat)
-        if idx is not None:
-            hits.append((idx, title))
+                hits.append(HeadingHit(key, display, page_idx, line_idx, score, raw))
+    # For each key keep best hit (highest score, then earliest)
+    best: Dict[str, HeadingHit] = {}
+    for h in sorted(hits, key=lambda x: (-x.score, x.page_idx, x.line_idx)):
+        if h.key not in best:
+            best[h.key] = h
+    # return ordered by appearance
+    ordered = sorted(best.values(), key=lambda x: (x.page_idx, x.line_idx))
+    return ordered
 
-    # sort by page
-    hits.sort(key=lambda x: x[0])
-    ranges: Dict[str, Tuple[int, int]] = {}
-    for k, (idx, title) in enumerate(hits):
-        end = hits[k + 1][0] if k + 1 < len(hits) else len(pages_text)
-        ranges[title] = (idx, end)
+def build_chapter_ranges(pages_text: List[str]) -> List[Tuple[str, int, int, int, int]]:
+    """
+    Returns list of (display_title, start_page, start_line, end_page, end_line_exclusive)
+    """
+    hits = locate_heading_hits(pages_text)
+    ranges: List[Tuple[str, int, int, int, int]] = []
+    if not hits:
+        return ranges
+
+    for i, h in enumerate(hits):
+        start_page, start_line = h.page_idx, h.line_idx
+        if i + 1 < len(hits):
+            nh = hits[i + 1]
+            end_page, end_line = nh.page_idx, nh.line_idx
+        else:
+            end_page, end_line = len(pages_text) - 1, 10**9  # to end
+        ranges.append((h.display, start_page, start_line, end_page, end_line))
     return ranges
 
+def extract_range_text(pages_text: List[str], start_page: int, start_line: int, end_page: int, end_line: int) -> str:
+    chunks: List[str] = []
+    for pidx in range(start_page, end_page + 1):
+        lines = normalize_lines(pages_text[pidx])
+        s = start_line if pidx == start_page else 0
+        e = end_line if pidx == end_page else len(lines)
+        e = min(e, len(lines))
+        if s < e:
+            chunks.append("\n".join(lines[s:e]))
+    return "\n".join(chunks).strip()
 
-def parse_training_objectives(section_text: str) -> List[str]:
-    """Parse 培养目标 items like "1." or "（1）" or "1）"."""
-    text = section_text or ""
-    # Try common patterns
+def extract_chapters(pages_text: List[str]) -> Dict[str, str]:
+    ranges = build_chapter_ranges(pages_text)
+    chapters: Dict[str, str] = {}
+    for title, sp, sl, ep, el in ranges:
+        chapters[title] = extract_range_text(pages_text, sp, sl, ep, el)
+    return chapters
+
+
+# -----------------------------
+# Structured parsing: objectives & graduation requirements
+# -----------------------------
+def parse_objectives(text: str) -> List[str]:
     lines = normalize_lines(text)
     items: List[str] = []
-
-    buf = []
-    cur_id = None
+    buf: List[str] = []
 
     def flush():
-        nonlocal buf, cur_id
-        if cur_id is not None and buf:
-            items.append("".join(buf).strip())
+        nonlocal buf
+        if buf:
+            s = clean_text(" ".join(buf))
+            if s:
+                items.append(s)
         buf = []
-        cur_id = None
 
     for ln in lines:
-        m = re.match(r"^\s*(\d+)[\.、]\s*(.+)$", ln)
-        m2 = re.match(r"^\s*[（(]\s*(\d+)\s*[）)]\s*(.+)$", ln)
-        if m or m2:
+        m = re.match(r"^\s*(?:培养目标)?\s*([1-9]\d?)\s*[\.、]\s*(.*)$", ln)
+        if m:
             flush()
-            cur_id = (m or m2).group(1)
-            buf = [f"{cur_id}. {(m or m2).group(2).strip()} "]
-        else:
-            if cur_id is None:
-                continue
-            buf.append(ln.strip() + " ")
-
+            buf = [m.group(2)]
+            continue
+        # also accept "（1）" "1)" etc
+        m2 = re.match(r"^\s*[\(（]\s*([1-9]\d?)\s*[\)）]\s*(.*)$", ln)
+        if m2:
+            flush()
+            buf = [m2.group(2)]
+            continue
+        # continuation line
+        if buf:
+            buf.append(ln)
     flush()
 
-    # 如果一个都没抓到，退化：取“培养目标”下面的段落（但做分句）
+    # fallback: if no enumerated, try bullet-like lines
     if not items:
-        text2 = re.sub(r"\s+", " ", text).strip()
-        if text2:
-            items = [x.strip() for x in re.split(r"[；;]\s*", text2) if x.strip()]
+        bullets = []
+        for ln in lines:
+            if re.match(r"^[•●■◆◇\-]\s*", ln):
+                bullets.append(re.sub(r"^[•●■◆◇\-]\s*", "", ln).strip())
+        if bullets:
+            items = bullets
+
     return items
 
+def _parse_main_item_header(ln: str) -> Optional[Tuple[int, str]]:
+    # "1. 工程知识：" / "1 工程知识：" / "1、工程知识：" etc
+    m = re.match(r"^\s*([1-9]\d?)\s*[\.、]?\s*([^\d].*?)\s*[：:]\s*(.*)$", ln)
+    if m:
+        return int(m.group(1)), clean_text(m.group(2) + "：" + m.group(3))
+    m2 = re.match(r"^\s*([1-9]\d?)\s*[\.、]\s*(.*)$", ln)
+    if m2:
+        return int(m2.group(1)), clean_text(m2.group(2))
+    return None
 
-def parse_graduation_requirements(section_text: str) -> Dict[str, Any]:
-    """Parse 毕业要求 1~12 and sub-items 1.1/1.2..."""
-    lines = normalize_lines(section_text)
-    out: Dict[str, Any] = {}
+def _parse_sub_item(ln: str) -> Optional[Tuple[str, str]]:
+    # "1.1 ..." "12.3 ..." etc
+    m = re.match(r"^\s*([1-9]\d?\.\d+)\s*(.*)$", ln)
+    if m:
+        return m.group(1), clean_text(m.group(2))
+    return None
 
-    cur_main = None
-    cur_sub = None
+def parse_graduation_requirements(text: str) -> Dict[str, Any]:
+    """
+    Output schema:
+    {
+      "1": {"title": "...", "subs": {"1.1":"...", ...}},
+      ...
+      "12": {...}
+    }
+    """
+    lines = normalize_lines(text)
+    req: Dict[str, Any] = {}
+    cur_main: Optional[int] = None
+    cur_buf: List[str] = []
 
-    def ensure_main(mid: str, title: str = ""):
-        if mid not in out:
-            out[mid] = {"title": title, "text": "", "subs": {}}
+    def flush_main_text():
+        nonlocal cur_buf, cur_main
+        if cur_main is not None and cur_main in range(1, 13):
+            if "title" not in req[str(cur_main)] or not req[str(cur_main)]["title"]:
+                s = clean_text(" ".join(cur_buf))
+                if s:
+                    req[str(cur_main)]["title"] = s
+        cur_buf = []
 
     for ln in lines:
-        # main: "1. 工程知识：..." 允许冒号中英文
-        m = re.match(r"^\s*(\d{1,2})[\.、]\s*([^：:]+)[：:]\s*(.*)$", ln)
-        if m:
-            cur_main = m.group(1)
-            cur_sub = None
-            ensure_main(cur_main, clean_text(m.group(2)))
-            tail = clean_text(m.group(3))
-            if tail:
-                out[cur_main]["text"] = (out[cur_main]["text"] + " " + tail).strip()
+        # detect main item header
+        mh = _parse_main_item_header(ln)
+        if mh:
+            flush_main_text()
+            n, title = mh
+            cur_main = n
+            req.setdefault(str(n), {"title": title, "subs": {}})
+            # if title already parsed from this line, reset buffer
+            req[str(n)]["title"] = title
             continue
 
-        # sub: "1.1 能够..." or "10.2 ..."
-        m2 = re.match(r"^\s*(\d{1,2}\.\d{1,2})\s+(.+)$", ln)
-        if m2:
-            cur_sub = m2.group(1)
-            mid = cur_sub.split(".")[0]
-            ensure_main(mid)
-            out[mid]["subs"][cur_sub] = clean_text(m2.group(2))
+        sh = _parse_sub_item(ln)
+        if sh and cur_main is not None:
+            code, content = sh
+            req.setdefault(str(cur_main), {"title": "", "subs": {}})
+            req[str(cur_main)]["subs"][code] = content
             continue
 
-        # continuation lines
-        if cur_sub:
-            mid = cur_sub.split(".")[0]
-            out[mid]["subs"][cur_sub] = (out[mid]["subs"][cur_sub] + " " + ln).strip()
-        elif cur_main:
-            out[cur_main]["text"] = (out[cur_main]["text"] + " " + ln).strip()
+        # continuation for title if no sub-items yet or line seems part of main description
+        if cur_main is not None:
+            # ignore obvious page headers/footers
+            if re.fullmatch(r"\d+", ln):
+                continue
+            cur_buf.append(ln)
 
-    return out
+    flush_main_text()
 
+    # Ensure 1..12 keys exist if partially parsed (keeps UI stable)
+    for i in range(1, 13):
+        req.setdefault(str(i), {"title": "", "subs": {}})
 
-def parse_chapter_content(pages_text: List[str], chapter_ranges: Dict[str, Tuple[int, int]]) -> Dict[str, str]:
-    wanted = [
-        "专业定位与特色",
-        "主干学科、专业核心课程和主要实践性教学环节",
-        "标准学制与授予学位",
-        "毕业条件",
-    ]
-    out: Dict[str, str] = {}
-    for w in wanted:
-        if w in chapter_ranges:
-            s, e = chapter_ranges[w]
-            out[w] = concat_pages(pages_text, s, e).strip()
-        else:
-            out[w] = ""
-    return out
+    return req
 
 
+# -----------------------------
+# Appendix title map from body text (附表1..)
+# -----------------------------
 def extract_appendix_title_map(pages_text: List[str]) -> Dict[str, str]:
-    """Try to extract mapping like 附表1->七 专业教学计划表"""
-    whole = "\n".join(pages_text)
-    # match "七专业教学计划表（附表1）" or "七、专业教学计划表（附表1）"
+    """
+    Returns {"附表1": "七、专业教学计划表（附表1）", ...}
+    """
+    full = "\n".join(pages_text)
+    lines = normalize_lines(full)
     mp: Dict[str, str] = {}
-    for cn, title in CHAPTER_KEYS:
-        if cn not in ["七", "八", "九", "十", "十一"]:
+    for ln in lines:
+        nrm = normalize_for_match(ln)
+        m = re.search(r"附表\s*([1-9]\d?)", ln)
+        if not m:
             continue
-        # Try to locate the line containing appendix
-        pat = rf"{cn}[、\s]*{re.escape(title)}\s*[（(]\s*(附表\s*\d+)\s*[）)]"
-        for m in re.finditer(pat, whole):
-            key = clean_text(m.group(1)).replace(" ", "")
-            mp[key] = f"{cn}、{title}（{key}）"
+        no = m.group(1)
+        key = f"附表{no}"
+        # Prefer lines that also contain Chinese chapter numerals or keywords
+        if key not in mp:
+            mp[key] = ln
+        else:
+            # choose "richer" line (longer)
+            if len(ln) > len(mp[key]):
+                mp[key] = ln
+
+    # Normalize display titles for known ones
+    defaults = {
+        "附表1": "七、专业教学计划表（附表1）",
+        "附表2": "八、学分统计表（附表2）",
+        "附表3": "九、教学进程表（附表3）",
+        "附表4": "十、课程设置对毕业要求支撑关系表（附表4）",
+        "附表5": "十一、课程设置逻辑思维导图（附表5）",
+    }
+    for k, v in defaults.items():
+        mp.setdefault(k, v)
     return mp
 
 
 # -----------------------------
-# Table extraction (pdfplumber)
+# Table extraction + cleanup
 # -----------------------------
-
-PDFPLUMBER_TABLE_SETTINGS_LINES = {
-    "vertical_strategy": "lines",
-    "horizontal_strategy": "lines",
-    "snap_tolerance": 3,
-    "join_tolerance": 3,
-    "edge_min_length": 3,
-    "intersection_tolerance": 3,
-    "text_tolerance": 3,
-}
-
-# Fallback for borderless tables (common in some teaching-plan PDFs)
-PDFPLUMBER_TABLE_SETTINGS_TEXT = {
-    "vertical_strategy": "text",
-    "horizontal_strategy": "text",
-    "snap_tolerance": 3,
-    "join_tolerance": 3,
-    "edge_min_length": 3,
-    "intersection_tolerance": 3,
-    "text_tolerance": 3,
-    "min_words_vertical": 3,
-    "min_words_horizontal": 1,
-}
-
-
-def normalize_table(raw_table: List[List[Any]]) -> Optional[List[List[str]]]:
-    """Normalize: strip, drop empty rows, pad rows, drop empty columns."""
-    if not raw_table:
-        return None
-    rows: List[List[str]] = []
-    max_cols = 0
-    for r in raw_table:
-        if r is None:
-            continue
-        rr = [clean_text(c) for c in r]
-        if all(c == "" for c in rr):
-            continue
-        rows.append(rr)
-        max_cols = max(max_cols, len(rr))
-
-    if not rows or max_cols == 0:
-        return None
-
-    # pad
-    for i in range(len(rows)):
-        if len(rows[i]) < max_cols:
-            rows[i] += [""] * (max_cols - len(rows[i]))
-
-    # drop empty columns
-    keep_cols = []
-    for j in range(max_cols):
-        col = [rows[i][j] for i in range(len(rows))]
-        if any(c != "" for c in col):
-            keep_cols.append(j)
-
-    if not keep_cols:
-        return None
-    out = [[row[j] for j in keep_cols] for row in rows]
-    return out
-
-
-def ffill_merged_cells(table: List[List[str]]) -> List[List[str]]:
-    """Heuristic fill for merged cells: horizontal then vertical for sparse columns."""
-    if not table:
-        return table
-    rows = [r[:] for r in table]
-    n_rows = len(rows)
-    n_cols = max(len(r) for r in rows)
-
-    # make rectangular
-    for i in range(n_rows):
-        if len(rows[i]) < n_cols:
-            rows[i] += [""] * (n_cols - len(rows[i]))
-
-    # horizontal fill
-    for i in range(n_rows):
-        last = ""
-        for j in range(n_cols):
-            if rows[i][j] != "":
-                last = rows[i][j]
-            else:
-                # only fill if last looks like category-like text (avoid filling numeric columns)
-                if last and not re.match(r"^[-+]?\d+(\.\d+)?$", last):
-                    rows[i][j] = rows[i][j] or ""  # keep empty by default
-        # do not actually fill horizontally aggressively (often wrong). Keep conservative.
-
-    # Decide columns that are likely merged vertically: high empty ratio
-    empties = []
-    for j in range(n_cols):
-        col = [rows[i][j] for i in range(n_rows)]
-        empty_ratio = sum(1 for x in col if x == "") / max(1, n_rows)
-        empties.append(empty_ratio)
-
-    # vertical fill on columns with empty_ratio high
-    for j in range(n_cols):
-        if empties[j] < 0.35:
-            continue
-        last = ""
-        for i in range(n_rows):
-            if rows[i][j] != "":
-                last = rows[i][j]
-            else:
-                if last:
-                    rows[i][j] = last
-
-    return rows
-
-
-def infer_direction_for_row(row: List[str]) -> str:
-    text = " ".join([c for c in row if c])
-    if "焊接" in text and "无损" in text:
-        return "混合"
-    if "焊接" in text:
-        return "焊接"
-    if "无损" in text or "NDT" in text:
-        return "无损检测"
-    return ""
-
-
-def infer_direction_for_table(table: List[List[str]]) -> str:
-    cnt = {"焊接": 0, "无损检测": 0}
-    for r in table[:50]:
-        d = infer_direction_for_row(r)
-        if d == "焊接":
-            cnt["焊接"] += 1
-        elif d == "无损检测":
-            cnt["无损检测"] += 1
-    if cnt["焊接"] and cnt["无损检测"]:
-        return "混合"
-    if cnt["焊接"]:
-        return "焊接"
-    if cnt["无损检测"]:
-        return "无损检测"
-    return ""
-
-
-def classify_appendix(table: List[List[str]]) -> str:
-    """Return appendix key like '附表1'..'附表5' or ''"""
-    head = " ".join(table[0]) if table else ""
-    head2 = " ".join(table[1]) if len(table) > 1 else ""
-    blob = (head + " " + head2)
-
-    if "课程编码" in blob and "课程体系" in blob:
-        return "附表1"
-    if "学分" in blob and ("统计" in blob or "合计" in blob):
-        return "附表2"
-    if "教学进程" in blob or "周" in blob or "学期" in blob and "周" in blob:
-        return "附表3"
-    if "毕业要求" in blob or "1.1" in blob or "12.3" in blob:
-        return "附表4"
-
-    # 逻辑思维导图通常不是表格
-    return ""
-
-
 @dataclass
 class ExtractedTable:
-    appendix: str
-    appendix_title: str
-    page: int
     title: str
-    columns: List[str]
-    rows: List[List[str]]
-    direction: str
+    page: int  # 1-based
+    df: pd.DataFrame
+    raw: List[List[str]]
 
+def _rectangularize(rows: List[List[Any]]) -> List[List[str]]:
+    max_len = max((len(r) for r in rows), default=0)
+    rect: List[List[str]] = []
+    for r in rows:
+        rr = [clean_text(x) for x in r]
+        if len(rr) < max_len:
+            rr += [""] * (max_len - len(rr))
+        rect.append(rr)
+    # trim trailing fully-empty columns
+    if max_len > 0:
+        keep = max_len
+        for j in range(max_len-1, -1, -1):
+            col = [rect[i][j] for i in range(len(rect))]
+            if all(clean_text(x)=="" for x in col):
+                keep -= 1
+            else:
+                break
+        rect = [r[:keep] for r in rect]
+    return rect
+
+def _combine_multirow_headers(rect: List[List[str]]) -> Tuple[List[str], List[List[str]]]:
+    """
+    Heuristic: if first 2 rows look like header parts, merge them.
+    Returns (columns, data_rows).
+    """
+    if not rect:
+        return [], []
+    if len(rect) == 1:
+        cols = [c or f"列{idx+1}" for idx, c in enumerate(rect[0])]
+        return cols, []
+
+    r0, r1 = rect[0], rect[1]
+    non0 = sum(1 for x in r0 if x)
+    non1 = sum(1 for x in r1 if x)
+    # header-like: first row sparse and second row provides detail
+    multi = (non0 <= max(2, int(0.45*len(r0)))) and (non1 >= non0)
+    if not multi:
+        cols = [c or f"列{idx+1}" for idx, c in enumerate(r0)]
+        return cols, rect[1:]
+
+    cols = []
+    for j in range(len(r0)):
+        a = clean_text(r0[j])
+        b = clean_text(r1[j])
+        if a and b and a != b:
+            cols.append(f"{a} / {b}")
+        else:
+            cols.append(a or b or f"列{j+1}")
+    data_rows = rect[2:]
+    return cols, data_rows
+
+def _forward_fill_merged_cells(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Forward-fill columns that look like 'category' columns (many blanks, few unique non-blanks).
+    Helps with merged-cell columns like 课程体系/课程类别.
+    """
+    out = df.copy()
+    nrows = len(out)
+    if nrows == 0:
+        return out
+
+    for col in out.columns:
+        s = out[col].astype(str).fillna("").map(clean_text)
+        blank_ratio = (s == "").mean()
+        non = s[s != ""]
+        uniq = non.nunique(dropna=True)
+        # Heuristic thresholds
+        if blank_ratio >= 0.20 and uniq <= max(12, int(0.25*nrows)):
+            out[col] = s.replace("", pd.NA).ffill().fillna("")
+        else:
+            out[col] = s
+
+    return out
+
+def _safe_df(df: pd.DataFrame) -> pd.DataFrame:
+    # Ensure arrow-safe: no lists/dicts, all strings
+    out = df.copy()
+    out.columns = [clean_text(c) or f"列{idx+1}" for idx, c in enumerate(out.columns)]
+    # de-duplicate columns
+    seen: Dict[str, int] = {}
+    cols = []
+    for c in out.columns:
+        if c not in seen:
+            seen[c] = 1
+            cols.append(c)
+        else:
+            seen[c] += 1
+            cols.append(f"{c}_{seen[c]}")
+    out.columns = cols
+
+    def cell_to_str(x: Any) -> str:
+        if x is None:
+            return ""
+        if isinstance(x, (dict, list, tuple, set)):
+            try:
+                return json.dumps(x, ensure_ascii=False)
+            except Exception:
+                return str(x)
+        if pd.isna(x):
+            return ""
+        return clean_text(x)
+
+    for c in out.columns:
+        out[c] = out[c].map(cell_to_str)
+    return out
 
 def extract_tables_pdfplumber(pdf_bytes: bytes, pages_text: List[str]) -> List[ExtractedTable]:
     if pdfplumber is None:
         return []
-
     appendix_map = extract_appendix_title_map(pages_text)
 
-    out: List[ExtractedTable] = []
+    # Map page -> best title line mentioning "附表"
+    page_title_hint: Dict[int, str] = {}
+    for i, t in enumerate(pages_text):
+        lines = normalize_lines(t)
+        for ln in lines[:12] + lines[-12:]:
+            m = re.search(r"(附表\s*[1-9]\d?)", ln)
+            if m:
+                key = re.sub(r"\s+", "", m.group(1))
+                key = key.replace("附表", "附表")
+                title = appendix_map.get(key, ln)
+                page_title_hint[i+1] = title
+
+    tables: List[ExtractedTable] = []
     with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
-        for i, page in enumerate(pdf.pages):
-            # Try two strategies: lines-first (bordered) then text (borderless)
+        for page_idx, page in enumerate(pdf.pages):
+            # Use two settings passes to increase recall
+            settings_list = [
+                dict(
+                    vertical_strategy="lines",
+                    horizontal_strategy="lines",
+                    snap_tolerance=3,
+                    join_tolerance=3,
+                    edge_min_length=3,
+                    intersection_tolerance=5,
+                    min_words_vertical=1,
+                    min_words_horizontal=1,
+                    keep_blank_chars=True,
+                ),
+                dict(
+                    vertical_strategy="text",
+                    horizontal_strategy="text",
+                    snap_tolerance=3,
+                    join_tolerance=3,
+                    edge_min_length=3,
+                    intersection_tolerance=5,
+                    min_words_vertical=1,
+                    min_words_horizontal=1,
+                    keep_blank_chars=True,
+                ),
+            ]
+
             raw_tables: List[List[List[Any]]] = []
-            for settings in (PDFPLUMBER_TABLE_SETTINGS_LINES, PDFPLUMBER_TABLE_SETTINGS_TEXT):
+            for ts in settings_list:
                 try:
-                    raw_tables += page.extract_tables(settings) or []
+                    raw_tables.extend(page.extract_tables(table_settings=ts) or [])
                 except Exception:
                     continue
 
-            # De-duplicate by a light signature (first 3 rows joined)
-            seen_sig: set = set()
-            for t in raw_tables:
-                nt = normalize_table(t)
-                if not nt or len(nt) < 2:
+            # De-dup by shape+first row string
+            seen = set()
+            uniq_raw = []
+            for tb in raw_tables:
+                if not tb or len(tb) < 2:
                     continue
-                sig = "||".join(["|".join(r) for r in nt[: min(3, len(nt))]])
-                if sig in seen_sig:
+                sig = (len(tb), max(len(r) for r in tb), clean_text(" ".join(tb[0]))[:80])
+                if sig in seen:
                     continue
-                seen_sig.add(sig)
-                nt = ffill_merged_cells(nt)
+                seen.add(sig)
+                uniq_raw.append(tb)
 
-                appendix = classify_appendix(nt)
-                appendix_title = appendix_map.get(appendix, appendix) if appendix else ""
+            for tb in uniq_raw:
+                rect = _rectangularize(tb)
+                cols, data_rows = _combine_multirow_headers(rect)
+                if not cols:
+                    continue
+                df = pd.DataFrame(data_rows, columns=cols)
+                df = _forward_fill_merged_cells(df)
+                df = _safe_df(df)
 
-                # Determine header
-                columns = nt[0]
-                rows = nt[1:]
+                # title
+                page_no = page_idx + 1
+                title = page_title_hint.get(page_no, f"表格（第{page_no}页）")
+                # If page text contains a more specific line above table
+                hint_lines = normalize_lines(pages_text[page_idx])
+                # pick the longest line containing "表" or "附表"
+                best_line = ""
+                for ln in hint_lines:
+                    if ("附表" in ln) or re.search(r"表\s*[1-9]\d?", ln):
+                        if len(ln) > len(best_line):
+                            best_line = ln
+                if best_line:
+                    # If includes "附表x", map
+                    m = re.search(r"(附表\s*[1-9]\d?)", best_line)
+                    if m:
+                        key = re.sub(r"\s+", "", m.group(1))
+                        title = appendix_map.get(key, best_line)
+                    else:
+                        title = best_line
 
-                # Add direction column if useful (appendix1 often needs)
-                direction_tbl = infer_direction_for_table(nt)
-                # per-row direction for appendix1/4 might be useful
-                add_row_direction = appendix in ("附表1", "附表4")
-                if add_row_direction:
-                    columns = columns + ["专业方向(推断)"]
-                    new_rows = []
-                    for r in rows:
-                        new_rows.append(r + [infer_direction_for_row(r)])
-                    rows = new_rows
+                tables.append(ExtractedTable(title=title, page=page_no, df=df, raw=rect))
 
-                title = appendix_title or f"表格-P{i+1}"  # fallback
-                if appendix_title:
-                    title = f"{appendix_title} - 第{i+1}页"
-
-                out.append(
-                    ExtractedTable(
-                        appendix=appendix,
-                        appendix_title=appendix_title,
-                        page=i + 1,
-                        title=title,
-                        columns=columns,
-                        rows=rows,
-                        direction=direction_tbl,
-                    )
-                )
-
-    return out
-
-
-def table_to_df(t: ExtractedTable) -> pd.DataFrame:
-    def _cell_to_str(x: Any) -> str:
-        if x is None:
-            return ""
-        # pdfplumber sometimes yields non-str objects; stringify everything
-        try:
-            s = str(x)
-        except Exception:
-            s = ""
-        return s.replace("\r", "").strip()
-
-    def _make_unique_columns(cols_in: List[str]) -> List[str]:
-        # Streamlit uses pyarrow under the hood; duplicate column names will crash.
-        seen: Dict[str, int] = {}
-        out: List[str] = []
-        for c in cols_in:
-            base = c
-            if base in seen:
-                seen[base] += 1
-                out.append(f"{base}_{seen[base]}")
-            else:
-                seen[base] = 1
-                out.append(base)
-        return out
-
-    cols_raw = ["" if c is None else str(c).strip() for c in (t.columns or [])]
-    rows_raw = t.rows or []
-
-    # robust align lengths
-    max_len = max([len(cols_raw)] + [len(r) for r in rows_raw] + [0])
-    cols_norm: List[str] = []
-    for i in range(max_len):
-        name = cols_raw[i] if i < len(cols_raw) else ""
-        name = re.sub(r"\s+", " ", (name or "").strip())
-        if not name:
-            name = f"col_{i+1}"
-        cols_norm.append(name)
-    cols_norm = _make_unique_columns(cols_norm)
-
-    fixed_rows: List[List[str]] = []
-    for r in rows_raw:
-        rr = [ _cell_to_str(x) for x in (r or []) ]
-        if len(rr) < max_len:
-            rr = rr + [""] * (max_len - len(rr))
-        elif len(rr) > max_len:
-            rr = rr[:max_len]
-        fixed_rows.append(rr)
-
-    # force all-string dataframe to avoid pyarrow dtype issues
-    df = pd.DataFrame(fixed_rows, columns=cols_norm)
-    return df.astype("string")
-
-
-def make_tables_zip(tables: List[ExtractedTable]) -> bytes:
-    buf = io.BytesIO()
-    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
-        for idx, t in enumerate(tables, start=1):
-            df = table_to_df(t)
-            safe_name = re.sub(r"[\\/:*?\"<>|]", "_", t.title)[:60]
-            filename = f"{idx:02d}_{safe_name}_P{t.page}.csv"
-            zf.writestr(filename, df.to_csv(index=False))
-    return buf.getvalue()
-
-
-def make_tables_excel(tables: List[ExtractedTable]) -> bytes:
-    buf = io.BytesIO()
-    # Prefer xlsxwriter, fallback openpyxl
-    engine = "xlsxwriter"
-    try:
-        import xlsxwriter  # noqa: F401
-    except Exception:
-        engine = "openpyxl"
-
-    with pd.ExcelWriter(buf, engine=engine) as writer:
-        for i, t in enumerate(tables, start=1):
-            df = table_to_df(t)
-            # sheet name length limit 31
-            name = re.sub(r"[\\/:*?\[\]]", "_", t.appendix or f"表{i}")
-            name = name[:28]  # keep room
-            sheet = f"{name}_{i}" if len(name) <= 20 else name
-            sheet = sheet[:31]
-            df.to_excel(writer, sheet_name=sheet, index=False)
-    return buf.getvalue()
+    # Sort by page then title
+    tables.sort(key=lambda x: (x.page, x.title))
+    return tables
 
 
 # -----------------------------
-# Full extraction pipeline
+# Optional LLM refine (OpenAI-compatible)
 # -----------------------------
-
-
-def run_full_extract(pdf_bytes: bytes, llm_cfg: Optional[LLMConfig] = None) -> Dict[str, Any]:
-    pages_text = extract_pages_text(pdf_bytes)
-    chapter_ranges = locate_chapter_ranges(pages_text)
-
-    # training objectives
-    if "培养目标" in chapter_ranges:
-        s, e = chapter_ranges["培养目标"]
-        obj_text = concat_pages(pages_text, s, e)
-    else:
-        obj_text = "\n".join(pages_text)
-    training_objectives = parse_training_objectives(obj_text)
-
-    # graduation requirements
-    grad_text = ""
-    if "毕业要求" in chapter_ranges:
-        s, e = chapter_ranges["毕业要求"]
-        grad_text = concat_pages(pages_text, s, e)
-    graduation_requirements = parse_graduation_requirements(grad_text)
-
-    # chapters 3-6 content
-    chapter_content = parse_chapter_content(pages_text, chapter_ranges)
-
-    # appendix map
-    appendix_map = extract_appendix_title_map(pages_text)
-
-    # tables
-    tables = extract_tables_pdfplumber(pdf_bytes, pages_text)
-
-    result = {
-        "meta": {
-            "sha256": sha256_bytes(pdf_bytes),
-            "pages": len(pages_text),
-            "tables": len(tables),
-        },
-        "chapter_ranges": {k: [v[0] + 1, v[1]] for k, v in chapter_ranges.items()},
-        "appendix_map": appendix_map,
-        "training_objectives": training_objectives,
-        "graduation_requirements": graduation_requirements,
-        "chapter_content": chapter_content,
-        "pages_text": pages_text,
-        "tables_data": [
-            {
-                "appendix": t.appendix,
-                "appendix_title": t.appendix_title,
-                "page": t.page,
-                "title": t.title,
-                "direction": t.direction,
-                "columns": t.columns,
-                "rows": t.rows,
-            }
-            for t in tables
-        ],
+def call_openai_compatible_chat(base_url: str, api_key: str, model: str, messages: List[Dict[str, str]], temperature: float = 0.2, timeout: int = 120) -> str:
+    if requests is None:
+        raise RuntimeError("requests 未安装，无法调用 LLM。")
+    url = base_url.rstrip("/") + "/v1/chat/completions"
+    headers = {"Content-Type": "application/json"}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+    payload = {
+        "model": model,
+        "messages": messages,
+        "temperature": float(temperature),
     }
-    # Optional LLM refinement
-    if llm_cfg is not None and getattr(llm_cfg, 'enabled', False):
-        try:
-            result = llm_refine_result(result, pages_text, llm_cfg)
-        except Exception as e:
-            result['_llm_error'] = str(e)
+    r = requests.post(url, headers=headers, json=payload, timeout=timeout)
+    r.raise_for_status()
+    data = r.json()
+    return data["choices"][0]["message"]["content"]
 
-    return result
+def llm_refine(parsed: Dict[str, Any], raw_sections: Dict[str, str], appendix_title_lines: List[str], llm_cfg: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Ask LLM to:
+    - fix missing 培养目标 items
+    - ensure 毕业要求 has 1..12 with subitems
+    - improve chapter title presence (no hallucination; only from provided raw text)
+    - refine appendix table titles if missing, and optionally add "方向" classification hints
+    """
+    base_url = llm_cfg.get("base_url", "")
+    api_key = llm_cfg.get("api_key", "")
+    model = llm_cfg.get("model", "")
+    temperature = llm_cfg.get("temperature", 0.2)
+
+    # Keep raw text bounded
+    raw_obj = raw_sections.get("一、培养目标", "")[:6000]
+    raw_req = raw_sections.get("二、毕业要求", "")[:9000]
+
+    prompt = {
+        "task": "你是高校培养方案解析校对助手。请在不编造信息的前提下，用下面提供的原文片段纠正并补全结构化解析结果。",
+        "rules": [
+            "只能依据提供的原文片段修正/补全；如果原文缺失则保持为空并说明。",
+            "毕业要求必须输出 1-12 共12条，每条可包含若干子条(如1.1,1.2...)。",
+            "培养目标输出为列表，每条为完整句子。",
+            "不要输出多余解释；只输出 JSON。"
+        ],
+        "inputs": {
+            "parsed": parsed,
+            "raw_text": {
+                "培养目标_section": raw_obj,
+                "毕业要求_section": raw_req,
+                "appendix_title_lines": appendix_title_lines[:80],
+            }
+        },
+        "output_schema": {
+            "objectives": ["..."],
+            "graduation_requirements": {"1":{"title":"...","subs":{"1.1":"..."}}, "...": {}},
+            "chapter_titles_found": ["..."],
+            "table_title_hints": {"附表1":"...", "附表2":"...", "附表3":"...", "附表4":"...", "附表5":"..."},
+            "notes": ["..."]
+        }
+    }
+
+    messages = [
+        {"role": "system", "content": "You return strictly valid JSON (no markdown)."},
+        {"role": "user", "content": json.dumps(prompt, ensure_ascii=False)}
+    ]
+    out = call_openai_compatible_chat(base_url, api_key, model, messages, temperature=temperature)
+    # Parse JSON safely
+    out = out.strip()
+    # Remove accidental code fences
+    out = re.sub(r"^```(?:json)?\s*|\s*```$", "", out).strip()
+    try:
+        refined = json.loads(out)
+        return refined if isinstance(refined, dict) else {}
+    except Exception:
+        return {}
 
 
 # -----------------------------
-# Streamlit UI
+# Export helpers
 # -----------------------------
+def make_tables_zip(tables: List[ExtractedTable]) -> bytes:
+    bio = io.BytesIO()
+    with zipfile.ZipFile(bio, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        meta = []
+        for i, t in enumerate(tables, start=1):
+            safe_title = re.sub(r"[\\/:*?\"<>|]+", "_", t.title)
+            safe_title = safe_title[:80] if safe_title else f"table_{i}"
+            xlsx_name = f"{i:02d}_{safe_title}_p{t.page}.xlsx"
+            xbio = io.BytesIO()
+            # prefer xlsxwriter if present
+            engine = "xlsxwriter"
+            try:
+                with pd.ExcelWriter(xbio, engine=engine) as writer:
+                    t.df.to_excel(writer, sheet_name="table", index=False)
+            except Exception:
+                with pd.ExcelWriter(xbio, engine="openpyxl") as writer:
+                    t.df.to_excel(writer, sheet_name="table", index=False)
 
-st.set_page_config(page_title="培养方案PDF全量抽取", layout="wide")
+            zf.writestr(xlsx_name, xbio.getvalue())
+            meta.append({"title": t.title, "page": t.page, "rows": len(t.df), "cols": len(t.df.columns), "file": xlsx_name})
 
-st.title("培养方案 PDF 全量抽取（文本 + 表格 + 结构化解析）")
+        zf.writestr("tables_meta.json", json.dumps(meta, ensure_ascii=False, indent=2))
+    return bio.getvalue()
+
+
+# -----------------------------
+# UI
+# -----------------------------
+st.set_page_config(page_title="培养方案全量抽取", layout="wide")
+
+st.title("培养方案 PDF 全量抽取与结构化展示")
 
 with st.sidebar:
-    st.markdown("## 上传与抽取")
-    up = st.file_uploader("上传培养方案 PDF", type=["pdf"], accept_multiple_files=False)
-    use_ocr = st.checkbox("对无文本页启用 OCR（可选）", value=False, help="若部署环境无 OCR 依赖，将自动降级")
+    st.header("输入")
+    pdf_file = st.file_uploader("上传培养方案 PDF", type=["pdf"])
+    run_btn = st.button("开始全量抽取", type="primary")
 
-    with st.expander("🔎 启用 LLM 校对与修正（可选）", expanded=False):
-        enable_llm = st.checkbox("启用 LLM 校对与修正", value=False)
-        provider = st.selectbox("LLM 提供方", ["OpenAI-compatible", "DashScope/Qwen"], index=0)
-        model = st.text_input("Model 名称", value=_get_secret("LLM_MODEL", ""))
-        api_key = st.text_input("API Key", value=_get_secret("LLM_API_KEY", ""), type="password")
-        base_url = ""
-        if provider == "OpenAI-compatible":
-            base_url = st.text_input("Base URL（如 https://xxx/v1 或完整 chat/completions）", value=_get_secret("LLM_BASE_URL", ""))
-        st.caption("可在 Streamlit secrets / 环境变量设置：LLM_API_KEY / LLM_MODEL / LLM_BASE_URL")
+    st.divider()
+    st.header("LLM 校对与修正")
+    enable_llm = st.checkbox("启用 LLM 校对与修正", value=False)
+    llm_cfg = {}
+    if enable_llm:
+        st.caption("使用 OpenAI 兼容接口（例如你自建网关 / 兼容服务）。")
+        llm_cfg["base_url"] = st.text_input("Base URL", value="https://api.openai.com")
+        llm_cfg["api_key"] = st.text_input("API Key", type="password", value="")
+        llm_cfg["model"] = st.text_input("Model", value="gpt-4o-mini")
+        llm_cfg["temperature"] = st.slider("Temperature", 0.0, 1.0, 0.2, 0.05)
 
-    llm_cfg = LLMConfig(
-        enabled=bool(enable_llm),
-        provider="dashscope" if provider == "DashScope/Qwen" else "openai_compat",
-        model=model.strip(),
-        api_key=api_key.strip(),
-        base_url=base_url.strip(),
-        temperature=0.0,
-        max_tokens=2000,
-        timeout=60,
-    )
+    st.divider()
+    st.header("显示")
+    show_pages = st.checkbox("显示分页原文", value=False)
+    show_raw_tables = st.checkbox("显示表格原始矩阵（调试）", value=False)
 
-    run_btn = st.button("开始全量抽取", type="primary", disabled=up is None)
-
-if "result" not in st.session_state:
-    st.session_state["result"] = None
-
-if up is not None:
-    pdf_bytes = up.getvalue()
-    file_hash = sha256_bytes(pdf_bytes)[:12]
-else:
-    pdf_bytes = b""
-    file_hash = ""
-
-if run_btn and up is not None:
-    with st.spinner("正在抽取全文与表格，请稍等…"):
-        res = run_full_extract(pdf_bytes, llm_cfg=llm_cfg)
-        st.session_state["result"] = res
-
-res = st.session_state.get("result")
-
-if not res:
-    st.info("请先在左侧上传培养方案 PDF，然后点击“开始全量抽取”。")
+if not pdf_file:
+    st.info("请先在左侧上传培养方案 PDF。")
     st.stop()
 
-# Summary row
-c1, c2, c3, c4 = st.columns([1.2, 1.2, 1.2, 3])
-with c1:
-    st.metric("总页数", res["meta"]["pages"])
-with c2:
-    st.metric("表格总数", res["meta"]["tables"])
-with c3:
-    st.metric("OCR启用", "是" if use_ocr else "否")
-with c4:
-    st.caption(f"SHA256: {res['meta']['sha256']}")
+pdf_bytes = pdf_file.read()
 
-# Tabs
-TAB_NAMES = [
-    "概览与下载",
-    "章节大标题（全部）",
-    "培养目标",
-    "毕业要求（12条）",
-    "附表表格",
-    "分页原文（溯源）",
-]
+if "extract_result" not in st.session_state:
+    st.session_state["extract_result"] = None
 
+if run_btn:
+    with st.spinner("正在解析 PDF 文本..."):
+        pages_text = extract_pages_text(pdf_bytes)
+        chapters = extract_chapters(pages_text)
 
-tabs = st.tabs(TAB_NAMES)
+    with st.spinner("正在解析毕业要求/培养目标..."):
+        obj_text = chapters.get("一、培养目标", "")
+        req_text = chapters.get("二、毕业要求", "")
+        objectives = parse_objectives(obj_text)
+        gradreq = parse_graduation_requirements(req_text)
 
-# 1) 概览与下载
+    with st.spinner("正在抽取 PDF 表格..."):
+        tables = extract_tables_pdfplumber(pdf_bytes, pages_text)
+
+    # Gather appendix title lines for LLM
+    appendix_title_lines = []
+    for ln in normalize_lines("\n".join(pages_text)):
+        if "附表" in ln:
+            appendix_title_lines.append(ln)
+    appendix_title_lines = appendix_title_lines[:200]
+
+    parsed = {
+        "objectives": objectives,
+        "graduation_requirements": gradreq,
+        "chapter_titles_found": list(chapters.keys()),
+        "table_count": len(tables),
+    }
+
+    refined = None
+    if enable_llm:
+        with st.spinner("LLM 正在校对与修正（若接口不可用会自动跳过）..."):
+            try:
+                refined = llm_refine(parsed, chapters, appendix_title_lines, llm_cfg)
+            except Exception as e:
+                refined = {"notes": [f"LLM 调用失败：{e}"]}
+
+        # Apply refined results carefully
+        if isinstance(refined, dict):
+            if isinstance(refined.get("objectives"), list) and refined["objectives"]:
+                objectives = [clean_text(x) for x in refined["objectives"] if clean_text(x)]
+            if isinstance(refined.get("graduation_requirements"), dict) and refined["graduation_requirements"]:
+                # merge 1..12
+                for i in range(1, 13):
+                    k = str(i)
+                    if k in refined["graduation_requirements"]:
+                        gradreq[k] = refined["graduation_requirements"][k]
+            # Update known appendix titles hint (doesn't change extracted df)
+            if isinstance(refined.get("table_title_hints"), dict):
+                hints = refined["table_title_hints"]
+                for t in tables:
+                    for key, title in hints.items():
+                        if key in t.title and clean_text(title):
+                            t.title = clean_text(title)
+
+    st.session_state["extract_result"] = {
+        "pages_text": pages_text,
+        "chapters": chapters,
+        "objectives": objectives,
+        "graduation_requirements": gradreq,
+        "tables": tables,
+        "llm_refined": refined,
+    }
+
+res = st.session_state["extract_result"]
+if res is None:
+    st.warning("请点击左侧“开始全量抽取”。")
+    st.stop()
+
+pages_text = res["pages_text"]
+chapters = res["chapters"]
+objectives = res["objectives"]
+gradreq = res["graduation_requirements"]
+tables: List[ExtractedTable] = res["tables"]
+refined = res.get("llm_refined")
+
+# ---- Overview ----
+st.subheader("章节定位概览")
+ranges = build_chapter_ranges(pages_text)
+if ranges:
+    df_rng = pd.DataFrame(
+        [{"章节": t, "起始页": sp+1, "起始行": sl+1, "结束页": ep+1} for (t, sp, sl, ep, el) in ranges]
+    )
+    st.dataframe(_safe_df(df_rng), use_container_width=True, hide_index=True)
+else:
+    st.warning("未能定位章节标题（但仍可查看分页原文与表格）。")
+
+tabs = st.tabs(["培养目标", "毕业要求", "章节原文", "附表表格", "分页原文"])
+
 with tabs[0]:
-    st.subheader("结构化识别结果（可先在这里校对）")
-
-    # quick counts
-    st.write(
-        {
-            "培养目标条数": len(res.get("training_objectives", [])),
-            "毕业要求大项数": len(res.get("graduation_requirements", {})),
-            "附表标题映射": res.get("appendix_map", {}),
-        }
-    )
-
-    # downloads
-    json_bytes = json.dumps(res, ensure_ascii=False, indent=2).encode("utf-8")
-    st.download_button(
-        "下载抽取结果 JSON（全量基础库）",
-        data=json_bytes,
-        file_name=f"培养方案抽取_{file_hash}.json",
-        mime="application/json",
-        use_container_width=True,
-    )
-
-    # tables downloads
-    if res["tables_data"]:
-        # rebuild ExtractedTable list for export
-        tables_obj = [
-            ExtractedTable(
-                appendix=t.get("appendix", ""),
-                appendix_title=t.get("appendix_title", ""),
-                page=int(t.get("page", 0)),
-                title=t.get("title", ""),
-                columns=t.get("columns", []),
-                rows=t.get("rows", []),
-                direction=t.get("direction", ""),
-            )
-            for t in res["tables_data"]
-        ]
-
-        zip_bytes = make_tables_zip(tables_obj)
-        st.download_button(
-            "下载附表表格 CSV（zip）",
-            data=zip_bytes,
-            file_name=f"附表表格_{file_hash}.zip",
-            mime="application/zip",
-            use_container_width=True,
-        )
-
-        try:
-            xlsx_bytes = make_tables_excel(tables_obj)
-            st.download_button(
-                "下载附表表格 Excel（xlsx）",
-                data=xlsx_bytes,
-                file_name=f"附表表格_{file_hash}.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                use_container_width=True,
-            )
-        except Exception as e:
-            st.warning(f"Excel 导出失败：{e}")
-    else:
-        st.warning("未检测到表格。若 PDF 为扫描件或线框不明显，表格识别可能失败。")
-
-# 2) 章节大标题
-with tabs[1]:
-    st.subheader("三~六 章节内容（原文拼接，可溯源）")
-    chap = res.get("chapter_content", {})
-    for k, v in chap.items():
-        st.markdown(f"### {k}")
-        if v:
-            st.text_area("", value=v, height=220, key=f"chap_{k}")
-        else:
-            st.info("未在 PDF 中定位到该章节标题（可能格式不一致）。")
-
-# 3) 培养目标
-with tabs[2]:
     st.subheader("培养目标（可编辑/校对）")
-    objs = res.get("training_objectives", [])
-    if not objs:
+    if objectives:
+        for i, it in enumerate(objectives, start=1):
+            st.markdown(f"**{i}.** {it}")
+    else:
         st.warning("未解析到培养目标条目。可在“分页原文”里确认 PDF 文本是否可提取。")
-    else:
-        for i, item in enumerate(objs, start=1):
-            st.markdown(f"**{i}.** {item}")
 
-# 4) 毕业要求
+    if enable_llm and refined:
+        notes = refined.get("notes") if isinstance(refined, dict) else None
+        if notes:
+            st.info("LLM 校对备注：\n- " + "\n- ".join([clean_text(x) for x in notes if clean_text(x)]))
+
+with tabs[1]:
+    st.subheader("毕业要求（1–12）")
+    for i in range(1, 13):
+        k = str(i)
+        item = gradreq.get(k, {"title": "", "subs": {}})
+        title = clean_text(item.get("title", ""))
+        st.markdown(f"### {i}. {title if title else '（标题缺失）'}")
+        subs = item.get("subs", {}) if isinstance(item.get("subs", {}), dict) else {}
+        if subs:
+            # sort by numeric
+            def _key(x):
+                try:
+                    a,b = x.split(".")
+                    return (int(a), float("0."+b))
+                except Exception:
+                    return (999, 999)
+            for code, cont in sorted(subs.items(), key=lambda kv: _key(kv[0])):
+                st.markdown(f"- **{code}** {clean_text(cont)}")
+        else:
+            st.caption("（未解析到子条）")
+
+with tabs[2]:
+    st.subheader("章节原文（抽取结果）")
+    for title, content in chapters.items():
+        with st.expander(title, expanded=False):
+            st.text_area("内容", value=content, height=260, label_visibility="collapsed")
+
 with tabs[3]:
-    st.subheader("毕业要求（应为 12 大条 + 子项）")
-    gr = res.get("graduation_requirements", {})
-    if not gr:
-        st.warning("未解析到毕业要求。")
+    st.subheader("附表/表格（PDF 抽取）")
+    if not tables:
+        st.warning("未抽取到表格。若 PDF 为图片扫描件，建议改用 OCR（此版本未内置 OCR）。")
     else:
-        # order by numeric
-        keys = sorted(gr.keys(), key=lambda x: safe_int(x, 999))
-        for k in keys:
-            item = gr[k]
-            st.markdown(f"### {k}. {item.get('title','')}")
-            if item.get("text"):
-                st.write(item["text"])
-            subs = item.get("subs", {})
-            if subs:
-                for sk in sorted(subs.keys(), key=lambda x: [safe_int(p) for p in x.split(".")]):
-                    st.markdown(f"- **{sk}** {subs[sk]}")
+        c1, c2 = st.columns([1, 1])
+        with c1:
+            st.metric("表格数量", len(tables))
+        with c2:
+            zip_bytes = make_tables_zip(tables)
+            st.download_button("下载全部表格（ZIP+Excel）", data=zip_bytes, file_name="培养方案_表格导出.zip", mime="application/zip")
 
-# 5) 附表表格
+        for idx, t in enumerate(tables, start=1):
+            with st.expander(f"{idx:02d}. {t.title}（第{t.page}页）", expanded=False):
+                st.dataframe(_safe_df(t.df), use_container_width=True, hide_index=True)
+                if show_raw_tables:
+                    st.caption("原始矩阵（调试）：")
+                    st.write(t.raw[:10])
+
 with tabs[4]:
-    st.subheader("附表表格（表名 + 方向尽量清晰）")
-
-    tables_data = res.get("tables_data", [])
-    if not tables_data:
-        st.info("未检测到表格。")
+    st.subheader("分页原文")
+    if show_pages:
+        for i, t in enumerate(pages_text, start=1):
+            with st.expander(f"第 {i} 页", expanded=False):
+                st.text_area("page_text", value=t, height=320, label_visibility="collapsed")
     else:
-        # group by appendix
-        by_app: Dict[str, List[ExtractedTable]] = {}
-        for t in tables_data:
-            obj = ExtractedTable(
-                appendix=t.get("appendix", ""),
-                appendix_title=t.get("appendix_title", ""),
-                page=int(t.get("page", 0)),
-                title=t.get("title", ""),
-                columns=t.get("columns", []),
-                rows=t.get("rows", []),
-                direction=t.get("direction", ""),
-            )
-            key = obj.appendix or "未分类"
-            by_app.setdefault(key, []).append(obj)
-
-        # tabs per appendix
-        app_keys = list(by_app.keys())
-        # order: 附表1..附表5, then others
-        def app_sort(k: str) -> int:
-            m = re.search(r"(\d+)", k)
-            if m:
-                return safe_int(m.group(1), 99)
-            return 99
-
-        app_keys = sorted(app_keys, key=app_sort)
-        app_tabs = st.tabs(app_keys)
-
-        for tab_key, app_tab in zip(app_keys, app_tabs):
-            with app_tab:
-                lst = sorted(by_app[tab_key], key=lambda x: (x.page, x.title))
-                for i, t in enumerate(lst, start=1):
-                    st.markdown(f"#### {t.title}")
-                    if t.direction:
-                        st.caption(f"方向（推断）：{t.direction}")
-                    df = table_to_df(t)
-                    # Streamlit uses PyArrow for rendering; some edge cases (e.g., duplicate cols / odd dtypes)
-                    # may still fail. We already normalize to strings & unique cols, but keep a safe fallback.
-                    try:
-                        st.dataframe(safe_dataframe_for_streamlit(df), use_container_width=True, hide_index=True)
-                    except Exception:
-                        st.warning("该表格渲染遇到兼容性问题，已退回为HTML表格显示。")
-                        # pandas.DataFrame.to_markdown() needs optional dependency "tabulate".
-                        # Streamlit Cloud often doesn't include it, so use HTML instead.
-                        html = safe_dataframe_for_streamlit(df).to_html(index=False, escape=False)
-                        st.markdown(html, unsafe_allow_html=True)
-
-# 6) 分页原文
-with tabs[5]:
-    st.subheader("分页原文（用于溯源/调试抽取缺失）")
-    pages = res.get("pages_text", [])
-    for i, txt in enumerate(pages, start=1):
-        with st.expander(f"第{i}页文本", expanded=(i == 1)):
-            st.text(txt)
+        st.info("如需查看分页原文，请在左侧勾选“显示分页原文”。")
