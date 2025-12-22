@@ -19,19 +19,9 @@ from typing import List, Optional, Dict, Any, Tuple
 import pandas as pd
 import streamlit as st
 from dataclasses import asdict, dataclass
-
-
+import pdfplumber
+from docx import Document
 # -------- 可选解析依赖 --------
-try:
-    import pdfplumber
-except Exception:
-    pdfplumber = None
-    st.error("缺少依赖 pdfplumber，请安装：pip install pdfplumber")
-
-try:
-    from docx import Document
-except Exception:
-    Document = None
 
 # ---------------------------
 # 基础配置
@@ -494,7 +484,7 @@ def topbar():
     st.markdown(
         """
 <div class="topbar">
-    <div class="title">教学智能体平台 - PDF全量抽取版</div>
+    <div class="title">教学智能体平台</div>
     <div class="sub">培养方案PDF全量抽取（文本+表格+结构）→ 大纲 → 日历 → 教案 → 试卷/审核 → 达成报告 → 授课手册</div>
 </div>
 """,
@@ -517,10 +507,10 @@ p_sel = st.sidebar.selectbox("选择项目", p_names, index=0)
 
 if p_sel == "（新建项目）":
     with st.sidebar.expander("创建新项目", expanded=True):
-        pname = st.text_input("项目名称", value="材料成型-教评一体化示例", key="new_pname")
+        pname = st.text_input("项目名称", value="材料成型-教评一体化", key="new_pname")
         major = st.text_input("专业", value="材料成型及控制工程", key="new_major")
         grade = st.text_input("年级", value="22", key="new_grade")
-        course_group = st.text_input("课程体系/方向", value="材料成型-数值模拟方向", key="new_group")
+        course_group = st.text_input("课程体系/方向", value="材料成型-焊接方向", key="new_group")
         if st.button("创建项目", type="primary"):
             pid = create_project(pname, {"major": major, "grade": grade, "course_group": course_group})
             st.success("已创建项目，请在下拉中选择它。")
@@ -1175,7 +1165,7 @@ def page_training_plan():
 
     with tab1:
             st.markdown("### PDF全量抽取独立界面（增强版）")
-            st.caption("确保显示所有章节（如一到六）和所有附表（如附表1到5，对应七到十一）")
+            st.caption("显示所有章节和所有附表")
             
             if "extract_result" not in st.session_state:
                 st.session_state["extract_result"] = None
@@ -1200,7 +1190,7 @@ def page_training_plan():
             c3.metric("OCR启用", "是" if result.ocr_used else "否")
             c4.caption(f"SHA256: {result.file_sha256[:16]}...")
 
-            tabs = st.tabs(["概览与下载", "章节大标题（全部）", "培养目标", "毕业要求（12条）", "附表表格（可下载CSV）", "分页原文与表格"])
+            tabs = st.tabs(["概览与下载", "章节大标题", "培养目标", "毕业要求", "附表表格（可下载CSV）", "分页原文与表格"])
 
             # ---- Tab 0 概览与下载
             with tabs[0]:
@@ -1234,7 +1224,7 @@ def page_training_plan():
 
             # ---- Tab 1 章节大标题
             with tabs[1]:
-                st.markdown("### 章节大标题（用于确保'三~六'等内容不丢）")
+                st.markdown("### 章节大标题")
                 st.caption("这里展示 split_sections 抽到的全部大章标题，点击可展开查看正文（用于溯源和校对）。")
                 for k in result.sections.keys():
                     with st.expander(k, expanded=False):
@@ -1243,7 +1233,7 @@ def page_training_plan():
             # ---- Tab 2 培养目标
             with tabs[2]:
                 st.markdown("### 1）培养目标（可编辑/校对）")
-                st.caption("若培养目标有多方向版本（焊接/无损），后续可在此基础上增强为分方向抽取。")
+                st.caption("若培养目标有多方向版本，后续可在此基础上增强为分方向抽取。")
 
                 obj = result.training_objectives
                 st.write(f"识别条目数：**{obj.get('count', 0)}**")
@@ -1253,9 +1243,9 @@ def page_training_plan():
 
             # ---- Tab 3 毕业要求
             with tabs[3]:
-                st.markdown("### 2）毕业要求（12条 + 分项）")
+                st.markdown("### 2）毕业要求")
                 grad = result.graduation_requirements
-                st.write(f"识别主条目数：**{grad.get('count', 0)}**（理想为 12）")
+                st.write(f"识别主条目数：**{grad.get('count', 0)}**")
 
                 items = grad.get("items", [])
                 if not items:
@@ -1278,7 +1268,7 @@ def page_training_plan():
 
             # ---- Tab 4 表格
             with tabs[4]:
-                st.markdown("### 3）附表表格（表名 + 方向尽量清晰）")
+                st.markdown("### 3）附表表格（表名 + 方向）")
                 if not result.tables:
                     st.info("未检测到表格。请检查PDF是否有表格，或尝试启用OCR。")
                 else:
