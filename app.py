@@ -575,7 +575,7 @@ def extract_tables_pdfplumber(pdf_bytes: bytes, pages_text: List[str]) -> List[E
 def call_openai_compatible_chat(base_url: str, api_key: str, model: str, messages: List[Dict[str, str]], temperature: float = 0.2, timeout: int = 120) -> str:
     if requests is None:
         raise RuntimeError("requests 未安装，无法调用 LLM。")
-    url = base_url.rstrip("/") + "/v1/chat/completions"
+    url = base_url.rstrip("/")
     headers = {"Content-Type": "application/json"}
     if api_key:
         headers["Authorization"] = f"Bearer {api_key}"
