@@ -2341,24 +2341,7 @@ def page_training_plan():
                 st.success("已保存培养方案（可作为后续文件依赖底座）")
                 st.rerun()
         
-        with col2:
-            st.markdown("#### 方式B：上传PDF全量抽取（推荐）")
-            up = st.file_uploader("上传培养方案PDF文件", type=["pdf"], key="tp_upload")
-            use_ocr = st.checkbox("启用OCR（针对扫描版PDF）", value=False)
-            
-            if up is not None and st.button("开始全量抽取", key="tp_start_extract"):
-                pdf_bytes = up.read()
-                with st.spinner("正在全量抽取PDF..."):
-                    extract_result = run_full_extract(pdf_bytes, use_ocr=use_ocr)
-                
-                # 保存抽取结果到session
-                st.session_state["tp_extract"] = {
-                    "source": up.name,
-                    "pdf_bytes": pdf_bytes,
-                    "extract_result": asdict(extract_result),
-                    "confirmed": False
-                }
-                st.success("PDF抽取完成！请在下方确认/修正抽取结果。")
+
         
         # 识别清单确认界面
         if "tp_extract" in st.session_state:
