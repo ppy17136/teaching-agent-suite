@@ -1547,7 +1547,7 @@ def page_training_plan():
         with tabs_full[5]:
             st.markdown("### 分页原文与表格（用于溯源/调试抽取缺失）")
             
-            for page_data in pages_data:
+            for page_data in result.pages_data:  # 这里添加 result.
                 page_no = page_data["page"]
                 page_text = page_data["text"]
                 page_tables = page_data["tables"]
