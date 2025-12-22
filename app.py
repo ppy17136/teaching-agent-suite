@@ -252,7 +252,7 @@ def extract_appendix_title_map(pages_text: List[str]) -> Dict[str, str]:
 # Table extraction (pdfplumber)
 # -----------------------------
 
-PDFPLUMBER_TABLE_SETTINGS = {
+PDFPLUMBER_TABLE_SETTINGS_LINES = {
     "vertical_strategy": "lines",
     "horizontal_strategy": "lines",
     "snap_tolerance": 3,
@@ -260,6 +260,19 @@ PDFPLUMBER_TABLE_SETTINGS = {
     "edge_min_length": 3,
     "intersection_tolerance": 3,
     "text_tolerance": 3,
+}
+
+# Fallback for borderless tables (common in some teaching-plan PDFs)
+PDFPLUMBER_TABLE_SETTINGS_TEXT = {
+    "vertical_strategy": "text",
+    "horizontal_strategy": "text",
+    "snap_tolerance": 3,
+    "join_tolerance": 3,
+    "edge_min_length": 3,
+    "intersection_tolerance": 3,
+    "text_tolerance": 3,
+    "min_words_vertical": 3,
+    "min_words_horizontal": 1,
 }
 
 
@@ -413,11 +426,24 @@ def extract_tables_pdfplumber(pdf_bytes: bytes, pages_text: List[str]) -> List[E
     out: List[ExtractedTable] = []
     with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
         for i, page in enumerate(pdf.pages):
-            raw_tables = page.extract_tables(PDFPLUMBER_TABLE_SETTINGS) or []
+            # Try two strategies: lines-first (bordered) then text (borderless)
+            raw_tables: List[List[List[Any]]] = []
+            for settings in (PDFPLUMBER_TABLE_SETTINGS_LINES, PDFPLUMBER_TABLE_SETTINGS_TEXT):
+                try:
+                    raw_tables += page.extract_tables(settings) or []
+                except Exception:
+                    continue
+
+            # De-duplicate by a light signature (first 3 rows joined)
+            seen_sig: set = set()
             for t in raw_tables:
                 nt = normalize_table(t)
                 if not nt or len(nt) < 2:
                     continue
+                sig = "||".join(["|".join(r) for r in nt[: min(3, len(nt))]])
+                if sig in seen_sig:
+                    continue
+                seen_sig.add(sig)
                 nt = ffill_merged_cells(nt)
 
                 appendix = classify_appendix(nt)
@@ -458,24 +484,56 @@ def extract_tables_pdfplumber(pdf_bytes: bytes, pages_text: List[str]) -> List[E
 
 
 def table_to_df(t: ExtractedTable) -> pd.DataFrame:
-    cols = t.columns
-    rows = t.rows
+    def _cell_to_str(x: Any) -> str:
+        if x is None:
+            return ""
+        # pdfplumber sometimes yields non-str objects; stringify everything
+        try:
+            s = str(x)
+        except Exception:
+            s = ""
+        return s.replace("\r", "").strip()
+
+    def _make_unique_columns(cols_in: List[str]) -> List[str]:
+        # Streamlit uses pyarrow under the hood; duplicate column names will crash.
+        seen: Dict[str, int] = {}
+        out: List[str] = []
+        for c in cols_in:
+            base = c
+            if base in seen:
+                seen[base] += 1
+                out.append(f"{base}_{seen[base]}")
+            else:
+                seen[base] = 1
+                out.append(base)
+        return out
+
+    cols_raw = ["" if c is None else str(c).strip() for c in (t.columns or [])]
+    rows_raw = t.rows or []
 
     # robust align lengths
-    max_len = max([len(cols)] + [len(r) for r in rows] + [0])
-    if len(cols) < max_len:
-        cols = cols + [f"col_{i+1}" for i in range(len(cols), max_len)]
+    max_len = max([len(cols_raw)] + [len(r) for r in rows_raw] + [0])
+    cols_norm: List[str] = []
+    for i in range(max_len):
+        name = cols_raw[i] if i < len(cols_raw) else ""
+        name = re.sub(r"\s+", " ", (name or "").strip())
+        if not name:
+            name = f"col_{i+1}"
+        cols_norm.append(name)
+    cols_norm = _make_unique_columns(cols_norm)
 
-    fixed_rows = []
-    for r in rows:
-        if len(r) < max_len:
-            fixed_rows.append(r + [""] * (max_len - len(r)))
-        elif len(r) > max_len:
-            fixed_rows.append(r[:max_len])
-        else:
-            fixed_rows.append(r)
+    fixed_rows: List[List[str]] = []
+    for r in rows_raw:
+        rr = [ _cell_to_str(x) for x in (r or []) ]
+        if len(rr) < max_len:
+            rr = rr + [""] * (max_len - len(rr))
+        elif len(rr) > max_len:
+            rr = rr[:max_len]
+        fixed_rows.append(rr)
 
-    return pd.DataFrame(fixed_rows, columns=cols)
+    # force all-string dataframe to avoid pyarrow dtype issues
+    df = pd.DataFrame(fixed_rows, columns=cols_norm)
+    return df.astype("string")
 
 
 def make_tables_zip(tables: List[ExtractedTable]) -> bytes:
@@ -775,7 +833,13 @@ with tabs[4]:
                     if t.direction:
                         st.caption(f"方向（推断）：{t.direction}")
                     df = table_to_df(t)
-                    st.dataframe(df, use_container_width=True, hide_index=True)
+                    # Streamlit uses PyArrow for rendering; some edge cases (e.g., duplicate cols / odd dtypes)
+                    # may still fail. We already normalize to strings & unique cols, but keep a safe fallback.
+                    try:
+                        st.dataframe(df, use_container_width=True, hide_index=True)
+                    except Exception:
+                        st.warning("该表格渲染遇到兼容性问题，已退回为文本表格显示。")
+                        st.markdown(df.to_markdown(index=False))
 
 # 6) 分页原文
 with tabs[5]:
