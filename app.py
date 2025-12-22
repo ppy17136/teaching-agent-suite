@@ -1151,7 +1151,373 @@ def page_overview():
         })
     st.dataframe(rows, use_container_width=True)
 
-
+def page_training_plan():
+    ensure_project()
+    a = get_artifact(project_id, "training_plan")
+    render_depbar(project_id, "training_plan")
+    
+    st.markdown("### 培养方案（底座）")
+    st.caption("推荐：上传培养方案PDF → 全量抽取 → 识别清单确认/修正 → 保存（结构化底座）。")
+    
+    tab1, tab2, tab3, tab4, tab5 = st.tabs(["生成/上传&识别确认", "预览", "编辑", "版本/导出", "PDF全量抽取界面"])
+    
+    with tab1:
+        col1, col2 = st.columns([1, 1])
+        
+        with col1:
+            st.markdown("#### 方式A：一键生成（演示/快速）")
+            major = st.text_input("专业", value="材料成型及控制工程", key="tp_major")
+            grade = st.text_input("年级", value="22", key="tp_grade")
+            group = st.text_input("课程体系/方向", value="材料成型-数值模拟方向", key="tp_group")
+            if st.button("生成培养方案并保存", type="primary"):
+                md = template_training_plan(major, grade, group)
+                a = upsert_artifact(
+                    project_id,
+                    "training_plan",
+                    f"{grade}级《{major}》培养方案",
+                    md,
+                    {"major": major, "grade": grade, "course_group": group, "confirmed": True},
+                    [],
+                    note="generate",
+                )
+                st.success("已保存培养方案（可作为后续文件依赖底座）")
+                st.rerun()
+        
+        with col2:
+            st.markdown("#### 方式B：上传PDF全量抽取（推荐）")
+            up = st.file_uploader("上传培养方案PDF文件", type=["pdf"], key="tp_upload")
+            use_ocr = st.checkbox("启用OCR（针对扫描版PDF）", value=False)
+            
+            if up is not None and st.button("开始全量抽取", key="tp_start_extract"):
+                pdf_bytes = up.read()
+                with st.spinner("正在全量抽取PDF..."):
+                    extract_result = run_full_extract(pdf_bytes, use_ocr=use_ocr)
+                
+                # 保存抽取结果到session
+                st.session_state["tp_extract"] = {
+                    "source": up.name,
+                    "pdf_bytes": pdf_bytes,
+                    "extract_result": asdict(extract_result),
+                    "confirmed": False
+                }
+                st.success("PDF抽取完成！请在下方确认/修正抽取结果。")
+        
+        # 识别清单确认界面
+        if "tp_extract" in st.session_state:
+            ex = st.session_state["tp_extract"]
+            extract_result = ex["extract_result"]
+            
+            st.markdown("---")
+            st.markdown("### PDF全量抽取结果（请确认/修正）")
+            
+            # 基本信息
+            colA, colB, colC = st.columns(3)
+            with colA:
+                major2 = st.text_input("专业", 
+                                      value=extract_result.get("major_guess", "") or "材料成型及控制工程", 
+                                      key="tp_major_fix")
+                grade2 = st.text_input("年级", 
+                                      value=extract_result.get("grade_guess", "") or "22", 
+                                      key="tp_grade_fix")
+            with colB:
+                course_group2 = st.text_input("课程体系/方向", 
+                                             value=extract_result.get("course_group_guess", "") or "材料成型方向", 
+                                             key="tp_group_fix")
+                confirmed_flag = st.checkbox("我已确认以上信息大体正确", value=False, key="tp_confirm_flag")
+            with colC:
+                st.metric("总页数", extract_result.get("page_count", 0))
+                st.metric("表格总数", extract_result.get("table_count", 0))
+            
+            st.markdown("#### 1) 培养目标（可编辑）")
+            goals = extract_result.get("training_objectives", {}).get("items", [])
+            goals_text = st.text_area(
+                "每行一个目标（可增删/改写）",
+                value="\n".join(goals) if goals else "",
+                height=140,
+                key="tp_goals_edit",
+            )
+            goals_final = [x.strip() for x in goals_text.splitlines() if x.strip()]
+            
+            st.markdown("#### 2) 毕业要求（可编辑）")
+            grad_items = extract_result.get("graduation_requirements", {}).get("items", [])
+            if grad_items:
+                # 创建可编辑的DataFrame
+                grad_data = []
+                for item in grad_items:
+                    grad_data.append({
+                        "编号": item.get("no", ""),
+                        "标题": item.get("title", ""),
+                        "内容": item.get("body", "")
+                    })
+                df_grad = pd.DataFrame(grad_data)
+                df_grad_edited = st.data_editor(df_grad, use_container_width=True, num_rows="dynamic", key="tp_grad_editor")
+                outcomes_final = []
+                for _, row in df_grad_edited.iterrows():
+                    if str(row["编号"]).strip():
+                        outcomes_final.append({
+                            "no": str(row["编号"]).strip(),
+                            "title": str(row["标题"]).strip(),
+                            "body": str(row["内容"]).strip()
+                        })
+            else:
+                st.info("未识别到毕业要求，请手工录入")
+                grad_json = st.text_area(
+                    "毕业要求 JSON",
+                    value=json.dumps([{"no": "1", "title": "工程知识", "body": ""}], ensure_ascii=False, indent=2),
+                    height=160,
+                    key="tp_grad_json",
+                )
+                try:
+                    outcomes_final = json.loads(grad_json) if grad_json.strip() else []
+                except Exception:
+                    outcomes_final = []
+            
+            st.markdown("#### 3) 抽取的表格（可编辑确认）")
+            tables = extract_result.get("tables", [])
+            confirmed_tables = []
+            
+            if tables:
+                for i, table_info in enumerate(tables[:5]):  # 只显示前5个表格
+                    st.markdown(f"**表格{i+1}（第{table_info.get('page', '?')}页）**")
+                    
+                    # 确保DataFrame有正确的列名
+                    try:
+                        df = safe_df_from_tablepack(table_info)
+                        if not df.empty:
+                            # 使用st.data_editor
+                            df_edited = st.data_editor(df, use_container_width=True, key=f"tp_table_{i}")
+                            
+                            confirm_table = st.checkbox(f"确认采用此表格", value=True, key=f"tp_table_confirm_{i}")
+                            if confirm_table:
+                                confirmed_tables.append({
+                                    "page": table_info.get("page", 0),
+                                    "title": table_info.get("title", ""),
+                                    "data": df_edited.values.tolist(),
+                                    "columns": df_edited.columns.tolist()
+                                })
+                    except Exception as e:
+                        st.error(f"表格{i+1}显示错误: {str(e)}")
+                        # 显示原始数据
+                        st.write("原始数据:", table_info.get("data", []))
+            else:
+                st.info("未抽取到表格")
+            
+            st.markdown("#### 4) 章节结构")
+            sections = extract_result.get("sections", {})
+            with st.expander("查看章节结构", expanded=False):
+                for section_name, section_content in list(sections.items())[:10]:  # 显示前10个章节
+                    st.markdown(f"**{section_name}**")
+                    st.text(section_content[:500] + "..." if len(section_content) > 500 else section_content)
+            
+            st.markdown("---")
+            if st.button("✅ 确认并保存为培养方案底座", type="primary", disabled=not confirmed_flag):
+                # 构建content_json
+                content_json = {
+                    "source": ex["source"],
+                    "confirmed": True,
+                    "major": major2,
+                    "grade": grade2,
+                    "course_group": course_group2,
+                    "goals": goals_final,
+                    "outcomes": outcomes_final,
+                    "tables": confirmed_tables,
+                    "extract_metadata": {
+                        "page_count": extract_result.get("page_count", 0),
+                        "table_count": extract_result.get("table_count", 0),
+                        "sections_count": len(sections),
+                        "extracted_at": extract_result.get("extracted_at", "")
+                    },
+                    "full_extract": extract_result  # 保存完整的抽取结果
+                }
+                
+                # 生成markdown
+                md = f"# 培养方案（PDF抽取-已确认）\n\n"
+                md += f"- 专业：{major2}\n- 年级：{grade2}\n- 课程体系/方向：{course_group2}\n\n"
+                md += "## 一、培养目标（确认版）\n" + ("\n".join([f"- {x}" for x in goals_final]) if goals_final else "- （未填）") + "\n\n"
+                md += "## 二、毕业要求（确认版）\n" + ("\n".join([f"- {o.get('no','')}. {o.get('title','')}: {o.get('body','')}" for o in outcomes_final]) if outcomes_final else "- （未填）") + "\n\n"
+                md += "## 三、抽取表格（共{}个）\n".format(len(confirmed_tables))
+                for i, tbl in enumerate(confirmed_tables, 1):
+                    md += f"- 表格{i}（第{tbl['page']}页）: {tbl['title']}\n"
+                md += "\n## 四、章节结构\n"
+                for section_name in list(sections.keys())[:5]:
+                    md += f"- {section_name}\n"
+                
+                title = f"培养方案（PDF抽取确认版）-{ex['source']}"
+                a2 = upsert_artifact(project_id, "training_plan", title, md, content_json, [], note="pdf-extract-confirm")
+                st.success("已保存'确认版培养方案底座'。后续生成大纲会优先使用结构化字段。")
+                st.session_state.pop("tp_extract", None)
+                st.rerun()
+            
+            if st.button("清除本次抽取结果（不保存）"):
+                st.session_state.pop("tp_extract", None)
+                st.info("已清除。")
+    
+    with tab2:
+        if not a:
+            st.info("暂无培养方案。请先生成或上传并确认。")
+        else:
+            artifact_toolbar(a)
+            st.markdown("#### 结构化内容")
+            st.json(a.get("content_json") or {})
+            st.markdown("#### Markdown预览")
+            st.markdown(a["content_md"][:2000] + "..." if len(a["content_md"]) > 2000 else a["content_md"])
+    
+    with tab3:
+        if not a:
+            st.info("暂无培养方案。请先生成或上传。")
+        else:
+            edited = md_textarea("在线编辑培养方案（支持直接修改）", a["content_md"], key="tp_edit")
+            note = st.text_input("保存说明（可选）", value="edit", key="tp_note")
+            if st.button("保存修改（生成新版本）", type="primary", key="tp_save"):
+                a2 = upsert_artifact(project_id, "training_plan", a["title"], edited, a["content_json"], [], note=note)
+                st.success("已保存。后续依赖文件将引用更新后的培养方案。")
+                st.rerun()
+    
+    with tab4:
+        if not a:
+            st.info("暂无培养方案。")
+        else:
+            vers = get_versions(a["id"])
+            st.markdown("#### 版本记录")
+            st.dataframe(vers if vers else [], use_container_width=True)
+    
+    with tab5:
+        # 完整的PDF全量抽取界面
+        st.markdown("### PDF全量抽取独立界面")
+        st.caption("这是完整的PDF抽取界面，包含所有抽取结果的展示和编辑功能")
+        
+        if "extract_result" not in st.session_state:
+            st.session_state["extract_result"] = None
+        
+        uploaded = st.file_uploader("上传培养方案 PDF", type=["pdf"], key="full_extract_upload")
+        use_ocr = st.checkbox("对无文本页启用 OCR（可选）", value=False, key="full_extract_ocr")
+        
+        if uploaded and st.button("开始全量抽取", type="primary", key="full_extract_btn"):
+            pdf_bytes = uploaded.getvalue()
+            with st.spinner("正在抽取…"):
+                extract_result = run_full_extract(pdf_bytes, use_ocr=use_ocr)
+                st.session_state["extract_result"] = extract_result
+        
+        result = st.session_state.get("extract_result")
+        if result is None:
+            st.stop()
+        
+        # 概览指标
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("总页数", result.page_count)
+        c2.metric("表格总数", result.table_count)
+        c3.metric("OCR启用", "是" if result.ocr_used else "否")
+        c4.caption(f"SHA256: {result.file_sha256[:16]}...")
+        
+        tabs_full = st.tabs(["概览与下载", "章节大标题", "培养目标", "毕业要求", "附表表格", "分页原文"])
+        
+        with tabs_full[0]:
+            st.markdown("### 结构化识别结果（可先在这里校对）")
+            
+            # 下载 JSON（全量）
+            json_bytes = json.dumps(asdict(result), ensure_ascii=False, indent=2).encode("utf-8")
+            st.download_button(
+                "下载抽取结果 JSON",
+                data=json_bytes,
+                file_name="training_plan_full_extract.json",
+                mime="application/json",
+                use_container_width=True,
+            )
+            
+            if result.tables:
+                zip_bytes = make_tables_zip(result.tables)
+                st.download_button(
+                    "下载表格 ZIP",
+                    data=zip_bytes,
+                    file_name="training_plan_tables.zip",
+                    mime="application/zip",
+                    use_container_width=True,
+                )
+            
+            st.markdown("#### 附表标题映射")
+            if result.appendix_titles:
+                st.json(result.appendix_titles)
+            else:
+                st.info("未检测到附表标题映射。")
+        
+        with tabs_full[1]:
+            st.markdown("### 章节大标题")
+            for k in result.sections.keys():
+                with st.expander(k, expanded=False):
+                    st.text(result.sections.get(k, ""))
+        
+        with tabs_full[2]:
+            st.markdown("### 培养目标")
+            obj = result.training_objectives
+            st.write(f"识别条目数：**{obj.get('count', 0)}**")
+            st.text_area("培养目标（逐条）", value="\n".join(obj.get("items", [])), height=220, key="full_obj")
+            with st.expander("原始文本"):
+                st.text(obj.get("raw", ""))
+        
+        with tabs_full[3]:
+            st.markdown("### 毕业要求（12条 + 分项）")
+            grad = result.graduation_requirements
+            st.write(f"识别主条目数：**{grad.get('count', 0)}**")
+            
+            items = grad.get("items", [])
+            if not items:
+                st.warning("未识别到毕业要求")
+            else:
+                for it in items:
+                    no = it.get("no")
+                    title = it.get("title") or ""
+                    body = it.get("body") or ""
+                    header = f"{no}. {title}".strip()
+                    with st.expander(header, expanded=(no in [1, 2])):
+                        st.write(body)
+                        subs = it.get("subitems", [])
+                        if subs:
+                            st.markdown("**分项：**")
+                            for s in subs:
+                                st.write(f"- {s.get('no')}: {s.get('body')}")
+            with st.expander("原始文本"):
+                st.text(grad.get("raw", ""))
+        
+        with tabs_full[4]:
+            st.markdown("### 附表表格")
+            if not result.tables:
+                st.info("未检测到表格。")
+            else:
+                all_dirs = sorted({clean_text(t.get("direction") or "") for t in result.tables if clean_text(t.get("direction") or "")})
+                opt_dirs = ["全部"] + all_dirs
+                sel = st.selectbox("方向过滤", opt_dirs, index=0, key="full_dir_filter")
+                
+                for t in result.tables:
+                    direction = clean_text(t.get("direction") or "")
+                    if sel != "全部" and direction != sel:
+                        continue
+                    
+                    st.subheader(f"第{t.get('page')}页｜{t.get('title')}")
+                    if direction:
+                        st.caption(f"页面方向提示：{direction}")
+                    
+                    df = safe_df_from_tablepack(t)
+                    st.dataframe(df, use_container_width=True, hide_index=True)
+        
+        with tabs_full[5]:
+            st.markdown("### 分页原文与表格")
+            for page_data in result.pages_data:
+                page_no = page_data["page"]
+                page_text = page_data["text"]
+                page_tables = page_data["tables"]
+                
+                with st.expander(f"第{page_no}页（{len(page_tables)}个表格）", expanded=False):
+                    st.text(page_text)
+                    
+                    if page_tables:
+                        st.markdown(f"**表格 ({len(page_tables)}个):**")
+                        for i, table_data in enumerate(page_tables, start=1):
+                            df = table_to_df(table_data)
+                            if not df.empty:
+                                st.markdown(f"**表格 {i}:**")
+                                st.dataframe(df, use_container_width=True)
+                            else:
+                                st.info(f"表格 {i} 为空")
 
 # 其他页面函数（简化实现）
 def page_syllabus():
@@ -1954,23 +2320,195 @@ def page_training_plan():
     tab1, tab2, tab3, tab4, tab5 = st.tabs(["PDF上传/抽取/确认", "查看当前", "编辑", "版本", "PDF全量抽取独立界面（增强）"])
     
     with tab1:
-        st.markdown("#### 方式A：一键生成（演示/快速）")
-        major = st.text_input("专业", value="材料成型及控制工程", key="tp_major")
-        grade = st.text_input("年级", value="22", key="tp_grade")
-        group = st.text_input("课程体系/方向", value="材料成型-数值模拟方向", key="tp_group")
-        if st.button("生成培养方案并保存", type="primary"):
-            md = template_training_plan(major, grade, group)
-            a = upsert_artifact(
-                project_id,
-                "training_plan",
-                f"{grade}级《{major}》培养方案",
-                md,
-                {"major": major, "grade": grade, "course_group": group, "confirmed": True},
-                [],
-                note="generate",
+        col1, col2 = st.columns([1, 1])
+        
+        with col1:
+            st.markdown("#### 方式A：一键生成（演示/快速）")
+            major = st.text_input("专业", value="材料成型及控制工程", key="tp_major")
+            grade = st.text_input("年级", value="22", key="tp_grade")
+            group = st.text_input("课程体系/方向", value="材料成型-数值模拟方向", key="tp_group")
+            if st.button("生成培养方案并保存", type="primary"):
+                md = template_training_plan(major, grade, group)
+                a = upsert_artifact(
+                    project_id,
+                    "training_plan",
+                    f"{grade}级《{major}》培养方案",
+                    md,
+                    {"major": major, "grade": grade, "course_group": group, "confirmed": True},
+                    [],
+                    note="generate",
+                )
+                st.success("已保存培养方案（可作为后续文件依赖底座）")
+                st.rerun()
+        
+        with col2:
+            st.markdown("#### 方式B：上传PDF全量抽取（推荐）")
+            up = st.file_uploader("上传培养方案PDF文件", type=["pdf"], key="tp_upload")
+            use_ocr = st.checkbox("启用OCR（针对扫描版PDF）", value=False)
+            
+            if up is not None and st.button("开始全量抽取", key="tp_start_extract"):
+                pdf_bytes = up.read()
+                with st.spinner("正在全量抽取PDF..."):
+                    extract_result = run_full_extract(pdf_bytes, use_ocr=use_ocr)
+                
+                # 保存抽取结果到session
+                st.session_state["tp_extract"] = {
+                    "source": up.name,
+                    "pdf_bytes": pdf_bytes,
+                    "extract_result": asdict(extract_result),
+                    "confirmed": False
+                }
+                st.success("PDF抽取完成！请在下方确认/修正抽取结果。")
+        
+        # 识别清单确认界面
+        if "tp_extract" in st.session_state:
+            ex = st.session_state["tp_extract"]
+            extract_result = ex["extract_result"]
+            
+            st.markdown("---")
+            st.markdown("### PDF全量抽取结果（请确认/修正）")
+            
+            # 基本信息
+            colA, colB, colC = st.columns(3)
+            with colA:
+                major2 = st.text_input("专业", 
+                                      value=extract_result.get("major_guess", "") or "材料成型及控制工程", 
+                                      key="tp_major_fix")
+                grade2 = st.text_input("年级", 
+                                      value=extract_result.get("grade_guess", "") or "22", 
+                                      key="tp_grade_fix")
+            with colB:
+                course_group2 = st.text_input("课程体系/方向", 
+                                             value=extract_result.get("course_group_guess", "") or "材料成型方向", 
+                                             key="tp_group_fix")
+                confirmed_flag = st.checkbox("我已确认以上信息大体正确", value=False, key="tp_confirm_flag")
+            with colC:
+                st.metric("总页数", extract_result.get("page_count", 0))
+                st.metric("表格总数", extract_result.get("table_count", 0))
+            
+            st.markdown("#### 1) 培养目标（可编辑）")
+            goals = extract_result.get("training_objectives", {}).get("items", [])
+            goals_text = st.text_area(
+                "每行一个目标（可增删/改写）",
+                value="\n".join(goals) if goals else "",
+                height=140,
+                key="tp_goals_edit",
             )
-            st.success("已保存培养方案（可作为后续文件依赖底座）")
-            st.rerun()
+            goals_final = [x.strip() for x in goals_text.splitlines() if x.strip()]
+            
+            st.markdown("#### 2) 毕业要求（可编辑）")
+            grad_items = extract_result.get("graduation_requirements", {}).get("items", [])
+            if grad_items:
+                # 创建可编辑的DataFrame
+                grad_data = []
+                for item in grad_items:
+                    grad_data.append({
+                        "编号": item.get("no", ""),
+                        "标题": item.get("title", ""),
+                        "内容": item.get("body", "")
+                    })
+                df_grad = pd.DataFrame(grad_data)
+                df_grad_edited = st.data_editor(df_grad, use_container_width=True, num_rows="dynamic", key="tp_grad_editor")
+                outcomes_final = []
+                for _, row in df_grad_edited.iterrows():
+                    if str(row["编号"]).strip():
+                        outcomes_final.append({
+                            "no": str(row["编号"]).strip(),
+                            "title": str(row["标题"]).strip(),
+                            "body": str(row["内容"]).strip()
+                        })
+            else:
+                st.info("未识别到毕业要求，请手工录入")
+                grad_json = st.text_area(
+                    "毕业要求 JSON",
+                    value=json.dumps([{"no": "1", "title": "工程知识", "body": ""}], ensure_ascii=False, indent=2),
+                    height=160,
+                    key="tp_grad_json",
+                )
+                try:
+                    outcomes_final = json.loads(grad_json) if grad_json.strip() else []
+                except Exception:
+                    outcomes_final = []
+            
+            st.markdown("#### 3) 抽取的表格（可编辑确认）")
+            tables = extract_result.get("tables", [])
+            confirmed_tables = []
+            
+            if tables:
+                for i, table_info in enumerate(tables[:5]):  # 只显示前5个表格
+                    st.markdown(f"**表格{i+1}（第{table_info.get('page', '?')}页）**")
+                    
+                    # 确保DataFrame有正确的列名
+                    try:
+                        df = safe_df_from_tablepack(table_info)
+                        if not df.empty:
+                            # 使用st.data_editor
+                            df_edited = st.data_editor(df, use_container_width=True, key=f"tp_table_{i}")
+                            
+                            confirm_table = st.checkbox(f"确认采用此表格", value=True, key=f"tp_table_confirm_{i}")
+                            if confirm_table:
+                                confirmed_tables.append({
+                                    "page": table_info.get("page", 0),
+                                    "title": table_info.get("title", ""),
+                                    "data": df_edited.values.tolist(),
+                                    "columns": df_edited.columns.tolist()
+                                })
+                    except Exception as e:
+                        st.error(f"表格{i+1}显示错误: {str(e)}")
+                        # 显示原始数据
+                        st.write("原始数据:", table_info.get("data", []))
+            else:
+                st.info("未抽取到表格")
+            
+            st.markdown("#### 4) 章节结构")
+            sections = extract_result.get("sections", {})
+            with st.expander("查看章节结构", expanded=False):
+                for section_name, section_content in list(sections.items())[:10]:  # 显示前10个章节
+                    st.markdown(f"**{section_name}**")
+                    st.text(section_content[:500] + "..." if len(section_content) > 500 else section_content)
+            
+            st.markdown("---")
+            if st.button("✅ 确认并保存为培养方案底座", type="primary", disabled=not confirmed_flag):
+                # 构建content_json
+                content_json = {
+                    "source": ex["source"],
+                    "confirmed": True,
+                    "major": major2,
+                    "grade": grade2,
+                    "course_group": course_group2,
+                    "goals": goals_final,
+                    "outcomes": outcomes_final,
+                    "tables": confirmed_tables,
+                    "extract_metadata": {
+                        "page_count": extract_result.get("page_count", 0),
+                        "table_count": extract_result.get("table_count", 0),
+                        "sections_count": len(sections),
+                        "extracted_at": extract_result.get("extracted_at", "")
+                    },
+                    "full_extract": extract_result  # 保存完整的抽取结果
+                }
+                
+                # 生成markdown
+                md = f"# 培养方案（PDF抽取-已确认）\n\n"
+                md += f"- 专业：{major2}\n- 年级：{grade2}\n- 课程体系/方向：{course_group2}\n\n"
+                md += "## 一、培养目标（确认版）\n" + ("\n".join([f"- {x}" for x in goals_final]) if goals_final else "- （未填）") + "\n\n"
+                md += "## 二、毕业要求（确认版）\n" + ("\n".join([f"- {o.get('no','')}. {o.get('title','')}: {o.get('body','')}" for o in outcomes_final]) if outcomes_final else "- （未填）") + "\n\n"
+                md += "## 三、抽取表格（共{}个）\n".format(len(confirmed_tables))
+                for i, tbl in enumerate(confirmed_tables, 1):
+                    md += f"- 表格{i}（第{tbl['page']}页）: {tbl['title']}\n"
+                md += "\n## 四、章节结构\n"
+                for section_name in list(sections.keys())[:5]:
+                    md += f"- {section_name}\n"
+                
+                title = f"培养方案（PDF抽取确认版）-{ex['source']}"
+                a2 = upsert_artifact(project_id, "training_plan", title, md, content_json, [], note="pdf-extract-confirm")
+                st.success("已保存'确认版培养方案底座'。后续生成大纲会优先使用结构化字段。")
+                st.session_state.pop("tp_extract", None)
+                st.rerun()
+            
+            if st.button("清除本次抽取结果（不保存）"):
+                st.session_state.pop("tp_extract", None)
+                st.info("已清除。")
     
     with tab2:
         if not a:
