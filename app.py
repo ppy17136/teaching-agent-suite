@@ -38,6 +38,43 @@ except Exception as e:  # pragma: no cover
     pdfplumber = None
 
 # -----------------------------
+# Streamlit/pyarrow can fail when DataFrame has mixed object types (lists/dicts, etc.).
+# This helper coerces unsafe columns to strings so they can be displayed reliably.
+def safe_dataframe_for_streamlit(df: pd.DataFrame) -> pd.DataFrame:
+    if df is None:
+        return pd.DataFrame()
+    out = df.copy()
+    # Ensure unique column names (pyarrow can be picky)
+    if out.columns.duplicated().any():
+        cols = []
+        seen = {}
+        for c in out.columns:
+            k = str(c)
+            seen[k] = seen.get(k, 0) + 1
+            cols.append(k if seen[k] == 1 else f"{k}_{seen[k]}")
+        out.columns = cols
+
+    for c in out.columns:
+        s = out[c]
+        # Convert complex objects to JSON strings; keep numeric/datetime as-is.
+        if pd.api.types.is_object_dtype(s) or pd.api.types.is_string_dtype(s):
+            def _coerce(x):
+                if x is None:
+                    return ""
+                try:
+                    if pd.isna(x):
+                        return ""
+                except Exception:
+                    pass
+                if isinstance(x, (dict, list, tuple, set)):
+                    try:
+                        return json.dumps(x, ensure_ascii=False)
+                    except Exception:
+                        return str(x)
+                return str(x)
+            out[c] = s.map(_coerce)
+    return out
+
 
 # -----------------------------
 # Optional LLM refinement (for post-processing)
