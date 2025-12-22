@@ -1177,7 +1177,7 @@ def page_training_plan():
                 
                 title = f"培养方案（PDF抽取确认版）-{ex['source']}"
                 a2 = upsert_artifact(project_id, "training_plan", title, md, content_json, [], note="pdf-extract-confirm")
-                st.success("已保存"确认版培养方案底座"。后续生成大纲会优先使用结构化字段。")
+                st.success("已保存‘确认版培养方案底座’。后续生成大纲会优先使用结构化字段。")
                 st.session_state.pop("tp_extract", None)
                 st.rerun()
             
