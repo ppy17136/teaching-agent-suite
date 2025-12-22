@@ -38,6 +38,160 @@ except Exception as e:  # pragma: no cover
     pdfplumber = None
 
 # -----------------------------
+
+# -----------------------------
+# Optional LLM refinement (for post-processing)
+# -----------------------------
+
+@dataclass
+class LLMConfig:
+    enabled: bool = False
+    provider: str = "openai_compat"  # "openai_compat" | "dashscope"
+    model: str = ""
+    api_key: str = ""
+    base_url: str = ""  # only for openai_compat
+    timeout: int = 60
+    temperature: float = 0.0
+    max_tokens: int = 2000
+
+
+def _get_secret(key: str, default: str = "") -> str:
+    try:
+        if hasattr(st, "secrets") and key in st.secrets:
+            return str(st.secrets.get(key, default))
+    except Exception:
+        pass
+    return os.environ.get(key, default)
+
+
+def _openai_compat_url(base_url: str) -> str:
+    base_url = (base_url or "").strip()
+    if not base_url:
+        return ""
+    if base_url.endswith("/chat/completions") or base_url.endswith("/v1/chat/completions"):
+        return base_url
+    if base_url.endswith("/v1"):
+        return base_url.rstrip("/") + "/chat/completions"
+    return base_url.rstrip("/") + "/v1/chat/completions"
+
+
+def llm_chat(messages: List[Dict[str, str]], cfg: LLMConfig) -> str:
+    if not cfg.enabled:
+        return ""
+    if not cfg.model:
+        raise ValueError("LLM 已启用，但未填写 model。")
+    if not cfg.api_key:
+        raise ValueError("LLM 已启用，但未填写 API Key。")
+
+    provider = (cfg.provider or "openai_compat").lower().strip()
+
+    if provider == "dashscope":
+        try:
+            import dashscope  # type: ignore
+            from dashscope import Generation  # type: ignore
+        except Exception as e:
+            raise RuntimeError("未安装 dashscope SDK（requirements.txt 需要加入 dashscope）。") from e
+
+        dashscope.api_key = cfg.api_key
+        resp = Generation.call(
+            model=cfg.model,
+            messages=messages,
+            result_format="message",
+            temperature=cfg.temperature,
+            max_tokens=cfg.max_tokens,
+        )
+        try:
+            return resp.output.choices[0].message["content"]
+        except Exception:
+            return str(resp)
+
+    # openai-compatible
+    url = _openai_compat_url(cfg.base_url)
+    if not url:
+        raise ValueError("OpenAI-compatible 模式需要填写 base_url（例如 .../v1 或完整 chat/completions 端点）。")
+
+    headers = {"Authorization": f"Bearer {cfg.api_key}", "Content-Type": "application/json"}
+    payload = {
+        "model": cfg.model,
+        "messages": messages,
+        "temperature": cfg.temperature,
+        "max_tokens": cfg.max_tokens,
+    }
+    r = requests.post(url, headers=headers, json=payload, timeout=cfg.timeout)
+    r.raise_for_status()
+    data = r.json()
+    try:
+        return data["choices"][0]["message"]["content"]
+    except Exception:
+        return json.dumps(data, ensure_ascii=False)
+
+
+def _extract_context_snippets(pages_text: List[str]) -> Dict[str, str]:
+    all_text = "\n".join([t or "" for t in pages_text])
+
+    def clip_around(keyword: str, window: int = 3500) -> str:
+        idx = all_text.find(keyword)
+        if idx < 0:
+            return ""
+        s = max(0, idx - window // 3)
+        e = min(len(all_text), idx + window)
+        return all_text[s:e]
+
+    return {
+        "objectives": clip_around("培养目标"),
+        "grad_reqs": clip_around("毕业要求"),
+        "sections": clip_around("专业定位") + "\n" + clip_around("主干学科") + "\n" + clip_around("标准学制") + "\n" + clip_around("毕业条件"),
+        "tables": clip_around("附表"),
+    }
+
+
+def llm_refine_result(result: Dict[str, Any], pages_text: List[str], cfg: LLMConfig) -> Dict[str, Any]:
+    snippets = _extract_context_snippets(pages_text)
+
+    system = (
+        "你是高校培养方案结构化抽取的校对助手。\n"
+        "在不捏造内容的前提下，基于提供的 PDF 片段与已抽取结果，修正/补全：\n"
+        "1) 培养目标 objectives；\n"
+        "2) 毕业要求 graduate_requirements（必须包含 1-12 大条及子条 1.1..）；\n"
+        "3) 大标题 sections（如 三、专业定位与特色 等）；\n"
+        "4) 附表标题 appendix_titles（附表1..5 对应的中文表名）。\n"
+        "只输出 JSON，不要输出其它文字。"
+    )
+
+    compact = {
+        "objectives": result.get("objectives", []),
+        "graduate_requirements": result.get("graduate_requirements", []),
+        "sections": result.get("sections", []),
+        "appendix_titles": result.get("appendix_titles", {}),
+    }
+
+    user_payload = {
+        "pdf_snippets": snippets,
+        "extracted": compact,
+        "output_schema": {
+            "objectives": ["string", "..."],
+            "graduate_requirements": [{"id": "1..12", "title": "string", "text": "string", "sub": [{"id": "1.1", "text": "string"}]}],
+            "sections": [{"no": "三", "title": "string", "text": "string"}],
+            "appendix_titles": {"附表1": "string", "附表2": "string", "附表3": "string", "附表4": "string", "附表5": "string"},
+        },
+    }
+
+    content = llm_chat(
+        messages=[
+            {"role": "system", "content": system},
+            {"role": "user", "content": json.dumps(user_payload, ensure_ascii=False)},
+        ],
+        cfg=cfg,
+    )
+
+    fixed = json.loads(content)
+
+    for k in ["objectives", "graduate_requirements", "sections", "appendix_titles"]:
+        if k in fixed and fixed[k]:
+            result[k] = fixed[k]
+    result["_llm_refined"] = True
+    return result
+
 # Utilities
 # -----------------------------
 
@@ -71,27 +225,7 @@ def normalize_lines(text: str) -> List[str]:
 # Text extraction
 # -----------------------------
 
-
-def ocr_page_fallback(page) -> str:
-    """
-    可选 OCR：仅当页面无可提取文本且用户勾选时尝试。
-    - 若环境缺少 pytesseract / PIL / tesseract / ImageMagick，将安全降级返回空字符串。
-    """
-    try:
-        import pytesseract  # type: ignore
-        from PIL import Image  # type: ignore
-    except Exception:
-        return ""
-    try:
-        im = page.to_image(resolution=200).original
-        if isinstance(im, Image.Image):
-            return pytesseract.image_to_string(im, lang="chi_sim+eng") or ""
-        return ""
-    except Exception:
-        return ""
-
-
-def extract_pages_text(pdf_bytes: bytes, use_ocr: bool = False) -> List[str]:
+def extract_pages_text(pdf_bytes: bytes) -> List[str]:
     if pdfplumber is None:
         raise RuntimeError("pdfplumber 未安装，无法解析 PDF")
 
@@ -334,58 +468,172 @@ def normalize_table(raw_table: List[List[Any]]) -> Optional[List[List[str]]]:
 
 
 def ffill_merged_cells(table: List[List[str]]) -> List[List[str]]:
-    """
-    对表格中的“合并单元格导致的空白”做尽量安全的补全。
-
-    规则：
-    - 对“课程体系/类别/模块/性质/方向/学期/学年/环节”等典型合并列：强制向下填充（ffill）
-    - 其余列：仅在该列空白比例很高时才向下填充（避免误填）
-    - 对于明显的表头区域（前几行）：不做填充
-    """
+    """Heuristic fill for merged cells: horizontal then vertical for sparse columns."""
     if not table:
         return table
+    rows = [r[:] for r in table]
+    n_rows = len(rows)
+    n_cols = max(len(r) for r in rows)
 
-    head_window = min(6, len(table))
-    head_idx = max(range(head_window), key=lambda i: sum(1 for x in table[i] if clean_text(x)))
-    headers = [clean_text(x) for x in table[head_idx]]
+    # make rectangular
+    for i in range(n_rows):
+        if len(rows[i]) < n_cols:
+            rows[i] += [""] * (n_cols - len(rows[i]))
 
-    ncol = max(len(r) for r in table)
-    out = [list(r) + [""] * (ncol - len(r)) for r in table]
+    # horizontal fill
+    for i in range(n_rows):
+        last = ""
+        for j in range(n_cols):
+            if rows[i][j] != "":
+                last = rows[i][j]
+            else:
+                # only fill if last looks like category-like text (avoid filling numeric columns)
+                if last and not re.match(r"^[-+]?\d+(\.\d+)?$", last):
+                    rows[i][j] = rows[i][j] or ""  # keep empty by default
+        # do not actually fill horizontally aggressively (often wrong). Keep conservative.
 
-    def _is_force_col(h: str) -> bool:
-        h = h or ""
-        keys = [
-            "课程体系", "体系", "类别", "课程类别", "模块", "课程模块",
-            "性质", "课程性质", "类型", "学期", "学年",
-            "方向", "专业方向", "环节", "教学环节", "实践",
-            "通识", "学科基础", "专业教育", "集中性实践",
-        ]
-        return any(k in h for k in keys)
+    # Decide columns that are likely merged vertically: high empty ratio
+    empties = []
+    for j in range(n_cols):
+        col = [rows[i][j] for i in range(n_rows)]
+        empty_ratio = sum(1 for x in col if x == "") / max(1, n_rows)
+        empties.append(empty_ratio)
 
-    force_cols = {j for j, h in enumerate(headers) if _is_force_col(h)}
+    # vertical fill on columns with empty_ratio high
+    for j in range(n_cols):
+        if empties[j] < 0.35:
+            continue
+        last = ""
+        for i in range(n_rows):
+            if rows[i][j] != "":
+                last = rows[i][j]
+            else:
+                if last:
+                    rows[i][j] = last
 
-    data_rows = out[head_idx + 1 :]
-    if not data_rows:
-        return out
+    return rows
 
-    empty_ratio = []
-    for j in range(ncol):
-        empties = sum(1 for r in data_rows if not clean_text(r[j] if j < len(r) else ""))
-        empty_ratio.append(empties / max(1, len(data_rows)))
 
-    fill_cols = set(force_cols) | {j for j, ratio in enumerate(empty_ratio) if ratio >= 0.55}
+def infer_direction_for_row(row: List[str]) -> str:
+    text = " ".join([c for c in row if c])
+    if "焊接" in text and "无损" in text:
+        return "混合"
+    if "焊接" in text:
+        return "焊接"
+    if "无损" in text or "NDT" in text:
+        return "无损检测"
+    return ""
 
-    last = [""] * ncol
-    for i in range(head_idx + 1, len(out)):
-        row = out[i]
-        for j in range(ncol):
-            v = clean_text(row[j] if j < len(row) else "")
-            if j in fill_cols:
-                if v:
-                    last[j] = v
-                else:
-                    row[j] = last[j]
-        out[i] = row
+
+def infer_direction_for_table(table: List[List[str]]) -> str:
+    cnt = {"焊接": 0, "无损检测": 0}
+    for r in table[:50]:
+        d = infer_direction_for_row(r)
+        if d == "焊接":
+            cnt["焊接"] += 1
+        elif d == "无损检测":
+            cnt["无损检测"] += 1
+    if cnt["焊接"] and cnt["无损检测"]:
+        return "混合"
+    if cnt["焊接"]:
+        return "焊接"
+    if cnt["无损检测"]:
+        return "无损检测"
+    return ""
+
+
+def classify_appendix(table: List[List[str]]) -> str:
+    """Return appendix key like '附表1'..'附表5' or ''"""
+    head = " ".join(table[0]) if table else ""
+    head2 = " ".join(table[1]) if len(table) > 1 else ""
+    blob = (head + " " + head2)
+
+    if "课程编码" in blob and "课程体系" in blob:
+        return "附表1"
+    if "学分" in blob and ("统计" in blob or "合计" in blob):
+        return "附表2"
+    if "教学进程" in blob or "周" in blob or "学期" in blob and "周" in blob:
+        return "附表3"
+    if "毕业要求" in blob or "1.1" in blob or "12.3" in blob:
+        return "附表4"
+
+    # 逻辑思维导图通常不是表格
+    return ""
+
+
+@dataclass
+class ExtractedTable:
+    appendix: str
+    appendix_title: str
+    page: int
+    title: str
+    columns: List[str]
+    rows: List[List[str]]
+    direction: str
+
+
+def extract_tables_pdfplumber(pdf_bytes: bytes, pages_text: List[str]) -> List[ExtractedTable]:
+    if pdfplumber is None:
+        return []
+
+    appendix_map = extract_appendix_title_map(pages_text)
+
+    out: List[ExtractedTable] = []
+    with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+        for i, page in enumerate(pdf.pages):
+            # Try two strategies: lines-first (bordered) then text (borderless)
+            raw_tables: List[List[List[Any]]] = []
+            for settings in (PDFPLUMBER_TABLE_SETTINGS_LINES, PDFPLUMBER_TABLE_SETTINGS_TEXT):
+                try:
+                    raw_tables += page.extract_tables(settings) or []
+                except Exception:
+                    continue
+
+            # De-duplicate by a light signature (first 3 rows joined)
+            seen_sig: set = set()
+            for t in raw_tables:
+                nt = normalize_table(t)
+                if not nt or len(nt) < 2:
+                    continue
+                sig = "||".join(["|".join(r) for r in nt[: min(3, len(nt))]])
+                if sig in seen_sig:
+                    continue
+                seen_sig.add(sig)
+                nt = ffill_merged_cells(nt)
+
+                appendix = classify_appendix(nt)
+                appendix_title = appendix_map.get(appendix, appendix) if appendix else ""
+
+                # Determine header
+                columns = nt[0]
+                rows = nt[1:]
+
+                # Add direction column if useful (appendix1 often needs)
+                direction_tbl = infer_direction_for_table(nt)
+                # per-row direction for appendix1/4 might be useful
+                add_row_direction = appendix in ("附表1", "附表4")
+                if add_row_direction:
+                    columns = columns + ["专业方向(推断)"]
+                    new_rows = []
+                    for r in rows:
+                        new_rows.append(r + [infer_direction_for_row(r)])
+                    rows = new_rows
+
+                title = appendix_title or f"表格-P{i+1}"  # fallback
+                if appendix_title:
+                    title = f"{appendix_title} - 第{i+1}页"
+
+                out.append(
+                    ExtractedTable(
+                        appendix=appendix,
+                        appendix_title=appendix_title,
+                        page=i + 1,
+                        title=title,
+                        columns=columns,
+                        rows=rows,
+                        direction=direction_tbl,
+                    )
+                )
 
     return out
 
@@ -475,233 +723,13 @@ def make_tables_excel(tables: List[ExtractedTable]) -> bytes:
     return buf.getvalue()
 
 
-
-def extract_headings_all(pages_text: List[str]) -> List[str]:
-    """
-    粗略提取全文中的“章节大标题”，用于显示/校对/LLM补漏。
-    """
-    out: List[str] = []
-    pat = re.compile(r"^(第[一二三四五六七八九十]+[章部分节]|[一二三四五六七八九十]+[、\.．]|\d+\))\s*.+$")
-    for t in pages_text:
-        for raw in (t or "").splitlines():
-            line = clean_text(raw)
-            if not line:
-                continue
-            if pat.match(line):
-                out.append(line)
-    seen = set()
-    uniq = []
-    for x in out:
-        if x not in seen:
-            seen.add(x)
-            uniq.append(x)
-    return uniq
-
-
-
-# -----------------------------
-# LLM 校对与修正（可选）
-# -----------------------------
-
-def _safe_json_load(s: str) -> Optional[dict]:
-    if not s:
-        return None
-    s = s.strip()
-    if "{" in s and "}" in s:
-        s = s[s.find("{") : s.rfind("}") + 1]
-    try:
-        return json.loads(s)
-    except Exception:
-        return None
-
-
-def llm_chat(
-    base_url: str,
-    api_key: str,
-    model: str,
-    messages: List[dict],
-    temperature: float = 0.0,
-    timeout: int = 60,
-) -> str:
-    url = base_url.rstrip("/") + "/chat/completions"
-    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
-    payload = {"model": model, "messages": messages, "temperature": float(temperature)}
-    r = requests.post(url, headers=headers, json=payload, timeout=timeout)
-    r.raise_for_status()
-    data = r.json()
-    return (data.get("choices", [{}])[0].get("message", {}) or {}).get("content", "") or ""
-
-
-def extract_between_markers(
-    text: str,
-    start_markers: List[str],
-    end_markers: List[str],
-    max_chars: int = 12000,
-) -> str:
-    t = text or ""
-    if not t.strip():
-        return ""
-    t2 = t.replace("\u3000", " ").replace("\xa0", " ")
-    start = 0
-    for s in start_markers:
-        p = t2.find(s)
-        if p != -1:
-            start = p
-            break
-    end = min(len(t2), start + max_chars)
-    for e in end_markers:
-        p = t2.find(e, start + 10)
-        if p != -1:
-            end = min(end, p)
-            break
-    return t2[start:end].strip()
-
-
-def refine_with_llm(result: Dict[str, Any], llm_cfg: dict) -> Dict[str, Any]:
-    base_url = (llm_cfg.get("base_url") or "").strip()
-    api_key = (llm_cfg.get("api_key") or "").strip()
-    model = (llm_cfg.get("model") or "").strip()
-    temperature = float(llm_cfg.get("temperature", 0.0) or 0.0)
-
-    if not (base_url and api_key and model):
-        return result
-
-    pages_text = result.get("pages_text") or []
-    full_text = "\n".join(pages_text)
-
-    obj_raw = extract_between_markers(
-        full_text,
-        start_markers=["培养目标", "一、培养目标", "（一）培养目标"],
-        end_markers=["毕业要求", "二、毕业要求", "专业定位", "三、专业定位"],
-        max_chars=8000,
-    )
-    grad_raw = extract_between_markers(
-        full_text,
-        start_markers=["毕业要求", "二、毕业要求"],
-        end_markers=["专业教学计划表", "七", "附表", "专业教学计划", "三、专业定位"],
-        max_chars=20000,
-    )
-
-    headings_raw = "\n".join((result.get("headings_all") or [])[:200])
-
-    tables = result.get("tables_data", [])
-    table_briefs = []
-    for i, t in enumerate(tables[:10]):
-        cols = [clean_text(x) for x in (t.get("columns") or [])][:30]
-        rows = t.get("rows") or []
-        sample_rows = [[clean_text(c) for c in r[: min(len(r), 12)]] for r in rows[:4]]
-        table_briefs.append(
-            {
-                "id": i,
-                "appendix": t.get("appendix", ""),
-                "title": t.get("appendix_title", "") or t.get("title", ""),
-                "page": t.get("page", None),
-                "columns": cols,
-                "sample_rows": sample_rows,
-            }
-        )
-
-    sys = {"role": "system", "content": "你是高校培养方案PDF解析与纠错助手。你只输出严格JSON，不要输出多余文字。"}
-    user = {
-        "role": "user",
-        "content": json.dumps(
-            {
-                "task": "校对并补全培养方案结构化信息。输出应尽量与原文一致，避免臆造。",
-                "inputs": {
-                    "obj_raw": obj_raw,
-                    "grad_raw": grad_raw,
-                    "headings_raw": headings_raw,
-                    "appendix_map": result.get("appendix_map", {}),
-                    "tables": table_briefs,
-                },
-                "output_schema": {
-                    "training_objectives": ["..."],
-                    "graduation_requirements": [
-                        {"no": 1, "title": "工程知识", "text": "...", "subs": [{"code": "1.1", "text": "..." }]}
-                    ],
-                    "headings_all": ["一、...", "二、...", "三、..."],
-                    "tables": [{"id": 0, "appendix": "附表1", "title": "七 专业教学计划表", "direction": "焊接+无损检测"}],
-                },
-            },
-            ensure_ascii=False,
-            indent=2,
-        ),
-    }
-
-    try:
-        content = llm_chat(base_url, api_key, model, [sys, user], temperature=temperature)
-    except Exception:
-        return result
-
-    patch = _safe_json_load(content)
-    if not patch:
-        return result
-
-    out = dict(result)
-
-    if isinstance(patch.get("training_objectives"), list) and patch["training_objectives"]:
-        out["training_objectives"] = [clean_text(x) for x in patch["training_objectives"] if clean_text(x)]
-
-    gr = patch.get("graduation_requirements")
-    if isinstance(gr, list) and len(gr) >= 10:
-        gr_dict = {}
-        for item in gr:
-            try:
-                no = int(item.get("no"))
-            except Exception:
-                continue
-            title = clean_text(item.get("title", "")) or f"{no}"
-            text = clean_text(item.get("text", ""))
-            subs = item.get("subs") or []
-            items: List[str] = []
-            if text:
-                items.append(text)
-            if isinstance(subs, list):
-                for s in subs:
-                    code = clean_text((s or {}).get("code", ""))
-                    txt = clean_text((s or {}).get("text", ""))
-                    if not txt:
-                        continue
-                    items.append(f"{code} {txt}".strip() if code else txt)
-            gr_dict[str(no)] = {"name": title, "items": items}
-        ok_cnt = sum(1 for i in range(1, 13) if str(i) in gr_dict)
-        if ok_cnt >= 10:
-            out["graduation_requirements"] = gr_dict
-
-    hs = patch.get("headings_all")
-    if isinstance(hs, list) and len(hs) >= 6:
-        out["headings_all"] = [clean_text(x) for x in hs if clean_text(x)]
-
-    tpatch = patch.get("tables")
-    if isinstance(tpatch, list) and out.get("tables_data"):
-        tables2 = list(out["tables_data"])
-        for tp in tpatch:
-            try:
-                i = int(tp.get("id"))
-            except Exception:
-                continue
-            if 0 <= i < len(tables2):
-                if clean_text(tp.get("appendix", "")):
-                    tables2[i]["appendix"] = clean_text(tp.get("appendix", ""))
-                if clean_text(tp.get("title", "")):
-                    tables2[i]["appendix_title"] = clean_text(tp.get("title", ""))
-                if clean_text(tp.get("direction", "")):
-                    tables2[i]["direction"] = clean_text(tp.get("direction", ""))
-        out["tables_data"] = tables2
-
-    out.setdefault("meta", {})
-    out["meta"]["llm_refined"] = True
-    out["meta"]["llm_model"] = model
-    return out
-
-
 # -----------------------------
 # Full extraction pipeline
 # -----------------------------
 
 
-def run_full_extract(pdf_bytes: bytes, use_ocr: bool = False, llm_cfg: Optional[dict] = None) -> Dict[str, Any]:
-    pages_text = extract_pages_text(pdf_bytes, use_ocr=use_ocr)
+def run_full_extract(pdf_bytes: bytes, llm_cfg: Optional[LLMConfig] = None) -> Dict[str, Any]:
+    pages_text = extract_pages_text(pdf_bytes)
     chapter_ranges = locate_chapter_ranges(pages_text)
 
     # training objectives
@@ -728,8 +756,6 @@ def run_full_extract(pdf_bytes: bytes, use_ocr: bool = False, llm_cfg: Optional[
     # tables
     tables = extract_tables_pdfplumber(pdf_bytes, pages_text)
 
-    headings_all = extract_headings_all(pages_text)
-
     result = {
         "meta": {
             "sha256": sha256_bytes(pdf_bytes),
@@ -742,8 +768,6 @@ def run_full_extract(pdf_bytes: bytes, use_ocr: bool = False, llm_cfg: Optional[
         "graduation_requirements": graduation_requirements,
         "chapter_content": chapter_content,
         "pages_text": pages_text,
-        "full_text": "\n".join(pages_text),
-        "headings_all": headings_all,
         "tables_data": [
             {
                 "appendix": t.appendix,
@@ -757,12 +781,12 @@ def run_full_extract(pdf_bytes: bytes, use_ocr: bool = False, llm_cfg: Optional[
             for t in tables
         ],
     }
-    # LLM 可选校对与修正
-    if llm_cfg and llm_cfg.get('enabled'):
+    # Optional LLM refinement
+    if llm_cfg is not None and getattr(llm_cfg, 'enabled', False):
         try:
-            result = refine_with_llm(result, llm_cfg)
-        except Exception:
-            pass
+            result = llm_refine_result(result, pages_text, llm_cfg)
+        except Exception as e:
+            result['_llm_error'] = str(e)
 
     return result
 
@@ -780,43 +804,28 @@ with st.sidebar:
     up = st.file_uploader("上传培养方案 PDF", type=["pdf"], accept_multiple_files=False)
     use_ocr = st.checkbox("对无文本页启用 OCR（可选）", value=False, help="若部署环境无 OCR 依赖，将自动降级")
 
-    st.markdown("## LLM 校对（可选）")
-    enable_llm = st.checkbox(
-        "启用 LLM 校对与修正（推荐）",
-        value=False,
-        help="用于补全培养目标/毕业要求/大标题，以及附表表名与方向；不启用也可正常抽取。",
-    )
-    llm_cfg = {"enabled": False}
+    with st.expander("🔎 启用 LLM 校对与修正（可选）", expanded=False):
+        enable_llm = st.checkbox("启用 LLM 校对与修正", value=False)
+        provider = st.selectbox("LLM 提供方", ["OpenAI-compatible", "DashScope/Qwen"], index=0)
+        model = st.text_input("Model 名称", value=_get_secret("LLM_MODEL", ""))
+        api_key = st.text_input("API Key", value=_get_secret("LLM_API_KEY", ""), type="password")
+        base_url = ""
+        if provider == "OpenAI-compatible":
+            base_url = st.text_input("Base URL（如 https://xxx/v1 或完整 chat/completions）", value=_get_secret("LLM_BASE_URL", ""))
+        st.caption("可在 Streamlit secrets / 环境变量设置：LLM_API_KEY / LLM_MODEL / LLM_BASE_URL")
 
-    if enable_llm:
-        with st.expander("LLM 配置", expanded=True):
-            base_url = st.text_input(
-                "Base URL（OpenAI兼容）",
-                value=st.secrets.get("LLM_BASE_URL", ""),
-                placeholder="例如：https://dashscope.aliyuncs.com/compatible-mode/v1",
-            )
-            model = st.text_input(
-                "Model",
-                value=st.secrets.get("LLM_MODEL", "qwen-turbo"),
-                placeholder="例如：qwen-plus / qwen-max / deepseek-chat 等",
-            )
-            api_key = st.text_input(
-                "API Key",
-                value=st.secrets.get("LLM_API_KEY", ""),
-                type="password",
-                placeholder="从 secrets 或此处输入",
-            )
-            temperature = st.slider("温度（越低越稳定）", 0.0, 1.0, 0.0, 0.05)
-            llm_cfg = {
-                "enabled": True,
-                "base_url": base_url,
-                "model": model,
-                "api_key": api_key,
-                "temperature": temperature,
-            }
+    llm_cfg = LLMConfig(
+        enabled=bool(enable_llm),
+        provider="dashscope" if provider == "DashScope/Qwen" else "openai_compat",
+        model=model.strip(),
+        api_key=api_key.strip(),
+        base_url=base_url.strip(),
+        temperature=0.0,
+        max_tokens=2000,
+        timeout=60,
+    )
 
     run_btn = st.button("开始全量抽取", type="primary", disabled=up is None)
-
 
 if "result" not in st.session_state:
     st.session_state["result"] = None
@@ -830,7 +839,7 @@ else:
 
 if run_btn and up is not None:
     with st.spinner("正在抽取全文与表格，请稍等…"):
-        res = run_full_extract(pdf_bytes, use_ocr=use_ocr, llm_cfg=llm_cfg)
+        res = run_full_extract(pdf_bytes, llm_cfg=llm_cfg)
         st.session_state["result"] = res
 
 res = st.session_state.get("result")
@@ -866,8 +875,6 @@ tabs = st.tabs(TAB_NAMES)
 # 1) 概览与下载
 with tabs[0]:
     st.subheader("结构化识别结果（可先在这里校对）")
-    if res.get("meta", {}).get("llm_refined"):
-        st.success(f"已启用 LLM 校对：{res.get('meta', {}).get('llm_model', '')}")
 
     # quick counts
     st.write(
@@ -1013,7 +1020,7 @@ with tabs[4]:
                     # Streamlit uses PyArrow for rendering; some edge cases (e.g., duplicate cols / odd dtypes)
                     # may still fail. We already normalize to strings & unique cols, but keep a safe fallback.
                     try:
-                        st.dataframe(df, use_container_width=True, hide_index=True)
+                        st.dataframe(safe_dataframe_for_streamlit(df), use_container_width=True, hide_index=True)
                     except Exception:
                         st.warning("该表格渲染遇到兼容性问题，已退回为文本表格显示。")
                         st.markdown(df.to_markdown(index=False))
