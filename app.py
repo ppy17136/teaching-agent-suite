@@ -1022,8 +1022,11 @@ with tabs[4]:
                     try:
                         st.dataframe(safe_dataframe_for_streamlit(df), use_container_width=True, hide_index=True)
                     except Exception:
-                        st.warning("该表格渲染遇到兼容性问题，已退回为文本表格显示。")
-                        st.markdown(df.to_markdown(index=False))
+                        st.warning("该表格渲染遇到兼容性问题，已退回为HTML表格显示。")
+                        # pandas.DataFrame.to_markdown() needs optional dependency "tabulate".
+                        # Streamlit Cloud often doesn't include it, so use HTML instead.
+                        html = safe_dataframe_for_streamlit(df).to_html(index=False, escape=False)
+                        st.markdown(html, unsafe_allow_html=True)
 
 # 6) 分页原文
 with tabs[5]:
