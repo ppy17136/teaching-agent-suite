@@ -509,7 +509,7 @@ if p_sel == "（新建项目）":
     with st.sidebar.expander("创建新项目", expanded=True):
         pname = st.text_input("项目名称", value="材料成型-教评一体化", key="new_pname")
         major = st.text_input("专业", value="材料成型及控制工程", key="new_major")
-        grade = st.text_input("年级", value="22", key="new_grade")
+        grade = st.text_input("年级", value="24", key="new_grade")
         course_group = st.text_input("课程体系/方向", value="材料成型-焊接方向", key="new_group")
         if st.button("创建项目", type="primary"):
             pid = create_project(pname, {"major": major, "grade": grade, "course_group": course_group})
