@@ -1664,6 +1664,27 @@ def _reset_base_plan_editor_state(pid: str, plan: Dict[str, Any]) -> None:
     # 记录当前 plan 的 sha，便于后续自动同步
     st.session_state[f"_plan_sha_{pid}"] = (plan.get("meta", {}) or {}).get("sha256", "")
 
+def _plan_sha(plan: Dict[str, Any]) -> str:
+    return str((plan.get("meta", {}) or {}).get("sha256", "")).strip()
+
+def _bump_plan_rev(pid: str, new_sha: str = "") -> int:
+    """
+    遇到新基座（sha变了）或手动触发时，把 rev+1。
+    右侧所有 widget key 都带 rev，从而强制重建并显示最新 plan。
+    """
+    k_rev = f"_plan_rev_{pid}"
+    k_sha = f"_plan_sha_{pid}"
+
+    st.session_state.setdefault(k_rev, 0)
+    if new_sha:
+        old = st.session_state.get(k_sha, "")
+        if old != new_sha:
+            st.session_state[k_rev] = int(st.session_state.get(k_rev, 0)) + 1
+            st.session_state[k_sha] = new_sha
+    else:
+        st.session_state[k_rev] = int(st.session_state.get(k_rev, 0)) + 1
+
+    return int(st.session_state[k_rev])
 
 def ui_base_training_plan(pid: str, llm_cfg: LLMConfig):
     st.subheader("培养方案基座（全量内容库）")
@@ -1681,6 +1702,12 @@ def ui_base_training_plan(pid: str, llm_cfg: LLMConfig):
         "course_graph": {"nodes": [], "edges": []},
         "raw_pages_text": [],
     }
+
+    # ✅ 基座变了（sha变），就 bump rev，让右侧控件强制重建显示最新内容
+    _bump_plan_rev(pid, _plan_sha(plan))
+    rev = st.session_state.get(f"_plan_rev_{pid}", 0)
+
+
 
     # ✅ 如果培养方案基座发生变化（sha256变了），强制把右侧编辑器 state 同步到最新 plan
     cur_sha = (plan.get("meta", {}) or {}).get("sha256", "")
@@ -1701,11 +1728,12 @@ def ui_base_training_plan(pid: str, llm_cfg: LLMConfig):
                 extracted = base_plan_minimal_from_pdf(pdf_bytes)
                 save_base_plan(pid, extracted)
 
-                # ✅ 关键：把右侧所有编辑器的 session_state 强制写成抽取结果
-                _reset_base_plan_editor_state(pid, extracted)
+                # ✅ 关键：换一代 rev，让右侧全部控件重建并吃到最新 value/df
+                _bump_plan_rev(pid, _plan_sha(extracted))
 
-                st.success("已写入培养方案基座，并同步填充右侧栏目。")
+                st.success("已写入培养方案基座，并刷新右侧全部栏目。")
                 st.rerun()
+
 
 
         st.write("")
@@ -1741,7 +1769,7 @@ def ui_base_training_plan(pid: str, llm_cfg: LLMConfig):
 
         for i, title in enumerate(SECTION_TITLES[:6]):
             with tabs[i]:
-                sections[title] = st.text_area(title, value=sections.get(title, ""), height=260, key=f"plan_text_{pid}_{i}",)
+                sections[title] = st.text_area(title, value=sections.get(title, ""), height=260, key=f"plan_text_{pid}_{rev}_{i}",)
 
                 if llm_available(llm_cfg):
                     if st.button(f"用 LLM 校对该栏目：{title}", key=f"btn_llm_fix_{i}"):
@@ -1772,7 +1800,7 @@ def ui_base_training_plan(pid: str, llm_cfg: LLMConfig):
                     rows = []
                 df = dataframe_safe(pd.DataFrame(rows))
                
-                edited_df = st.data_editor(df, num_rows="dynamic", use_container_width=True, key=f"plan_tbl_{pid}_{j}",)
+                edited_df = st.data_editor(df, num_rows="dynamic", use_container_width=True, key=f"plan_tbl_{pid}_{rev}_{j}",)
                 
                 append_tables[title] = edited_df.to_dict(orient="records")
 
@@ -1784,14 +1812,14 @@ def ui_base_training_plan(pid: str, llm_cfg: LLMConfig):
                 st.markdown("**Nodes**（建议字段：id / name / label）")
                 nodes_df = dataframe_safe(pd.DataFrame(graph.get("nodes", [])))
                
-                nodes_df = st.data_editor(nodes_df,num_rows="dynamic",use_container_width=True,key=f"graph_nodes_editor_{pid}",)                
+                nodes_df = st.data_editor(nodes_df,num_rows="dynamic",use_container_width=True,key=f"graph_nodes_editor_{pid}_{rev}",)                
                 
                 graph["nodes"] = nodes_df.to_dict(orient="records")
 
             with colB:
                 st.markdown("**Edges**（建议字段：from / to / label）")
                 edges_df = dataframe_safe(pd.DataFrame(graph.get("edges", [])))
-                edges_df = st.data_editor(edges_df,num_rows="dynamic",use_container_width=True,key=f"graph_nodes_editor_{pid}",) 
+                edges_df = st.data_editor(edges_df,num_rows="dynamic",use_container_width=True,key=f"graph_nodes_editor_{pid}_{rev}",) 
                 
                 graph["edges"] = edges_df.to_dict(orient="records")
 
