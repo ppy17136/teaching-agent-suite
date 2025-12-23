@@ -894,78 +894,147 @@ def _read_pdf_pages_text(pdf_bytes: bytes) -> List[str]:
 # ============================================================
 # UI 与 主逻辑
 # ============================================================
-def main():
-    st.set_page_config(page_title="Teaching Agent Suite AI", layout="wide")
-    
-    # 侧边栏：API Key 配置
-    with st.sidebar:
-        st.title("⚙️ 设置")
-        api_key = st.text_input("Gemini API Key", type="password", help="从 Google AI Studio 获取")
-        st.divider()
-        st.caption("v0.7 (AI Powered)")
+import io
+import json
+import pandas as pd
+import streamlit as st
+import pdfplumber
+import google.generativeai as genai
+from typing import Dict, List, Any
 
-    # 项目初始化
-    if "project_data" not in st.session_state:
-        st.session_state.project_data = {}
+# ============================================================
+# 1. 增强型 AI 处理模块
+# ============================================================
+def call_gemini_structured(api_key: str, prompt: str) -> Any:
+    """调用 Gemini 并强制要求返回 JSON 列表或字典"""
+    try:
+        genai.configure(api_key=api_key)
+        model = genai.GenerativeModel('gemini-1.5-flash')
+        response = model.generate_content(
+            prompt,
+            generation_config={"response_mime_type": "application/json"}
+        )
+        return json.loads(response.text)
+    except Exception as e:
+        st.error(f"AI 响应解析失败: {e}")
+        return None
 
-    st.header("🧠 教学文件智能工作台")
+def ai_extract_full_sections(api_key: str, pages_text: List[str]) -> Dict[str, str]:
+    """分段提取 1-6 项正文，避免信息丢失"""
+    # 提取前 5 页内容（通常 1-6 项在此范围内）
+    context = "\n".join(pages_text[:5])
+    prompt = f"""
+    你是一个教务专家。请从以下文本中准确提取培养方案的 1-6 项内容。
+    要求：保留原始段落逻辑，不要过度压缩。
+    JSON 键值对格式：
+    "1": "培养目标文本...",
+    "2": "毕业要求文本...",
+    "3": "专业定位与特色...",
+    "4": "主干学科与课程...",
+    "5": "学制与学位...",
+    "6": "毕业条件..."
     
-    tab1, tab2 = st.tabs(["培养方案基座 (AI 抽取)", "项目概览"])
+    文本内容：
+    {context}
+    """
+    return call_gemini_structured(api_key, prompt)
+
+def ai_process_long_table(api_key: str, raw_rows: List[List[str]]) -> pd.DataFrame:
+    """将超长表格行分块交给 AI 处理并合并"""
+    chunk_size = 40  # 每 40 行处理一次，防止 AI 幻觉或遗漏
+    all_dfs = []
     
-    with tab1:
-        col_l, col_r = st.columns([1, 1.5])
+    progress_bar = st.progress(0, text="AI 正在校对长表格...")
+    
+    for i in range(0, len(raw_rows), chunk_size):
+        chunk = raw_rows[i : i + chunk_size]
+        prompt = f"""
+        将以下 PDF 原始行转换为结构化 JSON 列表。
+        标准列：["课程体系", "课程编码", "课程名称", "学分", "总学时", "上课学期"]
         
-        with col_l:
-            pdf = st.file_uploader("上传培养方案 PDF", type=["pdf"])
-            use_ai = st.toggle("启用 Gemini AI 增强抽取", value=True)
-            
-            if st.button("开始智能抽取", type="primary", use_container_width=True):
-                if not pdf:
-                    st.warning("请上传 PDF")
-                elif use_ai and not api_key:
-                    st.error("请先在侧边栏配置 API Key")
-                else:
-                    with st.spinner("正在解析 PDF 并请求 AI 处理..."):
-                        pdf_bytes = pdf.getvalue()
-                        pages = _read_pdf_pages_text(pdf_bytes)
-                        full_text = "\n".join(pages)
-                        
-                        # 1. 基础文字处理
-                        sections = {}
-                        if use_ai:
-                            sections = ai_extract_sections(api_key, full_text)
-                        
-                        # 2. 表格处理 (附表 1 示例)
-                        tables = {}
-                        with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf_obj:
-                            # 假设附表1在后面几页，选取有表格的页面
-                            raw_rows = []
-                            for p in pdf_obj.pages[-12:]: # 扫描后12页找表格
-                                tbl = p.extract_table()
-                                if tbl: raw_rows.extend(tbl)
-                            
-                            if use_ai and raw_rows:
-                                tables["7"] = ai_align_table(api_key, raw_rows[:100], "7") # 取前100行测试
-                        
-                        st.session_state.project_data = {
-                            "sections": sections or {},
-                            "tables": tables,
-                            "raw_text": full_text
-                        }
-                        st.success("抽取完成！")
+        注意：
+        1. 识别并填入“课程体系”（如通识教育、学科基础）。
+        2. 如果某行只有课程名没有学分，请与上一行合并。
+        
+        数据：{json.dumps(chunk, ensure_ascii=False)}
+        """
+        res = call_gemini_structured(api_key, prompt)
+        if res:
+            all_dfs.append(pd.DataFrame(res))
+        progress_bar.progress(min((i + chunk_size) / len(raw_rows), 1.0))
+        
+    return pd.concat(all_dfs, ignore_index=True) if all_dfs else pd.DataFrame()
 
-        with col_r:
-            data = st.session_state.project_data
-            if not data:
-                st.info("待抽取数据...")
-            else:
-                sec_list = ["1", "2", "3", "4", "5", "6"]
-                choice = st.selectbox("查看栏目", sec_list, format_func=lambda x: f"栏目 {x}")
-                st.text_area("内容", value=data["sections"].get(choice, ""), height=300)
+# ============================================================
+# 2. 页面锚点定位逻辑（利用 PDF 结构提高效率）
+# ============================================================
+def find_appendix_pages(pdf_bytes: bytes) -> Dict[str, List[int]]:
+    """精确定位附表页码"""
+    found = {"7": []}
+    with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+        for i, page in enumerate(pdf.pages):
+            text = page.extract_text() or ""
+            if "附表1" in text or "专业教学计划表" in text:
+                found["7"].append(i)
+    return found
+
+# ============================================================
+# 3. Streamlit UI 主程序
+# ============================================================
+def main():
+    st.set_page_config(page_title="教学文件智能工作台 V2", layout="wide")
+    
+    with st.sidebar:
+        st.header("⚙️ 配置")
+        key = st.text_input("Gemini API Key", type="password")
+        st.info("提示：针对长文档，建议使用分段抽取模式以保证信息完整性。")
+
+    st.title("🧠 教学文件智能工作台")
+    
+    up_file = st.file_uploader("上传培养方案 PDF", type="pdf")
+    
+    if up_file and key:
+        if st.button("开始全量深度抽取", type="primary"):
+            with st.status("深度解析中...", expanded=True) as status:
+                pdf_bytes = up_file.getvalue()
                 
-                if "7" in data["tables"]:
-                    st.markdown("### 自动生成的专业教学计划表 (附表1)")
-                    st.data_editor(data["tables"]["7"], use_container_width=True)
+                # 步骤 1：文本预读
+                st.write("正在读取 PDF 文本...")
+                with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+                    all_pages = [p.extract_text() for p in pdf.pages]
+                
+                # 步骤 2：AI 提取 1-6 项
+                st.write("AI 正在解析 1-6 项正文...")
+                sections = ai_extract_full_sections(key, all_pages)
+                
+                # 步骤 3：定位并提取长表格 (附表1)
+                st.write("正在定位附表 1 并进行全量校对...")
+                page_indices = find_appendix_pages(pdf_bytes)["7"]
+                all_raw_rows = []
+                with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+                    for idx in page_indices:
+                        table = pdf.pages[idx].extract_table()
+                        if table: all_raw_rows.extend(table[1:]) # 跳过表头
+                
+                table_df = ai_process_long_table(key, all_raw_rows)
+                
+                st.session_state.final_data = {"sections": sections, "table": table_df}
+                status.update(label="抽取完成！", state="complete")
+
+    # 结果展示
+    if "final_data" in st.session_state:
+        data = st.session_state.final_data
+        
+        col1, col2 = st.columns([1, 2])
+        with col1:
+            st.subheader("1-6 项正文")
+            sec_id = st.selectbox("选择栏目", list(data["sections"].keys()))
+            st.text_area("内容", value=data["sections"][sec_id], height=400)
+            
+        with col2:
+            st.subheader("自动生成的专业教学计划表 (全量)")
+            st.dataframe(data["table"], use_container_width=True, height=600)
+            st.download_button("导出 Excel", data=data["table"].to_csv().encode('utf-8'), file_name="teaching_plan.csv")
 
 if __name__ == "__main__":
     main()
