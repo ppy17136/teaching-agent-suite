@@ -1306,12 +1306,13 @@ def ui_llm_sidebar(project_obj: Optional[Project]) -> LLMConfig:
         height=70,
     )
 
+
     ui_cfg = dict(
         enabled=enabled,
         provider=provider,
         api_key=api_key,
         base_url=base_url,
-        model=model,
+        model=st.session_state.get("llm_model", model),
         timeout=timeout,
         temperature=temperature,
         max_tokens=max_tokens,
@@ -1320,6 +1321,7 @@ def ui_llm_sidebar(project_obj: Optional[Project]) -> LLMConfig:
         endpoint_url=endpoint_url,
         api_version=api_version,
     )
+
 
     # 合并逻辑
     if mode == "仅后台":
