@@ -1197,143 +1197,250 @@ def ui_render_editor(template_type: str, data: Dict[str, Any]) -> Dict[str, Any]
 # Sidebar: LLM
 # =========================
 
-def ui_llm_sidebar(project_obj: Optional[Project]) -> LLMConfig:
+def ui_llm_sidebar(project_obj=None) -> LLMConfig:
+    """
+    侧边栏 LLM 配置（支持：自动/仅后台/仅页面/合并(页面优先)）
+    - Provider 选择后：自动联动 Base URL/Model（自动填充或下拉可选）
+    - 不建议把 api_key 保存进项目；仅保存除 key 外的默认配置
+    """
+
     st.sidebar.markdown("---")
     st.sidebar.markdown("### LLM（可选：用于校对/修正/补全）")
 
-    backend = _read_llm_defaults()
-    prj_llm: Dict[str, Any] = {}
-    if project_obj is not None and isinstance(getattr(project_obj, "llm", None), dict):
-        prj_llm = project_obj.llm
+    backend = _read_llm_defaults()  # secrets.llm > env > hardcode
+    prj_llm = {}
+    if project_obj is not None and hasattr(project_obj, "llm") and isinstance(getattr(project_obj, "llm"), dict):
+        prj_llm = getattr(project_obj, "llm")
 
     ui_defaults = {**backend, **prj_llm}
 
+    # -----------------------------
+    # session_state keys
+    # -----------------------------
+    K_MODE = "llm_cfg_mode"
+    K_PRESET = "llm_preset_name"
+    K_PROVIDER = "llm_provider"
+    K_ENABLED = "llm_enabled"
+    K_APIKEY = "llm_api_key"
+    K_MODEL_PICK = "llm_model_pick"
+    K_MODEL_CUSTOM = "llm_model_custom"
+    K_BASE_PICK = "llm_base_pick"
+    K_BASE_CUSTOM = "llm_base_custom"
+    K_ENDPOINT = "llm_endpoint_url"
+    K_API_VER = "llm_api_version"
+    K_TIMEOUT = "llm_timeout"
+    K_TEMP = "llm_temperature"
+    K_MAXTOK = "llm_max_tokens"
+    K_EHEAD = "llm_extra_headers_json"
+    K_EPARM = "llm_extra_params_json"
+
+    def _init_once():
+        if "_llm_inited" in st.session_state:
+            return
+        st.session_state["_llm_inited"] = True
+
+        st.session_state.setdefault(K_MODE, "自动(推荐)")
+        st.session_state.setdefault(K_PRESET, list(PROVIDER_PRESETS.keys())[0] if PROVIDER_PRESETS else "OpenAI / OpenAI兼容（通用）")
+        st.session_state.setdefault(K_ENABLED, bool(ui_defaults.get("enabled", False)))
+        st.session_state.setdefault(K_APIKEY, str(ui_defaults.get("api_key", "")))
+
+        # 先把“已有默认值”塞进去（避免首次打开为空）
+        st.session_state.setdefault(K_PROVIDER, str(ui_defaults.get("provider", "openai_compat")))
+        st.session_state.setdefault(K_BASE_CUSTOM, str(ui_defaults.get("base_url", "")))
+        st.session_state.setdefault(K_MODEL_CUSTOM, str(ui_defaults.get("model", "")))
+        st.session_state.setdefault(K_ENDPOINT, str(ui_defaults.get("endpoint_url", "")))
+        st.session_state.setdefault(K_API_VER, str(ui_defaults.get("api_version", "")))
+
+        st.session_state.setdefault(K_TIMEOUT, int(ui_defaults.get("timeout", 60)))
+        st.session_state.setdefault(K_TEMP, float(ui_defaults.get("temperature", 0.2)))
+        st.session_state.setdefault(K_MAXTOK, int(ui_defaults.get("max_tokens", 2048)))
+
+        st.session_state.setdefault(K_EHEAD, str(ui_defaults.get("extra_headers_json", "")))
+        st.session_state.setdefault(K_EPARM, str(ui_defaults.get("extra_params_json", "")))
+
+        # pick 默认先设为 “自定义…”，这样不会丢用户已有输入
+        st.session_state.setdefault(K_BASE_PICK, "自定义…")
+        st.session_state.setdefault(K_MODEL_PICK, "自定义…")
+
+    _init_once()
+
+    # -----------------------------
+    # helpers: build options
+    # -----------------------------
+    def _preset_options(preset: dict, field: str) -> list[str]:
+        """
+        field: "base_urls" or "models"
+        兼容：preset 不提供列表时，用 hint + 当前值做兜底。
+        """
+        arr = preset.get(field)
+        if isinstance(arr, list) and arr:
+            return [str(x) for x in arr if str(x).strip()]
+        # fallback：给一个“可选提示项”
+        hint_key = "base_url_hint" if field == "base_urls" else "model_hint"
+        hint = str(preset.get(hint_key, "")).strip()
+        if hint:
+            return [f"（参考）{hint}"]
+        return []
+
+    def _apply_preset_defaults(preset_name: str):
+        preset = PROVIDER_PRESETS.get(preset_name, {})
+        provider = preset.get("provider", "openai_compat")
+        st.session_state[K_PROVIDER] = provider
+
+        base_opts = _preset_options(preset, "base_urls")
+        model_opts = _preset_options(preset, "models")
+
+        # Base URL：如果 preset 给了可用选项，优先切换到第一个；否则保持用户现有输入
+        if base_opts:
+            st.session_state[K_BASE_PICK] = base_opts[0]
+            # 如果是“参考项”就不强行写死到 custom；否则写入 custom 方便后续编辑
+            if not str(base_opts[0]).startswith("（参考）"):
+                st.session_state[K_BASE_CUSTOM] = base_opts[0]
+        else:
+            st.session_state[K_BASE_PICK] = "自定义…"
+
+        # Model：同理
+        if model_opts:
+            st.session_state[K_MODEL_PICK] = model_opts[0]
+            if not str(model_opts[0]).startswith("（参考）"):
+                st.session_state[K_MODEL_CUSTOM] = model_opts[0]
+        else:
+            st.session_state[K_MODEL_PICK] = "自定义…"
+
+        # 原生 provider 给一个合理 endpoint 模板（仅做默认值，不保证适配所有网关）
+        if provider == "anthropic" and not st.session_state.get(K_ENDPOINT, "").strip():
+            st.session_state[K_ENDPOINT] = "https://api.anthropic.com/v1/messages"
+        if provider == "gemini" and not st.session_state.get(K_ENDPOINT, "").strip():
+            st.session_state[K_ENDPOINT] = ""  # Gemini 常用带 key 的完整 URL；让用户按实际填
+
+    # -----------------------------
+    # UI: mode + preset
+    # -----------------------------
     mode = st.sidebar.selectbox(
         "配置来源",
         ["自动(推荐)", "仅后台", "仅页面", "合并(页面优先)"],
-        index=0,
-        help="自动：后台(secrets/env) 与 项目默认 合并；仅页面：每次手输；合并：页面优先覆盖后台/项目默认。",
+        key=K_MODE,
     )
-
-    # --- Provider preset select + auto fill ---
-    preset_names = list(PROVIDER_PRESETS.keys())
-
-    def apply_preset():
-        name = st.session_state.get("provider_preset_name", preset_names[0])
-        p = PROVIDER_PRESETS[name]
-
-        # provider 写入 session
-        st.session_state["llm_provider"] = p.get("provider", "openai_compat")
-
-        # base_url / endpoint_url 自动填充（如果 preset 给了值）
-        if p.get("default_base_url", "") != "":
-            st.session_state["llm_base_url"] = p["default_base_url"]
-        else:
-            # 不强行覆盖用户已有输入
-            st.session_state.setdefault("llm_base_url", "")
-
-        if p.get("default_endpoint_url", "") != "":
-            st.session_state["llm_endpoint_url"] = p["default_endpoint_url"]
-        else:
-            st.session_state.setdefault("llm_endpoint_url", "")
-
-        # model 自动填充（如果 preset 给了默认）
-        if p.get("default_model", "") != "":
-            st.session_state["llm_model"] = p["default_model"]
-        else:
-            st.session_state.setdefault("llm_model", "")
-
-        # 重置“自定义model”开关
-        st.session_state["llm_model_mode"] = "下拉选择"
 
     preset_name = st.sidebar.selectbox(
         "Provider 选择",
-        preset_names,
-        key="provider_preset_name",
-        on_change=apply_preset,
+        list(PROVIDER_PRESETS.keys()),
+        key=K_PRESET,
+        on_change=lambda: _apply_preset_defaults(st.session_state[K_PRESET]),
     )
-    preset = PROVIDER_PRESETS[preset_name]
-    provider = st.session_state.get("llm_provider", preset.get("provider", "openai_compat"))
+    preset = PROVIDER_PRESETS.get(preset_name, {})
+    provider = st.session_state.get(K_PROVIDER, preset.get("provider", "openai_compat"))
 
-    enabled = st.sidebar.checkbox("启用 LLM 校对与修正", value=bool(ui_defaults.get("enabled", False)), key="llm_enabled")
-    api_key = st.sidebar.text_input("API Key", value=str(ui_defaults.get("api_key", "")), type="password", key="llm_api_key")
+    enabled = st.sidebar.checkbox("启用 LLM 校对与修正", key=K_ENABLED)
 
-    # --- Model: 下拉 + 可自定义 ---
-    model_mode = st.sidebar.radio("Model 输入方式", ["下拉选择", "自定义输入"], horizontal=True, key="llm_model_mode")
+    st.sidebar.caption(f"当前 Provider：`{provider}`")
 
-    if model_mode == "下拉选择" and preset.get("models"):
-        model = st.sidebar.selectbox("Model", preset["models"], key="llm_model")
+    # -----------------------------
+    # Model selector (auto fill / pick)
+    # -----------------------------
+    model_opts = _preset_options(preset, "models")
+    model_pick_list = (model_opts + ["自定义…"]) if model_opts else ["自定义…"]
+    model_pick = st.sidebar.selectbox("Model（可选）", model_pick_list, key=K_MODEL_PICK)
+
+    if model_pick == "自定义…" or str(model_pick).startswith("（参考）"):
+        model_custom = st.sidebar.text_input(
+            "Model（自定义输入）",
+            key=K_MODEL_CUSTOM,
+            help=preset.get("model_hint", ""),
+        )
+        model_final = model_custom.strip()
     else:
-        model = st.sidebar.text_input("Model", value=st.session_state.get("llm_model", str(ui_defaults.get("model", ""))), key="llm_model_custom")
-        # 让后续统一取 llm_model
-        st.session_state["llm_model"] = model
+        model_final = str(model_pick).strip()
 
-    # --- Base URL / Endpoint URL ---
-    base_url_help = preset.get("base_url_hint", "")
-    base_url = st.sidebar.text_input("Base URL", value=st.session_state.get("llm_base_url", str(ui_defaults.get("base_url", ""))), help=base_url_help, key="llm_base_url")
+    # -----------------------------
+    # Base URL selector (auto fill / pick)
+    # -----------------------------
+    base_opts = _preset_options(preset, "base_urls")
+    base_pick_list = (base_opts + ["自定义…"]) if base_opts else ["自定义…"]
+    base_pick = st.sidebar.selectbox("Base URL（可选）", base_pick_list, key=K_BASE_PICK)
+
+    if base_pick == "自定义…" or str(base_pick).startswith("（参考）"):
+        base_custom = st.sidebar.text_input(
+            "Base URL（自定义输入）",
+            key=K_BASE_CUSTOM,
+            help=preset.get("base_url_hint", ""),
+        )
+        base_final = base_custom.strip()
+    else:
+        base_final = str(base_pick).strip()
+
+    # -----------------------------
+    # API Key / Endpoint
+    # -----------------------------
+    api_key = st.sidebar.text_input("API Key", key=K_APIKEY, type="password")
 
     endpoint_url = st.sidebar.text_input(
         "Endpoint URL（可选，用于原生/自定义覆盖）",
-        value=st.session_state.get("llm_endpoint_url", str(ui_defaults.get("endpoint_url", ""))),
-        help="Gemini/Claude/自定义REST建议填完整URL；OpenAI兼容一般不需要。",
-        key="llm_endpoint_url",
+        key=K_ENDPOINT,
+        help="Gemini/Claude/自定义REST通常更建议填完整URL；OpenAI兼容一般只需要 Base URL。",
     )
 
     api_version = ""
     if provider == "anthropic":
         api_version = st.sidebar.text_input(
             "Anthropic-Version（可选）",
-            value=str(ui_defaults.get("api_version", "")),
-            help="不确定就留空。",
-            key="llm_api_version",
+            key=K_API_VER,
+            help="不确定就留空。不同网关可能要求不同版本字符串。",
         )
+    else:
+        # 其它 provider 不显示，但仍保留 state
+        api_version = st.session_state.get(K_API_VER, "")
 
-
-    timeout = st.sidebar.slider("超时（秒）", 10, 180, int(ui_defaults.get("timeout", 60)))
-    temperature = st.sidebar.slider("temperature", 0.0, 1.5, float(ui_defaults.get("temperature", 0.2)))
-    max_tokens = st.sidebar.slider("max_tokens", 256, 8192, int(ui_defaults.get("max_tokens", 2048)), step=256)
+    timeout = st.sidebar.slider("超时（秒）", 10, 180, key=K_TIMEOUT)
+    temperature = st.sidebar.slider("temperature", 0.0, 1.5, key=K_TEMP)
+    max_tokens = st.sidebar.slider("max_tokens", 256, 8192, key=K_MAXTOK, step=256)
 
     extra_headers_json = st.sidebar.text_area(
         "额外 Headers（JSON，可选）",
-        value=str(ui_defaults.get("extra_headers_json", "")),
+        key=K_EHEAD,
         help='例如：{"X-Org":"xxx"}；自定义REST很常用。',
-        height=70,
+        height=80,
     )
     extra_params_json = st.sidebar.text_area(
         "额外 Params（JSON，可选）",
-        value=str(ui_defaults.get("extra_params_json", "")),
+        key=K_EPARM,
         help='例如：{"top_p":0.9} 或覆盖payload结构；自定义REST很常用。',
-        height=70,
+        height=80,
     )
 
-
+    # -----------------------------
+    # build ui_cfg
+    # -----------------------------
     ui_cfg = dict(
-        enabled=enabled,
-        provider=provider,
-        api_key=api_key,
-        base_url=base_url,
-        model=st.session_state.get("llm_model", model),
-        timeout=timeout,
-        temperature=temperature,
-        max_tokens=max_tokens,
-        extra_headers_json=extra_headers_json,
-        extra_params_json=extra_params_json,
-        endpoint_url=endpoint_url,
-        api_version=api_version,
+        enabled=bool(enabled),
+        provider=str(provider),
+        api_key=str(api_key),
+        base_url=str(base_final),
+        model=str(model_final),
+        timeout=int(timeout),
+        temperature=float(temperature),
+        max_tokens=int(max_tokens),
+        extra_headers_json=str(extra_headers_json),
+        extra_params_json=str(extra_params_json),
+        endpoint_url=str(endpoint_url),
+        api_version=str(api_version),
     )
 
-
-    # 合并逻辑
+    # -----------------------------
+    # merge strategy
+    # -----------------------------
     if mode == "仅后台":
         merged = dict(backend)
     elif mode == "仅页面":
         merged = dict(ui_cfg)
     else:
-        merged = dict(ui_defaults) if mode == "自动(推荐)" else dict(backend)
+        # 自动 / 合并(页面优先)：以 backend 为底，页面有值则覆盖
+        merged = dict(backend)
         for k, v in ui_cfg.items():
             if k == "enabled":
                 merged[k] = bool(v)
-            elif isinstance(v, str):
+                continue
+            if isinstance(v, str):
                 if v.strip() != "":
                     merged[k] = v.strip()
             elif v is not None:
@@ -1341,17 +1448,23 @@ def ui_llm_sidebar(project_obj: Optional[Project]) -> LLMConfig:
 
     llm_cfg = LLMConfig(**merged)
 
-    if project_obj is not None and st.sidebar.button("保存为本项目默认（不含Key）", use_container_width=True):
-        safe_cfg = dict(merged)
-        safe_cfg["api_key"] = ""
-        project_obj.llm = safe_cfg
-        save_project(project_obj)
-        st.sidebar.success("已保存（Key未写入项目）。")
-
-    if enabled and not llm_available(llm_cfg):
-        st.sidebar.warning("LLM 已勾选，但配置不完整（通常需要 model + key + base_url/endpoint）。")
+    # -----------------------------
+    # save to project (without key)
+    # -----------------------------
+    if project_obj is not None:
+        st.sidebar.markdown("---")
+        if st.sidebar.button("保存为本项目默认（不含Key）", use_container_width=True):
+            safe = dict(merged)
+            safe["api_key"] = ""
+            try:
+                project_obj.llm = safe
+                save_project(project_obj)  # 你原本这里注释了，建议打开
+                st.sidebar.success("已保存（Key未写入项目）。")
+            except Exception as e:
+                st.sidebar.error(f"保存失败：{e}")
 
     return llm_cfg
+
 
 
 # =========================
@@ -1399,7 +1512,8 @@ def ui_project_sidebar() -> Tuple[Project, LLMConfig]:
         st.session_state["active_project_id"] = pid
         active = load_project(pid) or projects[0]
 
-    llm_cfg = ui_llm_sidebar(active)
+    llm_cfg = ui_llm_sidebar(project_obj=active)
+
 
     st.sidebar.markdown("---")
     st.sidebar.markdown("### 导出/打包")
@@ -1730,6 +1844,24 @@ def ui_templates(pid: str, llm_cfg: LLMConfig):
             st.warning("文档读取失败。")
             return
 
+
+        # 让“当前文档模板类型”可切换，并联动右侧编辑器
+        new_type = st.selectbox(
+            "当前文档模板类型（切换后右侧编辑器会联动）",
+            TEMPLATE_TYPES,
+            index=TEMPLATE_TYPES.index(doc_obj["template_type"]),
+            key=f"active_doc_type_{doc_id}",
+        )
+        if new_type != doc_obj["template_type"]:
+            doc_obj["history"].append({"at": now_str(), "action": "change_template_type", "data": doc_obj.get("data", {})})
+            doc_obj["template_type"] = new_type
+            doc_obj["data"] = merge_by_schema(schema_for(new_type), doc_obj.get("data", {}))
+            save_doc(pid, doc_obj)
+            st.rerun()
+
+
+
+
         st.markdown(f"##### 编辑：{doc_obj['title']} · {doc_obj['template_type']}")
         st.caption(f"更新时间：{doc_obj.get('updated_at','')} · 来源：{doc_obj.get('source',{}).get('uploaded_filename','(无)')}")
 
@@ -1835,6 +1967,22 @@ def main():
 
     prj, llm_cfg = ui_project_sidebar()
     ui_header(prj)
+
+    st.markdown("""
+    <style>
+    /* 让 tabs 自动换行显示（多行标签） */
+    div[data-baseweb="tab-list"] {
+      flex-wrap: wrap !important;
+      gap: 6px !important;
+    }
+    button[data-baseweb="tab"] {
+      height: auto !important;
+      padding-top: 6px !important;
+      padding-bottom: 6px !important;
+    }
+    </style>
+    """, unsafe_allow_html=True)
+
 
     tabs = st.tabs(["培养方案基座", "模板化教学文件", "项目概览"])
     with tabs[0]:
