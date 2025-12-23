@@ -1,15 +1,16 @@
 # app.py
 # ------------------------------------------------------------
-# Teaching-Agent-Suite (Template-first, Project-based)
-# 核心思路：
+# Teaching-Agent-Suite (Enhanced with Full Templates, Linkage, Consistency, LLM Evaluation/Writing)
+# 目标：
 # 1) “培养方案基座”=项目的权威内容库（可PDF抽取/可手工/可LLM校对）
 # 2) 其他教学文件=固定模板（课程大纲/教学日历/授课手册/达成度表等）
-#    支持：上传docx/粘贴全文 → 离线抽取填充 →（可选LLM）结构化重建/校对 → 人工编辑 → 导出规范docx/xlsx
-# 3) 数据持久化：data/projects/<project_id>/... 便于后续“记住并作为校准依据”
+# 支持：上传docx/pdf/粘贴全文 → 离线抽取填充 →（可选LLM）结构化重建/校对/评价/建议/撰写 → 人工编辑 → 导出docx/xlsx
+# 3) 数据持久化：data/projects/<project_id>/... 便于后续复用
+# 4) 联动：培养方案与下游文件关联（e.g., 毕业要求指标点自动校验/填充建议）
+# 5) 一致性检查：跨文件校验（e.g., 课程目标支撑毕业要求）
+# 6) LLM增强：提取填写、评价建议、帮助撰写（e.g., 生成报告）
 # ------------------------------------------------------------
-
 from __future__ import annotations
-
 import io
 import os
 import re
@@ -21,33 +22,26 @@ import datetime as dt
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
-
 import streamlit as st
 import pandas as pd
 import requests
-
 # ---- Optional deps ----
 try:
     import pdfplumber
 except Exception:
     pdfplumber = None
-
 try:
     from docx import Document
     from docx.shared import Pt
     from docx.enum.text import WD_ALIGN_PARAGRAPH
 except Exception:
     Document = None
-
-
 # =========================
 # Globals / constants
 # =========================
-
 APP_NAME = "Teaching Agent Suite"
-APP_VERSION = "v0.5 (template-first + LLM optional)"
+APP_VERSION = "v0.6 (full templates + linkage + LLM eval/write)"
 DATA_ROOT = Path("data/projects")
-
 SECTION_TITLES = [
     "一、培养目标",
     "二、毕业要求",
@@ -61,49 +55,38 @@ SECTION_TITLES = [
     "十、课程设置对毕业要求支撑关系表",
     "十一、课程设置逻辑思维导图",
 ]
-
 TEMPLATE_TYPES = [
     "课程大纲",
     "教学日历",
     "授课手册",
-    "达成度评价依据审核表",
-    "达成度评价报告",
-    "调查问卷",
+    "课程目标达成情况评价依据合理性审核表",
+    "课程目标达成情况评价报告",
 ]
-
-
 # =========================
 # Utilities
 # =========================
-
 def now_str() -> str:
     return dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
 def sha256_bytes(b: bytes) -> str:
     return hashlib.sha256(b).hexdigest()
-
 def ensure_dir(p: Path) -> None:
     p.mkdir(parents=True, exist_ok=True)
-
 def safe_json_load(s: str, default: Any = None) -> Any:
     try:
         return json.loads(s)
     except Exception:
         return default
-
 def clean_text(s: str) -> str:
     if s is None:
         return ""
     s = s.replace("\u00a0", " ")
     s = re.sub(r"[ \t]+", " ", s)
     return s.strip()
-
 def clamp(s: str, n: int = 12000) -> str:
     s = s or ""
     if len(s) <= n:
         return s
     return s[:n] + f"\n…(截断，原长度 {len(s)})"
-
 def dataframe_safe(df: pd.DataFrame) -> pd.DataFrame:
     """
     解决 Streamlit/pyarrow 常见崩溃：列里出现 dict/list/None 混合类型。
@@ -116,7 +99,6 @@ def dataframe_safe(df: pd.DataFrame) -> pd.DataFrame:
     for c in df2.columns:
         df2[c] = df2[c].map(lambda x: "" if x is None else str(x))
     return df2
-
 def render_table_html(df: pd.DataFrame, height: int = 420) -> None:
     """
     兜底展示：不用 st.dataframe 避免 arrow 推断类型问题。
@@ -128,11 +110,9 @@ def render_table_html(df: pd.DataFrame, height: int = 420) -> None:
         height=min(height + 40, 900),
         scrolling=True,
     )
-
 def json_download_button(label: str, obj: Any, filename: str, key: Optional[str] = None):
     data = json.dumps(obj, ensure_ascii=False, indent=2).encode("utf-8")
     st.download_button(label, data=data, file_name=filename, mime="application/json", key=key)
-
 def to_xlsx_bytes(sheets: Dict[str, pd.DataFrame]) -> bytes:
     buf = io.BytesIO()
     with pd.ExcelWriter(buf, engine="xlsxwriter") as writer:
@@ -140,12 +120,9 @@ def to_xlsx_bytes(sheets: Dict[str, pd.DataFrame]) -> bytes:
             name = str(name)[:31]
             dataframe_safe(df).to_excel(writer, sheet_name=name, index=False)
     return buf.getvalue()
-
-
 # =========================
 # Persistence (Project DB)
 # =========================
-
 @dataclass
 class Project:
     project_id: str
@@ -153,26 +130,19 @@ class Project:
     llm: Dict[str, Any] = field(default_factory=dict)  # 保存项目默认LLM配置（不含Key）
     created_at: str = field(default_factory=now_str)
     updated_at: str = field(default_factory=now_str)
-    logo_file: str = ""   # 例如 "logo.png" 或 "logo.svg"
-
+    logo_file: str = ""  # 例如 "logo.png" 或 "logo.svg"
 def project_dir(pid: str) -> Path:
     return DATA_ROOT / pid
-
 def project_meta_path(pid: str) -> Path:
     return project_dir(pid) / "project.json"
-
 def base_plan_path(pid: str) -> Path:
     return project_dir(pid) / "base_training_plan.json"
-
 def docs_dir(pid: str) -> Path:
     return project_dir(pid) / "docs"
-
 def doc_path(pid: str, doc_id: str) -> Path:
     return docs_dir(pid) / f"{doc_id}.json"
-
 def assets_dir(pid: str) -> Path:
     return project_dir(pid) / "assets"
-
 def list_projects() -> List[Project]:
     ensure_dir(DATA_ROOT)
     out: List[Project] = []
@@ -190,7 +160,6 @@ def list_projects() -> List[Project]:
                 pass
     out.sort(key=lambda x: x.updated_at, reverse=True)
     return out
-
 def save_project(prj: Project) -> None:
     ensure_dir(project_dir(prj.project_id))
     ensure_dir(docs_dir(prj.project_id))
@@ -199,7 +168,6 @@ def save_project(prj: Project) -> None:
     project_meta_path(prj.project_id).write_text(
         json.dumps(prj.__dict__, ensure_ascii=False, indent=2), "utf-8"
     )
-
 def load_project(pid: str) -> Optional[Project]:
     p = project_meta_path(pid)
     if not p.exists():
@@ -209,15 +177,12 @@ def load_project(pid: str) -> Optional[Project]:
         return Project(**meta) if meta else None
     except Exception:
         return None
-
 def load_base_plan(pid: str) -> Dict[str, Any]:
     p = base_plan_path(pid)
     return safe_json_load(p.read_text("utf-8"), {}) if p.exists() else {}
-
 def save_base_plan(pid: str, plan: Dict[str, Any]) -> None:
     ensure_dir(project_dir(pid))
     base_plan_path(pid).write_text(json.dumps(plan, ensure_ascii=False, indent=2), "utf-8")
-
 def list_docs(pid: str) -> List[Dict[str, Any]]:
     ensure_dir(docs_dir(pid))
     out: List[Dict[str, Any]] = []
@@ -227,40 +192,32 @@ def list_docs(pid: str) -> List[Dict[str, Any]]:
             out.append(obj)
     out.sort(key=lambda x: x.get("updated_at", ""), reverse=True)
     return out
-
 def save_doc(pid: str, doc_obj: Dict[str, Any]) -> None:
     ensure_dir(docs_dir(pid))
     doc_obj["updated_at"] = now_str()
     doc_path(pid, doc_obj["doc_id"]).write_text(json.dumps(doc_obj, ensure_ascii=False, indent=2), "utf-8")
-
 def delete_doc(pid: str, doc_id: str) -> None:
     p = doc_path(pid, doc_id)
     if p.exists():
         p.unlink()
-
-
 # =========================
 # LLM Config + Provider presets
 # =========================
-
 @dataclass
 class LLMConfig:
     enabled: bool = False
-    provider: str = "openai_compat"   # openai_compat / anthropic / gemini / custom_rest
+    provider: str = "openai_compat"  # openai_compat / anthropic / gemini / custom_rest
     api_key: str = ""
-    base_url: str = ""                # openai_compat: https://xxx/v1 ; custom_rest: full URL (or endpoint_url)
+    base_url: str = ""  # openai_compat: https://xxx/v1
     model: str = ""
     timeout: int = 60
     temperature: float = 0.2
     max_tokens: int = 2048
-
     # advanced/custom
-    extra_headers_json: str = ""      # JSON dict string
-    extra_params_json: str = ""       # JSON dict string
-    # native extras
-    api_version: str = ""             # anthropic optional
-    endpoint_url: str = ""            # gemini/custom full URL override
-
+    extra_headers_json: str = ""  # JSON dict string
+    extra_params_json: str = ""  # JSON dict string
+    endpoint_url: str = ""  # gemini/custom full URL override
+    api_version: str = ""  # anthropic optional
 def _safe_json_loads(s: str) -> Dict[str, Any]:
     if not s or not str(s).strip():
         return {}
@@ -269,7 +226,6 @@ def _safe_json_loads(s: str) -> Dict[str, Any]:
         return obj if isinstance(obj, dict) else {}
     except Exception:
         return {}
-
 def _read_llm_defaults() -> Dict[str, Any]:
     """
     Defaults priority: secrets.llm > env > hardcode
@@ -279,7 +235,6 @@ def _read_llm_defaults() -> Dict[str, Any]:
         s = dict(st.secrets.get("llm", {}))
     except Exception:
         s = {}
-
     return {
         "enabled": bool(s.get("enabled", False)),
         "provider": str(s.get("provider", os.environ.get("LLM_PROVIDER", "openai_compat"))),
@@ -294,65 +249,50 @@ def _read_llm_defaults() -> Dict[str, Any]:
         "endpoint_url": str(s.get("endpoint_url", "")),
         "api_version": str(s.get("api_version", "")),
     }
-
-# ✅ 这里保留你原来的字段，同时增加 base_urls，保证 ui_llm_sidebar 能自动下拉/填充
 PROVIDER_PRESETS: Dict[str, Dict[str, Any]] = {
     "OpenAI / OpenAI兼容（通用）": {
         "provider": "openai_compat",
         "default_base_url": "https://api.openai.com/v1",
-        "base_urls": ["https://api.openai.com/v1"],
-        "models": ["gpt-4.1-mini", "gpt-4.1", "gpt-4o-mini"],
-        "default_model": "gpt-4.1-mini",
-        "default_endpoint_url": "",
+        "models": ["gpt-4o-mini", "gpt-4o", "gpt-4-turbo"],
+        "default_model": "gpt-4o-mini",
         "base_url_hint": "OpenAI兼容一般是 https://xxx/v1",
     },
     "DeepSeek（OpenAI兼容）": {
         "provider": "openai_compat",
         "default_base_url": "",
-        "base_urls": [],
         "models": ["deepseek-chat", "deepseek-reasoner"],
         "default_model": "deepseek-chat",
-        "default_endpoint_url": "",
         "base_url_hint": "填 DeepSeek 提供的 OpenAI 兼容 base_url（通常以 /v1 结尾）",
     },
     "月之暗面 Kimi（OpenAI兼容）": {
         "provider": "openai_compat",
         "default_base_url": "",
-        "base_urls": [],
         "models": ["moonshot-v1-8k", "moonshot-v1-32k", "moonshot-v1-128k"],
         "default_model": "moonshot-v1-8k",
-        "default_endpoint_url": "",
         "base_url_hint": "填 Kimi 的 OpenAI 兼容 base_url（通常以 /v1 结尾）",
     },
     "Claude (Anthropic) 原生接口": {
         "provider": "anthropic",
         "default_base_url": "https://api.anthropic.com",
-        "base_urls": ["https://api.anthropic.com"],
-        "models": ["claude-3-5-sonnet-latest", "claude-3-5-haiku-latest"],
+        "models": ["claude-3-5-sonnet-latest", "claude-3-opus-latest", "claude-3-haiku-latest"],
         "default_model": "claude-3-5-sonnet-latest",
-        "default_endpoint_url": "https://api.anthropic.com/v1/messages",
         "base_url_hint": "不确定可用默认；如走网关可改。",
     },
     "Gemini 原生接口": {
         "provider": "gemini",
         "default_base_url": "",
-        "base_urls": [],
         "models": ["gemini-1.5-pro", "gemini-1.5-flash"],
         "default_model": "gemini-1.5-flash",
-        "default_endpoint_url": "",
         "base_url_hint": "通常不需要 Base URL；可用 endpoint_url 覆盖。",
     },
     "自定义 REST（任意平台/私有模型）": {
         "provider": "custom_rest",
         "default_base_url": "",
-        "base_urls": [],
         "models": [],
         "default_model": "",
-        "default_endpoint_url": "",
         "base_url_hint": "填完整URL（例如 https://host/path）",
     },
 }
-
 def llm_available(cfg: LLMConfig) -> bool:
     if not cfg or not cfg.enabled:
         return False
@@ -365,16 +305,12 @@ def llm_available(cfg: LLMConfig) -> bool:
     if cfg.provider == "custom_rest":
         return bool(cfg.endpoint_url or cfg.base_url)
     return False
-
-
 # =========================
 # LLM unified call
 # =========================
-
 def llm_chat(messages: List[Dict[str, str]], cfg: LLMConfig) -> str:
     if not cfg.enabled:
         raise RuntimeError("LLM is disabled")
-
     if cfg.provider == "openai_compat":
         return _call_openai_compat(messages, cfg)
     if cfg.provider == "anthropic":
@@ -383,9 +319,7 @@ def llm_chat(messages: List[Dict[str, str]], cfg: LLMConfig) -> str:
         return _call_gemini(messages, cfg)
     if cfg.provider == "custom_rest":
         return _call_custom_rest(messages, cfg)
-
     raise ValueError(f"Unknown provider: {cfg.provider}")
-
 def _call_openai_compat(messages: List[Dict[str, str]], cfg: LLMConfig) -> str:
     base = (cfg.base_url or "").rstrip("/")
     if base.endswith("/v1"):
@@ -394,10 +328,8 @@ def _call_openai_compat(messages: List[Dict[str, str]], cfg: LLMConfig) -> str:
         url = base
     else:
         url = base + "/v1/chat/completions"
-
     headers = {"Authorization": f"Bearer {cfg.api_key}"}
     headers.update(_safe_json_loads(cfg.extra_headers_json))
-
     payload: Dict[str, Any] = {
         "model": cfg.model,
         "messages": messages,
@@ -405,34 +337,27 @@ def _call_openai_compat(messages: List[Dict[str, str]], cfg: LLMConfig) -> str:
         "max_tokens": cfg.max_tokens,
     }
     payload.update(_safe_json_loads(cfg.extra_params_json))
-
     r = requests.post(url, headers=headers, json=payload, timeout=cfg.timeout)
     r.raise_for_status()
     data = r.json()
     return data["choices"][0]["message"]["content"]
-
 def _call_anthropic(messages: List[Dict[str, str]], cfg: LLMConfig) -> str:
     endpoint = cfg.endpoint_url.strip()
     if not endpoint:
-        base = (cfg.base_url or "https://api.anthropic.com").rstrip("/")
-        endpoint = base + "/v1/messages"
-
+        endpoint = "https://api.anthropic.com/v1/messages"
     system_text = "\n".join([m["content"] for m in messages if m["role"] == "system"]).strip()
-
     user_parts: List[Dict[str, str]] = []
     for m in messages:
         if m["role"] == "user":
             user_parts.append({"type": "text", "text": m["content"]})
         elif m["role"] == "assistant":
             user_parts.append({"type": "text", "text": f"(assistant) {m['content']}"})
-
     headers: Dict[str, str] = {
         "x-api-key": cfg.api_key,
         "content-type": "application/json",
         "anthropic-version": cfg.api_version.strip() or "2023-06-01",
     }
     headers.update(_safe_json_loads(cfg.extra_headers_json))
-
     payload: Dict[str, Any] = {
         "model": cfg.model,
         "max_tokens": cfg.max_tokens,
@@ -442,33 +367,27 @@ def _call_anthropic(messages: List[Dict[str, str]], cfg: LLMConfig) -> str:
     if system_text:
         payload["system"] = system_text
     payload.update(_safe_json_loads(cfg.extra_params_json))
-
     r = requests.post(endpoint, headers=headers, json=payload, timeout=cfg.timeout)
     r.raise_for_status()
     data = r.json()
     parts = data.get("content", [])
     texts = [p.get("text", "") for p in parts if isinstance(p, dict)]
     return "\n".join([t for t in texts if t]).strip()
-
 def _call_gemini(messages: List[Dict[str, str]], cfg: LLMConfig) -> str:
     endpoint = cfg.endpoint_url.strip()
     if not endpoint:
         endpoint = f"https://generativelanguage.googleapis.com/v1beta/models/{cfg.model}:generateContent?key={cfg.api_key}"
-
     contents: List[Dict[str, Any]] = []
     for m in messages:
         role = "user" if m["role"] != "assistant" else "model"
         contents.append({"role": role, "parts": [{"text": m["content"]}]})
-
     payload: Dict[str, Any] = {
         "contents": contents,
         "generationConfig": {"temperature": cfg.temperature, "maxOutputTokens": cfg.max_tokens},
     }
     payload.update(_safe_json_loads(cfg.extra_params_json))
-
     headers = {"content-type": "application/json"}
     headers.update(_safe_json_loads(cfg.extra_headers_json))
-
     r = requests.post(endpoint, headers=headers, json=payload, timeout=cfg.timeout)
     r.raise_for_status()
     data = r.json()
@@ -477,16 +396,13 @@ def _call_gemini(messages: List[Dict[str, str]], cfg: LLMConfig) -> str:
     parts = content.get("parts", []) if isinstance(content, dict) else []
     texts = [p.get("text", "") for p in parts if isinstance(p, dict)]
     return "\n".join([t for t in texts if t]).strip()
-
 def _call_custom_rest(messages: List[Dict[str, str]], cfg: LLMConfig) -> str:
     url = cfg.endpoint_url.strip() or cfg.base_url.strip()
     if not url:
         raise ValueError("custom_rest requires endpoint_url or base_url")
-
     headers = _safe_json_loads(cfg.extra_headers_json)
     if cfg.api_key and "authorization" not in {k.lower() for k in headers.keys()}:
         headers["Authorization"] = f"Bearer {cfg.api_key}"
-
     payload: Dict[str, Any] = {
         "model": cfg.model,
         "messages": messages,
@@ -494,11 +410,9 @@ def _call_custom_rest(messages: List[Dict[str, str]], cfg: LLMConfig) -> str:
         "max_tokens": cfg.max_tokens,
     }
     payload.update(_safe_json_loads(cfg.extra_params_json))
-
     r = requests.post(url, headers=headers, json=payload, timeout=cfg.timeout)
     r.raise_for_status()
     data = r.json()
-
     try:
         return data["choices"][0]["message"]["content"]
     except Exception:
@@ -507,41 +421,34 @@ def _call_custom_rest(messages: List[Dict[str, str]], cfg: LLMConfig) -> str:
         if isinstance(data.get(k), str):
             return data[k]
     return json.dumps(data, ensure_ascii=False)[:4000]
-
-
 # =========================
-# LLM JSON helpers
+# LLM JSON helpers + Enhanced for eval/suggest/write
 # =========================
-
 def extract_json_from_text(text: str) -> Optional[Dict[str, Any]]:
     if not text:
         return None
     obj = safe_json_load(text, None)
     if isinstance(obj, dict):
         return obj
-
     m = re.search(r"```(?:json)?\s*([\s\S]*?)\s*```", text)
     if m:
         obj = safe_json_load(m.group(1), None)
         if isinstance(obj, dict):
             return obj
-
     m = re.search(r"(\{[\s\S]*\})", text)
     if m:
         obj = safe_json_load(m.group(1), None)
         if isinstance(obj, dict):
             return obj
     return None
-
 def llm_chat_json(cfg: LLMConfig, system: str, user: str, schema_hint: str = "") -> Tuple[Optional[Dict[str, Any]], str]:
     if not llm_available(cfg):
         return None, "LLM 未启用或配置不完整。"
-
     messages = [
         {"role": "system", "content": system.strip()},
         {"role": "user", "content": (user.strip() + ("\n\nJSON schema hint:\n" + schema_hint if schema_hint else "")).strip()},
     ]
-
+    # OpenAI兼容：支持 response_format（如果目标网关不支持，会走 fallback）
     if cfg.provider == "openai_compat":
         base = (cfg.base_url or "").rstrip("/")
         if base.endswith("/v1"):
@@ -550,10 +457,8 @@ def llm_chat_json(cfg: LLMConfig, system: str, user: str, schema_hint: str = "")
             url = base
         else:
             url = base + "/v1/chat/completions"
-
         headers = {"Authorization": f"Bearer {cfg.api_key}", "Content-Type": "application/json"}
         headers.update(_safe_json_loads(cfg.extra_headers_json))
-
         payload: Dict[str, Any] = {
             "model": cfg.model,
             "messages": messages,
@@ -562,7 +467,6 @@ def llm_chat_json(cfg: LLMConfig, system: str, user: str, schema_hint: str = "")
             "response_format": {"type": "json_object"},
         }
         payload.update(_safe_json_loads(cfg.extra_params_json))
-
         try:
             r = requests.post(url, headers=headers, json=payload, timeout=cfg.timeout)
             r.raise_for_status()
@@ -572,66 +476,63 @@ def llm_chat_json(cfg: LLMConfig, system: str, user: str, schema_hint: str = "")
             return obj, content
         except Exception as e:
             return None, f"LLM 调用失败：{e}"
-
+    # 其他 provider：先普通调用，再 regex 提取 JSON
     try:
         content = llm_chat(messages, cfg)
         obj = extract_json_from_text(content)
         return obj, content
     except Exception as e:
         return None, f"LLM 调用失败：{e}"
-
-
+def llm_evaluate_suggest(cfg: LLMConfig, context: str, template_type: str) -> Tuple[Optional[Dict[str, Any]], str]:
+    system = f"你是高校教学文件审核助手。对给定{template_type}内容，进行评价、检查一致性，并给出改进建议。只输出JSON。"
+    schema_hint = json.dumps({
+        "evaluation": "整体评价（优点/问题）",
+        "consistency_issues": ["一致性问题列表（e.g., 与培养方案不符）"],
+        "suggestions": ["改进建议列表"],
+    }, ensure_ascii=False, indent=2)
+    user = f"内容上下文：\n{context}\n"
+    return llm_chat_json(cfg, system, user, schema_hint)
+def llm_help_write(cfg: LLMConfig, context: str, section: str, hints: str = "") -> str:
+    messages = [
+        {"role": "system", "content": "你是高校教学文件撰写助手。根据上下文，帮助撰写指定部分。输出纯文本。"},
+        {"role": "user", "content": f"上下文：\n{context}\n\n撰写部分：{section}\n\n额外提示：{hints}"},
+    ]
+    return llm_chat(messages, cfg)
 # =========================
-# DOCX parsing / exporting
+# DOCX parsing / exporting (enhanced for tables)
 # =========================
-
 def docx_bytes_to_document(file_bytes: bytes):
     if Document is None:
         raise RuntimeError("python-docx 未安装或不可用。")
     return Document(io.BytesIO(file_bytes))
-
 def docx_extract_text_tables(file_bytes: bytes) -> Tuple[str, List[pd.DataFrame]]:
-    """
-    把 docx 的段落合并成文本；把所有表格转成 DataFrame 列表
-    """
     doc = docx_bytes_to_document(file_bytes)
     paras: List[str] = []
     for p in doc.paragraphs:
         t = clean_text(p.text)
         if t:
             paras.append(t)
-
     dfs: List[pd.DataFrame] = []
     for tbl in doc.tables:
         rows: List[List[str]] = []
         for row in tbl.rows:
-            rows.append([clean_text(c.text) for c in row.cells])
-
-        maxlen = max((len(r) for r in rows), default=0)
-        rows2 = [r + [""] * (maxlen - len(r)) for r in rows]
-
-        if rows2:
-            header = rows2[0]
-            body = rows2[1:] if len(rows2) > 1 else []
+            cells = [clean_text(c.text) for c in row.cells]
+            rows.append(cells)
+        if rows:
+            maxlen = max(len(r) for r in rows)
+            rows = [r + [""] * (maxlen - len(r)) for r in rows]
+            header = rows[0] if rows else []
+            body = rows[1:] if len(rows) > 1 else []
             if sum(1 for x in header if x) <= 1:
                 header = [f"列{i+1}" for i in range(maxlen)]
-                body = rows2
+                body = rows
             df = pd.DataFrame(body, columns=header)
-        else:
-            df = pd.DataFrame()
-
-        dfs.append(df)
-
+            dfs.append(df)
     return "\n".join(paras), dfs
-
 def docx_export_simple(template_title: str, sections: List[Tuple[str, str]], tables: Optional[List[Tuple[str, pd.DataFrame]]] = None) -> bytes:
-    """
-    稳定的 Word 导出：标题 + 一级标题 + 段落 + 表格
-    """
     if Document is None:
         raise RuntimeError("python-docx 未安装或不可用。")
     tables = tables or []
-
     doc = Document()
     t = doc.add_paragraph()
     run = t.add_run(template_title)
@@ -639,7 +540,6 @@ def docx_export_simple(template_title: str, sections: List[Tuple[str, str]], tab
     run.font.size = Pt(16)
     t.alignment = WD_ALIGN_PARAGRAPH.CENTER
     doc.add_paragraph("")
-
     for h, body in sections:
         doc.add_heading(h, level=1)
         for para in (body or "").splitlines():
@@ -647,7 +547,6 @@ def docx_export_simple(template_title: str, sections: List[Tuple[str, str]], tab
             if para:
                 doc.add_paragraph(para)
         doc.add_paragraph("")
-
     for name, df in tables:
         doc.add_heading(name, level=2)
         df2 = dataframe_safe(df)
@@ -656,7 +555,6 @@ def docx_export_simple(template_title: str, sections: List[Tuple[str, str]], tab
             doc.add_paragraph("(空表)")
             doc.add_paragraph("")
             continue
-
         word_tbl = doc.add_table(rows=nrows + 1, cols=ncols)
         word_tbl.style = "Table Grid"
         for j, col in enumerate(df2.columns):
@@ -665,16 +563,12 @@ def docx_export_simple(template_title: str, sections: List[Tuple[str, str]], tab
             for j in range(ncols):
                 word_tbl.cell(i + 1, j).text = str(df2.iat[i, j])
         doc.add_paragraph("")
-
     buf = io.BytesIO()
     doc.save(buf)
     return buf.getvalue()
-
-
 # =========================
-# Schemas / Templates
+# Schemas / Templates (full for all types)
 # =========================
-
 def schema_for(template_type: str) -> Dict[str, Any]:
     if template_type == "教学日历":
         return {
@@ -683,11 +577,16 @@ def schema_for(template_type: str) -> Dict[str, Any]:
             "major_and_grade": "",
             "teacher": "",
             "total_hours": "",
+            "weekly_hours": "",
             "weeks": "",
+            "lecture_hours": "",
+            "lab_hours": "",
+            "test_hours": "",
+            "extracurricular_hours": "",
             "assessment": "",
             "grade_rule": "",
-            "textbook": [{"name": "", "press": "", "year": ""}],
-            "references": [{"name": "", "press": "", "year": ""}],
+            "textbook": [{"name": "", "publisher": "", "publish_date": "", "awards": ""}],
+            "references": [{"name": "", "publisher": "", "publish_date": ""}],
             "schedule_rows": [
                 {
                     "week": "",
@@ -704,68 +603,76 @@ def schema_for(template_type: str) -> Dict[str, Any]:
     if template_type == "课程大纲":
         return {
             "course_name": "",
-            "course_code": "",
-            "credits": "",
-            "hours_total": "",
-            "hours_theory": "",
-            "hours_practice": "",
-            "course_nature": "",
-            "prerequisites": "",
-            "teaching_objectives": [{"id": "1", "text": "", "support_grad_req": ""}],
-            "content_outline": [{"module": "", "hours": "", "topics": ""}],
-            "assessment": [{"item": "", "weight": "", "notes": ""}],
-            "textbooks": [{"name": "", "press": "", "year": ""}],
-            "references": [{"name": "", "press": "", "year": ""}],
-            "remarks": "",
+            "course_info": {
+                "course_code": "",
+                "credits": "",
+                "hours_total": "",
+                "hours_lecture": "",
+                "hours_experiment": "",
+                "course_type": "",
+                "prerequisites": "",
+            },
+            "objectives": [{"id": "", "description": "", "support_grad_req": ""}],
+            "content_requirements": [{"section": "", "hours": "", "details": ""}],
+            "assessment": {"method": "", "components": [{"item": "", "percentage": "", "details": ""}]},
+            "standards": {"exam": "", "homework": [{"type": "", "criteria": ""}]},
+            "ideological_education": "",
+            "prepared_by": "",
+            "prepared_date": "",
+            "reviewed_by": "",
+            "reviewed_date": "",
+            "college_dean": "",
+            "teaching_college_dean": "",
         }
     if template_type == "授课手册":
         return {
+            "teacher_name": "",
+            "title": "",
+            "department": "",
             "course_name": "",
             "term": "",
-            "class": "",
-            "teacher": "",
-            "weekly_log": [{"date": "", "progress": "", "issues": "", "actions": ""}],
+            "tasks": [{"class": "", "students": ""}],
+            "student_records": [{"class": "", "students": [{"id": "", "name": "", "attendance": "", "homework": "", "test": "", "notes": ""}]}],
+            "teaching_activities": [{"date": "", "content": "", "method": "", "hours": ""}],
             "summary": "",
-            "exam_analysis": "",
-            "improvement": "",
+            "checks": "",
         }
-    if template_type == "达成度评价依据审核表":
+    if template_type == "课程目标达成情况评价依据合理性审核表":
         return {
             "course_name": "",
             "term": "",
-            "evidence_used": {"期末试卷": True, "平时考试": True, "作业": True, "实验": False, "讨论小论文": False},
-            "calc_method": "",
+            "major": "",
+            "class": "",
+            "expected_students": "",
+            "actual_students": "",
+            "evaluation_team": "",
+            "objectives": [{"id": "", "description": "", "support_grad_req": ""}],
+            "evaluation_methods": [{"objective": "", "method": "", "observation": "", "question_type_score": "", "weight": "", "support_explanation": "", "review_opinion": ""}],
+            "evidence": {"final_exam": False, "midterm": False, "quiz": False, "discussion": False, "experiment": False, "homework": False},
+            "calculation_method": "",
             "conclusion": "",
             "review_team": "",
             "review_date": "",
         }
-    if template_type == "达成度评价报告":
+    if template_type == "课程目标达成情况评价报告":
         return {
             "course_name": "",
             "term": "",
-            "threshold": "0.65",
-            "objectives": [{"obj": "1", "support_grad_req": "", "direct_score": "", "self_score": "", "achieved": ""}],
+            "course_type": "",
+            "teacher": "",
+            "evaluation_team": "",
+            "evaluation_date": "",
+            "achievement": [{"objective": "", "support_grad_req": "", "direct_eval": "", "self_eval": "", "overall": "", "achieved": ""}],
             "overall_comment": "",
             "analysis": "",
             "improvements": "",
-            "weakness": "",
-            "next_suggestions": "",
-            "responsible": "",
-            "date": "",
-            "reviewer": "",
-            "review_date": "",
+            "weaknesses": "",
+            "next_cycle_suggestions": "",
         }
-    if template_type == "调查问卷":
-        return {"title": "", "target": "", "questions": [{"q": "", "type": "单选/多选/量表/填空", "options": []}]}
     return {}
-
 def merge_by_schema(schema: Dict[str, Any], obj: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    只保留 schema 里的字段（避免 LLM 返回乱字段导致展示崩）
-    """
     if not isinstance(schema, dict) or not isinstance(obj, dict):
         return obj if obj is not None else schema
-
     out: Dict[str, Any] = {}
     for k, v in schema.items():
         if k in obj:
@@ -777,11 +684,10 @@ def merge_by_schema(schema: Dict[str, Any], obj: Dict[str, Any]) -> Dict[str, An
                 out[k] = obj[k]
         else:
             out[k] = v
-
-    if "warnings" in obj and "warnings" not in out:
-        out["warnings"] = obj["warnings"]
+    for k, v in obj.items():
+        if k not in out:
+            out[k] = v
     return out
-
 def new_doc_object(template_type: str, title: str = "") -> Dict[str, Any]:
     doc_id = uuid.uuid4().hex[:12]
     return {
@@ -796,19 +702,15 @@ def new_doc_object(template_type: str, title: str = "") -> Dict[str, Any]:
         "llm": {"last_prompt": "", "last_raw_response": ""},
         "history": [],
     }
-
-
 # =========================
-# Heuristic extraction (offline baseline)
+# Heuristic extraction (enhanced for all templates)
 # =========================
-
 def heuristic_fill(template_type: str, raw_text: str, raw_tables: List[pd.DataFrame]) -> Dict[str, Any]:
     raw_text = raw_text or ""
     lines = [clean_text(x) for x in raw_text.splitlines() if clean_text(x)]
     data = schema_for(template_type)
     if not data:
         return {}
-
     def find_after(pattern: str, max_ahead: int = 2) -> str:
         pat = re.compile(pattern)
         for i, ln in enumerate(lines):
@@ -817,56 +719,122 @@ def heuristic_fill(template_type: str, raw_text: str, raw_tables: List[pd.DataFr
                     if i + j < len(lines) and lines[i + j]:
                         return lines[i + j]
         return ""
-
     if template_type == "教学日历":
-        schedule: List[Dict[str, Any]] = []
+        data["course_name"] = find_after(r"课程\s*名\s*称|课程名称")
+        data["term"] = find_after(r"学\s*年|学期")
+        data["major_and_grade"] = find_after(r"学生专业及年级|专业名称")
+        data["teacher"] = find_after(r"主讲教师姓名及职称|教师")
+        data["total_hours"] = find_after(r"课程总学时数|总学时")
+        data["weeks"] = find_after(r"本学期上课周数|周数")
+        data["assessment"] = find_after(r"考核方式")
+        data["grade_rule"] = find_after(r"成绩计算方法")
+        # 教材和参考书
+        textbooks = []
+        for ln in lines:
+            if "使用教材" in ln or "教材" in ln:
+                parts = re.split(r"名称|出版社|出版时间|获奖情况", ln)
+                if len(parts) >= 4:
+                    textbooks.append({"name": parts[1], "publisher": parts[2], "publish_date": parts[3], "awards": parts[4] if len(parts) > 4 else ""})
+        data["textbook"] = textbooks
+        # 参考书目类似
+        # 进度表
+        schedule = []
         for df in raw_tables:
             df2 = dataframe_safe(df)
-            header = " ".join([str(c) for c in df2.columns])
-            if ("周次" in header and "课次" in header) or ("教学内容" in header and "周次" in header):
+            cols = " ".join(df2.columns)
+            if all(k in cols for k in ["周次", "课次", "教学内容"]):
                 for _, r in df2.iterrows():
-                    row = {c: str(r[c]) for c in df2.columns}
                     schedule.append({
-                        "week": row.get("周次", ""),
-                        "lesson_no": row.get("课次", ""),
-                        "content": row.get("教学内容（写明章节标题）", row.get("教学内容", "")),
-                        "key_points": row.get("学习重点、教学要求及", row.get("学习重点", "")),
-                        "hours": row.get("学时", ""),
-                        "method": row.get("教学方法", ""),
-                        "others": row.get("其它（作业、习题课、实验等）", row.get("其它", "")),
-                        "support_objective": row.get("支撑教学目标", ""),
+                        "week": r.get("周次", ""),
+                        "lesson_no": r.get("课次", ""),
+                        "content": r.get("教学内容（写明章节标题）", r.get("教学内容", "")),
+                        "key_points": r.get("学习重点、教学要求及", r.get("学习重点", "")),
+                        "hours": r.get("学时", ""),
+                        "method": r.get("教学方法", ""),
+                        "others": r.get("其它（作业、习题课、实验等）", r.get("其它", "")),
+                        "support_objective": r.get("支撑教学目标", ""),
                     })
-        if schedule:
-            data["schedule_rows"] = schedule
-
-        if not data.get("course_name"):
-            data["course_name"] = find_after(r"课程\s*名\s*称|课程名称", 1)
+        data["schedule_rows"] = schedule
         return data
-
     if template_type == "课程大纲":
+        data["course_name"] = find_after(r"课程名称|《")
+        # 目标
         objectives = []
         for ln in lines:
             m = re.match(r"(课程目标|教学目标)\s*([0-9]+)\s*[:：]\s*(.+)", ln)
             if m:
-                objectives.append({"id": m.group(2), "text": m.group(3), "support_grad_req": ""})
-        if objectives:
-            data["teaching_objectives"] = objectives
-        if not data.get("course_name"):
-            for ln in lines[:40]:
-                if "《" in ln and "》" in ln and ("教学大纲" in ln):
-                    m = re.findall(r"《([^》]+)》", ln)
-                    if m:
-                        data["course_name"] = m[0]
-                        break
+                objectives.append({"id": m.group(2), "description": m.group(3), "support_grad_req": ""})
+        data["objectives"] = objectives
+        # 考核
+        assessment = {"method": "", "components": []}
+        for df in raw_tables:
+            if "考核方式" in " ".join(df.columns):
+                assessment["components"] = df.to_dict(orient="records")
+        data["assessment"] = assessment
+        # ... 类似扩展其他字段
         return data
-
+    if template_type == "授课手册":
+        data["course_name"] = find_after(r"课程名称")
+        data["term"] = find_after(r"学年度|学期")
+        # 学生记录和教学活动从表格提取
+        for df in raw_tables:
+            cols = " ".join(df.columns)
+            if "专业班级" in cols or "学生考核记录" in cols:
+                # 提取学生列表
+                data["student_records"] = [{"class": "", "students": df.to_dict(orient="records")}]
+            if "教学活动实施情况" in cols:
+                data["teaching_activities"] = df.to_dict(orient="records")
+        return data
+    if template_type == "课程目标达成情况评价依据合理性审核表":
+        data["course_name"] = find_after(r"课程名称")
+        data["term"] = find_after(r"学\s*期")
+        data["major"] = find_after(r"专业名称")
+        data["class"] = find_after(r"班\s*级")
+        data["expected_students"] = find_after(r"应评价学生数量")
+        data["actual_students"] = find_after(r"实际评价学生数量")
+        data["evaluation_team"] = find_after(r"评价小组教师成员")
+        # 目标
+        objectives = []
+        for ln in lines:
+            if "课程目标" in ln and "毕业要求指标点" in ln:
+                parts = ln.split("毕业要求指标点")
+                objectives.append({"id": parts[0].strip().replace("课程目标", ""), "description": parts[0], "support_grad_req": parts[1] if len(parts) > 1 else ""})
+        data["objectives"] = objectives
+        # 方法表格
+        methods = []
+        for df in raw_tables:
+            if "课程目标" in df.columns[0]:
+                methods = df.to_dict(orient="records")
+        data["evaluation_methods"] = methods
+        # 依据
+        evidence = {}
+        for ln in lines:
+            if "本课程目标达成评价用到的依据" in ln:
+                evidence = {k: "√" in ln for k in ["期末考试试卷", "平时考试试卷", "平时测验", "专题讨论小论文", "课内实验", "作业"]}
+        data["evidence"] = evidence
+        data["calculation_method"] = find_after(r"课程目标达成度计算办法")
+        data["conclusion"] = find_after(r"审核结论")
+        data["review_team"] = find_after(r"审核小组")
+        data["review_date"] = find_after(r"审核时间")
+        return data
+    if template_type == "课程目标达成情况评价报告":
+        data["course_name"] = find_after(r"课程名称")
+        data["term"] = find_after(r"开课学期")
+        data["course_type"] = find_after(r"课程类型")
+        data["teacher"] = find_after(r"任课教师")
+        data["evaluation_team"] = find_after(r"课程评价小组")
+        data["evaluation_date"] = find_after(r"课程评价时间")
+        # 达成情况表格
+        achievement = []
+        for df in raw_tables:
+            if "课程目标" in df.columns[0]:
+                achievement = df.to_dict(orient="records")
+        data["achievement"] = achievement
+        return data
     return data
-
-
 # =========================
-# Training plan base (minimal PDF extractor)
+# Training plan base (minimal PDF extractor + LLM enhance)
 # =========================
-
 def pdf_extract_pages_text(pdf_bytes: bytes) -> List[str]:
     if pdfplumber is None:
         return []
@@ -875,15 +843,13 @@ def pdf_extract_pages_text(pdf_bytes: bytes) -> List[str]:
         for page in pdf.pages:
             pages.append(page.extract_text() or "")
     return pages
-
 def split_sections_from_pages(pages_text: List[str]) -> Dict[str, str]:
     full = "\n".join([t for t in pages_text if t])
     if not full.strip():
         return {}
     full2 = full.replace("\r", "\n")
-
     heads: List[Tuple[str, int]] = []
-    for title in SECTION_TITLES[:6]:
+    for title in SECTION_TITLES:
         parts = title.split("、", 1)
         if len(parts) != 2:
             continue
@@ -891,166 +857,149 @@ def split_sections_from_pages(pages_text: List[str]) -> Dict[str, str]:
         m = re.search(key, full2)
         if m:
             heads.append((title, m.start()))
-
     heads.sort(key=lambda x: x[1])
-
     out: Dict[str, str] = {}
     for i, (h, pos) in enumerate(heads):
         end = heads[i + 1][1] if i + 1 < len(heads) else len(full2)
         out[h] = clean_text(full2[pos:end])
     return out
-
 def base_plan_minimal_from_pdf(pdf_bytes: bytes) -> Dict[str, Any]:
     pages = pdf_extract_pages_text(pdf_bytes)
     sections = split_sections_from_pages(pages)
     return {
         "meta": {"sha256": sha256_bytes(pdf_bytes), "created_at": now_str(), "extractor": "minimal-pdfplumber"},
-        "sections": sections,  # 1-6
+        "sections": sections,
         "appendices": {
             "tables": {
-                "七、专业教学计划表": [],
-                "八、学分统计表": [],
-                "九、教学进程表": [],
-                "十、课程设置对毕业要求支撑关系表": [],
+                title: [] for title in SECTION_TITLES[6:10]
             }
         },
+        "course_graph": {"nodes": [], "edges": []},
         "raw_pages_text": pages,
-        "course_graph": {"nodes": [], "edges": []},  # 11
     }
-
-
 # =========================
-# Consistency checks
+# Consistency checks + linkage (enhanced)
 # =========================
-
+def extract_grad_req_codes(plan: Dict[str, Any]) -> Dict[str, str]:
+    grad_req = plan.get("sections", {}).get("二、毕业要求", "")
+    codes = {}
+    for m in re.finditer(r"(\d+\.\d+)\s*[:：]\s*(.+?)(?=\d+\.\d+|$)", grad_req, re.DOTALL):
+        codes[m.group(1)] = m.group(2).strip()
+    return codes
 def run_consistency_checks(template_type: str, data: Dict[str, Any], plan: Dict[str, Any]) -> List[str]:
     warnings: List[str] = []
-    sections = plan.get("sections", {}) if isinstance(plan, dict) else {}
-
-    if template_type in ("教学日历", "课程大纲", "授课手册", "达成度评价依据审核表", "达成度评价报告"):
-        if not clean_text(str(data.get("course_name", ""))):
-            warnings.append("课程名称为空：建议填写以便后续一致性校验/自动填充。")
-
-    if template_type in ("课程大纲", "达成度评价报告"):
-        grad_req = sections.get("二、毕业要求", "")
-        codes_in_plan = set(re.findall(r"\b\d+\.\d+\b", grad_req)) if grad_req else set()
-        codes_in_doc: set[str] = set()
-
+    grad_codes = extract_grad_req_codes(plan)
+    if template_type in ("课程大纲", "课程目标达成情况评价报告", "课程目标达成情况评价依据合理性审核表"):
+        supp_codes: Set[str] = set()
         if template_type == "课程大纲":
-            for row in data.get("teaching_objectives", []):
-                codes_in_doc |= set(re.findall(r"\b\d+\.\d+\b", str(row.get("support_grad_req", ""))))
-        else:
-            for row in data.get("objectives", []):
-                codes_in_doc |= set(re.findall(r"\b\d+\.\d+\b", str(row.get("support_grad_req", ""))))
-
-        unknown = sorted([c for c in codes_in_doc if c and c not in codes_in_plan])
+            for obj in data.get("objectives", []):
+                supp_codes.update(re.findall(r"\b\d+\.\d+\b", str(obj.get("support_grad_req", ""))))
+        elif template_type == "课程目标达成情况评价报告":
+            for obj in data.get("achievement", []):
+                supp_codes.update(re.findall(r"\b\d+\.\d+\b", str(obj.get("support_grad_req", ""))))
+        elif template_type == "课程目标达成情况评价依据合理性审核表":
+            for obj in data.get("objectives", []):
+                supp_codes.update(re.findall(r"\b\d+\.\d+\b", str(obj.get("support_grad_req", ""))))
+        unknown = [c for c in supp_codes if c not in grad_codes]
         if unknown:
-            warnings.append("发现不在培养方案‘毕业要求’中的支撑码： " + ", ".join(unknown))
-
+            warnings.append(f"未知毕业要求码：{', '.join(unknown)}")
+    # 课程名称一致性（与培养方案核心课程匹配）
+    core_courses = re.findall(r"[\u4e00-\u9fa5]+", plan.get("sections", {}).get("四、主干学科、专业核心课程和主要实践性教学环节", ""))
+    course_name = data.get("course_name", "")
+    if course_name and course_name not in core_courses:
+        warnings.append(f"课程名称 '{course_name}' 未在培养方案核心课程中找到。")
     return warnings
-
-
 # =========================
-# Export (docx/xlsx + project zip)
+# Export (docx/xlsx + project zip) (enhanced for all templates)
 # =========================
-
 def export_docx_for_template(template_type: str, data: Dict[str, Any], title: str) -> bytes:
     sections: List[Tuple[str, str]] = []
     tables: List[Tuple[str, pd.DataFrame]] = []
-
     if template_type == "教学日历":
-        sections = [
-            ("基本信息", "\n".join([
-                f"课程名称：{data.get('course_name','')}",
-                f"学期：{data.get('term','')}",
-                f"专业及年级：{data.get('major_and_grade','')}",
-                f"主讲教师：{data.get('teacher','')}",
-                f"总学时：{data.get('total_hours','')}",
-                f"上课周数：{data.get('weeks','')}",
-                f"考核方式：{data.get('assessment','')}",
-                f"成绩计算方法：{data.get('grade_rule','')}",
-            ])),
-        ]
-        tables = [("教学进度表", pd.DataFrame(data.get("schedule_rows", [])))]
-        return docx_export_simple(title, sections, tables)
-
-    if template_type == "课程大纲":
-        sections = [
-            ("基本信息", "\n".join([
-                f"课程名称：{data.get('course_name','')}",
-                f"课程代码：{data.get('course_code','')}",
-                f"学分：{data.get('credits','')}",
-                f"总学时：{data.get('hours_total','')}",
-                f"理论学时：{data.get('hours_theory','')}",
-                f"实践学时：{data.get('hours_practice','')}",
-                f"课程性质：{data.get('course_nature','')}",
-                f"先修课程：{data.get('prerequisites','')}",
-            ])),
-            ("备注", data.get("remarks", "")),
-        ]
-        tables = [
-            ("课程目标", pd.DataFrame(data.get("teaching_objectives", []))),
-            ("内容大纲", pd.DataFrame(data.get("content_outline", []))),
-            ("考核方式", pd.DataFrame(data.get("assessment", []))),
-        ]
-        return docx_export_simple(title, sections, tables)
-
-    return docx_export_simple(title, [("内容", json.dumps(data, ensure_ascii=False, indent=2))], [])
-
+        sections.append(("课程信息", json.dumps(data["course_info"], ensure_ascii=False)))
+        tables.append(("教材", pd.DataFrame(data.get("textbook", []))))
+        tables.append(("参考书", pd.DataFrame(data.get("references", []))))
+        tables.append(("教学进度", pd.DataFrame(data.get("schedule_rows", []))))
+    elif template_type == "课程大纲":
+        sections.append(("课程基本信息", json.dumps(data["course_info"], ensure_ascii=False)))
+        tables.append(("课程目标", pd.DataFrame(data.get("objectives", []))))
+        tables.append(("教学内容与要求", pd.DataFrame(data.get("content_requirements", []))))
+        tables.append(("课程目标考核", pd.DataFrame(data.get("assessment", {}).get("components", []))))
+        sections.append(("课程思政实施内容", data.get("ideological_education", "")))
+    elif template_type == "授课手册":
+        sections.append(("教学任务", json.dumps(data["tasks"], ensure_ascii=False)))
+        tables.append(("学生考核记录", pd.DataFrame(data.get("student_records", [{}])[0].get("students", []))))
+        tables.append(("教学活动实施情况", pd.DataFrame(data.get("teaching_activities", []))))
+        sections.append(("课程教学情况总结", data.get("summary", "")))
+    elif template_type == "课程目标达成情况评价依据合理性审核表":
+        sections.append(("基本信息", f"课程名称: {data['course_name']}\n学期: {data['term']}等"))
+        tables.append(("课程目标", pd.DataFrame(data.get("objectives", []))))
+        tables.append(("评价方式", pd.DataFrame(data.get("evaluation_methods", []))))
+        sections.append(("依据", json.dumps(data["evidence"], ensure_ascii=False)))
+        sections.append(("计算办法", data["calculation_method"]))
+        sections.append(("审核结论", data["conclusion"]))
+    elif template_type == "课程目标达成情况评价报告":
+        sections.append(("基本信息", f"课程名称: {data['course_name']}\n学期: {data['term']}等"))
+        tables.append(("达成情况", pd.DataFrame(data.get("achievement", []))))
+        sections.append(("总体评论", data["overall_comment"]))
+        sections.append(("分析", data["analysis"]))
+        sections.append(("改进", data["improvements"]))
+    return docx_export_simple(title, sections, tables)
 def export_xlsx_for_template(template_type: str, data: Dict[str, Any]) -> Optional[bytes]:
     sheets: Dict[str, pd.DataFrame] = {}
     if template_type == "教学日历":
-        sheets["教学进度表"] = pd.DataFrame(data.get("schedule_rows", []))
-    if template_type == "课程大纲":
-        sheets["课程目标"] = pd.DataFrame(data.get("teaching_objectives", []))
-        sheets["内容大纲"] = pd.DataFrame(data.get("content_outline", []))
-        sheets["考核方式"] = pd.DataFrame(data.get("assessment", []))
+        sheets["基本信息"] = pd.DataFrame([data])
+        sheets["教材"] = pd.DataFrame(data.get("textbook", []))
+        sheets["参考书"] = pd.DataFrame(data.get("references", []))
+        sheets["教学进度"] = pd.DataFrame(data.get("schedule_rows", []))
+    elif template_type == "课程大纲":
+        sheets["课程目标"] = pd.DataFrame(data.get("objectives", []))
+        sheets["教学内容"] = pd.DataFrame(data.get("content_requirements", []))
+        sheets["考核"] = pd.DataFrame(data.get("assessment", {}).get("components", []))
+    elif template_type == "授课手册":
+        sheets["学生记录"] = pd.DataFrame(data.get("student_records", [{}])[0].get("students", []))
+        sheets["教学活动"] = pd.DataFrame(data.get("teaching_activities", []))
+    elif template_type == "课程目标达成情况评价依据合理性审核表":
+        sheets["课程目标"] = pd.DataFrame(data.get("objectives", []))
+        sheets["评价方式"] = pd.DataFrame(data.get("evaluation_methods", []))
+    elif template_type == "课程目标达成情况评价报告":
+        sheets["达成情况"] = pd.DataFrame(data.get("achievement", []))
     if not sheets:
         return None
     return to_xlsx_bytes(sheets)
-
 def export_project_zip(pid: str) -> bytes:
     prj = load_project(pid)
     plan = load_base_plan(pid)
     docs = list_docs(pid)
-
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w", compression=zipfile.ZIP_DEFLATED) as z:
         if prj:
             z.writestr("project.json", json.dumps(prj.__dict__, ensure_ascii=False, indent=2))
         z.writestr("base_training_plan.json", json.dumps(plan, ensure_ascii=False, indent=2))
-
         for d in docs:
             doc_id = d["doc_id"]
             z.writestr(f"docs/{doc_id}.json", json.dumps(d, ensure_ascii=False, indent=2))
-
             safe_title = re.sub(r"[\\/:*?\"<>|]+", "_", d.get("title", doc_id))
             try:
                 docx_bytes = export_docx_for_template(d["template_type"], d.get("data", {}), d.get("title", doc_id))
                 z.writestr(f"exports/{safe_title}.docx", docx_bytes)
             except Exception as e:
                 z.writestr(f"exports/{safe_title}.docx.ERROR.txt", str(e))
-
             try:
                 x = export_xlsx_for_template(d["template_type"], d.get("data", {}))
                 if x:
                     z.writestr(f"exports/{safe_title}.xlsx", x)
             except Exception as e:
                 z.writestr(f"exports/{safe_title}.xlsx.ERROR.txt", str(e))
-
         ap = assets_dir(pid)
         if ap.exists():
             for fp in ap.glob("*"):
                 if fp.is_file():
                     z.write(fp, arcname=f"assets/{fp.name}")
-
     return buf.getvalue()
-
-
 # =========================
-# UI: editors
+# UI: editors (enhanced for all templates)
 # =========================
-
 def ui_edit_table_of_dicts(title: str, rows: List[Dict[str, Any]], columns: List[str]) -> List[Dict[str, Any]]:
     st.caption(title)
     df = pd.DataFrame(rows or [], columns=columns)
@@ -1061,151 +1010,141 @@ def ui_edit_table_of_dicts(title: str, rows: List[Dict[str, Any]], columns: List
             edited[c] = ""
     edited = edited[columns]
     return edited.to_dict(orient="records")
-
-def ui_render_editor(template_type: str, data: Dict[str, Any]) -> Dict[str, Any]:
+def ui_render_editor(template_type: str, data: Dict[str, Any], plan: Dict[str, Any], llm_cfg: LLMConfig) -> Dict[str, Any]:
     data = merge_by_schema(schema_for(template_type), data or {})
-
+    grad_codes = extract_grad_req_codes(plan)
     if template_type == "教学日历":
         st.markdown("###### 基本信息")
-        c1, c2, c3 = st.columns(3)
-        data["course_name"] = c1.text_input("课程名称", value=data.get("course_name", ""))
-        data["term"] = c2.text_input("学期", value=data.get("term", ""))
-        data["major_and_grade"] = c3.text_input("专业及年级", value=data.get("major_and_grade", ""))
-
-        c4, c5, c6 = st.columns(3)
-        data["teacher"] = c4.text_input("主讲教师", value=data.get("teacher", ""))
-        data["total_hours"] = c5.text_input("总学时", value=data.get("total_hours", ""))
-        data["weeks"] = c6.text_input("上课周数", value=data.get("weeks", ""))
-
-        c7, c8 = st.columns(2)
-        data["assessment"] = c7.text_input("考核方式", value=data.get("assessment", ""))
-        data["grade_rule"] = c8.text_input("成绩计算方法", value=data.get("grade_rule", ""))
-
-        st.markdown("###### 教材 / 参考书")
-        data["textbook"] = ui_edit_table_of_dicts("教材", data.get("textbook", []), ["name", "press", "year"])
-        data["references"] = ui_edit_table_of_dicts("参考书目", data.get("references", []), ["name", "press", "year"])
-
-        st.markdown("###### 教学进度表（可直接编辑）")
-        df = dataframe_safe(pd.DataFrame(data.get("schedule_rows", [])))
-        edited_df = st.data_editor(df, num_rows="dynamic", use_container_width=True)
-        data["schedule_rows"] = edited_df.to_dict(orient="records")
-        return data
-
-    if template_type == "课程大纲":
+        data["course_name"] = st.text_input("课程名称", data["course_name"])
+        data["term"] = st.text_input("学期", data["term"])
+        data["major_and_grade"] = st.text_input("专业及年级", data["major_and_grade"])
+        data["teacher"] = st.text_input("主讲教师", data["teacher"])
+        data["total_hours"] = st.text_input("总学时", data["total_hours"])
+        data["weekly_hours"] = st.text_input("平均每周学时", data["weekly_hours"])
+        data["weeks"] = st.text_input("上课周数", data["weeks"])
+        data["lecture_hours"] = st.text_input("讲课", data["lecture_hours"])
+        data["lab_hours"] = st.text_input("实验等", data["lab_hours"])
+        data["test_hours"] = st.text_input("测验", data["test_hours"])
+        data["extracurricular_hours"] = st.text_input("课外", data["extracurricular_hours"])
+        data["assessment"] = st.text_input("课程性质", data["assessment"])
+        data["grade_rule"] = st.text_input("成绩计算方法", data["grade_rule"])
+        st.markdown("###### 教材/参考书")
+        data["textbook"] = ui_edit_table_of_dicts("教材", data["textbook"], ["name", "publisher", "publish_date", "awards"])
+        data["references"] = ui_edit_table_of_dicts("参考书目", data["references"], ["name", "publisher", "publish_date"])
+        st.markdown("###### 教学进度表")
+        data["schedule_rows"] = ui_edit_table_of_dicts("进度", data["schedule_rows"], ["week", "lesson_no", "content", "key_points", "hours", "method", "others", "support_objective"])
+    elif template_type == "课程大纲":
+        st.markdown("###### 课程基本信息")
+        info = data["course_info"]
+        info["course_code"] = st.text_input("课程代码", info["course_code"])
+        info["credits"] = st.text_input("学分", info["credits"])
+        info["hours_total"] = st.text_input("总学时", info["hours_total"])
+        info["hours_lecture"] = st.text_input("理论学时", info["hours_lecture"])
+        info["hours_experiment"] = st.text_input("实践学时", info["hours_experiment"])
+        info["course_type"] = st.text_input("课程性质", info["course_type"])
+        info["prerequisites"] = st.text_input("先修课程", info["prerequisites"])
+        st.markdown("###### 课程目标及其对毕业要求指标点的支撑")
+        data["objectives"] = ui_edit_table_of_dicts("目标", data["objectives"], ["id", "description", "support_grad_req"])
+        st.caption(f"可用毕业要求码：{', '.join(grad_codes.keys())}")
+        st.markdown("###### 教学内容与要求")
+        data["content_requirements"] = ui_edit_table_of_dicts("内容", data["content_requirements"], ["section", "hours", "details"])
+        st.markdown("###### 课程目标考核")
+        assess = data["assessment"]
+        assess["method"] = st.text_area("考核方式", assess["method"])
+        assess["components"] = ui_edit_table_of_dicts("考核项目", assess["components"], ["item", "percentage", "details"])
+        st.markdown("###### 课程考核标准")
+        data["standards"]["exam"] = st.text_area("考试评分标准", data["standards"]["exam"])
+        data["standards"]["homework"] = ui_edit_table_of_dicts("作业评分标准", data["standards"]["homework"], ["type", "criteria"])
+        data["ideological_education"] = st.text_area("课程思政实施内容", data["ideological_education"])
+        st.markdown("###### 签名")
+        data["prepared_by"] = st.text_input("大纲执笔人", data["prepared_by"])
+        data["prepared_date"] = st.text_input("制定时间", data["prepared_date"])
+        data["reviewed_by"] = st.text_input("审核人", data["reviewed_by"])
+        data["reviewed_date"] = st.text_input("审核时间", data["reviewed_date"])
+        data["college_dean"] = st.text_input("开课学院教学院长", data["college_dean"])
+        data["teaching_college_dean"] = st.text_input("授课学院教学院长", data["teaching_college_dean"])
+    elif template_type == "授课手册":
         st.markdown("###### 基本信息")
-        c1, c2, c3, c4 = st.columns(4)
-        data["course_name"] = c1.text_input("课程名称", value=data.get("course_name", ""))
-        data["course_code"] = c2.text_input("课程代码", value=data.get("course_code", ""))
-        data["credits"] = c3.text_input("学分", value=data.get("credits", ""))
-        data["hours_total"] = c4.text_input("总学时", value=data.get("hours_total", ""))
-
-        c5, c6, c7, c8 = st.columns(4)
-        data["hours_theory"] = c5.text_input("理论学时", value=data.get("hours_theory", ""))
-        data["hours_practice"] = c6.text_input("实践学时", value=data.get("hours_practice", ""))
-        data["course_nature"] = c7.text_input("课程性质", value=data.get("course_nature", ""))
-        data["prerequisites"] = c8.text_input("先修课程", value=data.get("prerequisites", ""))
-
-        st.markdown("###### 课程目标（建议填支撑毕业要求码，如 5.2）")
-        data["teaching_objectives"] = ui_edit_table_of_dicts("课程目标", data.get("teaching_objectives", []), ["id", "text", "support_grad_req"])
-
-        st.markdown("###### 教学内容与学时分配")
-        data["content_outline"] = ui_edit_table_of_dicts("内容大纲", data.get("content_outline", []), ["module", "hours", "topics"])
-
-        st.markdown("###### 考核方式与比例")
-        data["assessment"] = ui_edit_table_of_dicts("考核项", data.get("assessment", []), ["item", "weight", "notes"])
-
-        data["remarks"] = st.text_area("备注", value=data.get("remarks", ""), height=120)
-        return data
-
-    if template_type == "授课手册":
+        data["teacher_name"] = st.text_input("教师姓名", data["teacher_name"])
+        data["title"] = st.text_input("职称", data["title"])
+        data["department"] = st.text_input("开课单位", data["department"])
+        data["course_name"] = st.text_input("课程名称", data["course_name"])
+        data["term"] = st.text_input("学年度学期", data["term"])
+        st.markdown("###### 教学任务")
+        data["tasks"] = ui_edit_table_of_dicts("任务", data["tasks"], ["class", "students"])
+        st.markdown("###### 学生考核记录")
+        for i, rec in enumerate(data["student_records"]):
+            st.caption(f"班级 {i+1}")
+            rec["students"] = ui_edit_table_of_dicts("学生", rec["students"], ["id", "name", "attendance", "homework", "test", "notes"])
+        st.markdown("###### 教学活动实施情况")
+        data["teaching_activities"] = ui_edit_table_of_dicts("活动", data["teaching_activities"], ["date", "content", "method", "hours"])
+        st.markdown("###### 课程教学情况总结")
+        data["summary"] = st.text_area("总结", data["summary"])
+        st.markdown("###### 院系教学检查记载")
+        data["checks"] = st.text_area("检查", data["checks"])
+    elif template_type == "课程目标达成情况评价依据合理性审核表":
         st.markdown("###### 基本信息")
-        c1, c2, c3, c4 = st.columns(4)
-        data["course_name"] = c1.text_input("课程名称", value=data.get("course_name", ""))
-        data["term"] = c2.text_input("学期", value=data.get("term", ""))
-        data["class"] = c3.text_input("班级", value=data.get("class", ""))
-        data["teacher"] = c4.text_input("教师", value=data.get("teacher", ""))
-
-        st.markdown("###### 周记录")
-        data["weekly_log"] = ui_edit_table_of_dicts("周记录", data.get("weekly_log", []), ["date", "progress", "issues", "actions"])
-
-        st.markdown("###### 总结/分析/改进")
-        data["summary"] = st.text_area("课程总结", value=data.get("summary", ""), height=120)
-        data["exam_analysis"] = st.text_area("试卷分析", value=data.get("exam_analysis", ""), height=120)
-        data["improvement"] = st.text_area("改进措施", value=data.get("improvement", ""), height=120)
-        return data
-
-    if template_type == "达成度评价依据审核表":
+        data["course_name"] = st.text_input("课程名称", data["course_name"])
+        data["term"] = st.text_input("学期", data["term"])
+        data["major"] = st.text_input("专业名称", data["major"])
+        data["class"] = st.text_input("班级", data["class"])
+        data["expected_students"] = st.text_input("应评价学生数量", data["expected_students"])
+        data["actual_students"] = st.text_input("实际评价学生数量", data["actual_students"])
+        data["evaluation_team"] = st.text_input("评价小组教师成员", data["evaluation_team"])
+        st.markdown("###### 课程目标")
+        data["objectives"] = ui_edit_table_of_dicts("目标", data["objectives"], ["id", "description", "support_grad_req"])
+        st.caption(f"可用毕业要求码：{', '.join(grad_codes.keys())}")
+        st.markdown("###### 评价方式")
+        data["evaluation_methods"] = ui_edit_table_of_dicts("方式", data["evaluation_methods"], ["objective", "method", "observation", "question_type_score", "weight", "support_explanation", "review_opinion"])
+        st.markdown("###### 依据")
+        ev = data["evidence"]
+        cols = st.columns(len(ev))
+        for i, (k, v) in enumerate(ev.items()):
+            ev[k] = cols[i].checkbox(k, v)
+        st.markdown("###### 计算办法")
+        data["calculation_method"] = st.text_area("计算办法", data["calculation_method"])
+        st.markdown("###### 审核结论")
+        data["conclusion"] = st.text_area("结论", data["conclusion"])
+        data["review_team"] = st.text_input("审核小组", data["review_team"])
+        data["review_date"] = st.text_input("审核时间", data["review_date"])
+    elif template_type == "课程目标达成情况评价报告":
         st.markdown("###### 基本信息")
-        c1, c2 = st.columns(2)
-        data["course_name"] = c1.text_input("课程名称", value=data.get("course_name", ""))
-        data["term"] = c2.text_input("学期", value=data.get("term", ""))
-
-        st.markdown("###### 评价依据")
-        ev = data.get("evidence_used", {})
-        cols = st.columns(5)
-        keys = list(ev.keys()) if isinstance(ev, dict) else ["期末试卷", "平时考试", "作业", "实验", "讨论小论文"]
-        ev2: Dict[str, bool] = {}
-        for i, k in enumerate(keys):
-            ev2[k] = cols[i % 5].checkbox(k, value=bool(ev.get(k, False)))
-        data["evidence_used"] = ev2
-
-        data["calc_method"] = st.text_area("计算方法说明", value=data.get("calc_method", ""), height=120)
-        data["conclusion"] = st.text_area("结论", value=data.get("conclusion", ""), height=100)
-        c3, c4 = st.columns(2)
-        data["review_team"] = c3.text_input("审核小组/人员", value=data.get("review_team", ""))
-        data["review_date"] = c4.text_input("审核日期", value=data.get("review_date", ""))
-        return data
-
-    if template_type == "达成度评价报告":
-        st.markdown("###### 基本信息")
-        c1, c2, c3 = st.columns(3)
-        data["course_name"] = c1.text_input("课程名称", value=data.get("course_name", ""))
-        data["term"] = c2.text_input("学期", value=data.get("term", ""))
-        data["threshold"] = c3.text_input("达成阈值（如0.65）", value=str(data.get("threshold", "0.65")))
-
-        st.markdown("###### 课程目标达成情况（可编辑）")
-        data["objectives"] = ui_edit_table_of_dicts("目标达成", data.get("objectives", []),
-                                                    ["obj", "support_grad_req", "direct_score", "self_score", "achieved"])
-
-        st.markdown("###### 结论与改进")
-        data["overall_comment"] = st.text_area("总体评价", value=data.get("overall_comment", ""), height=100)
-        data["analysis"] = st.text_area("原因分析", value=data.get("analysis", ""), height=120)
-        data["improvements"] = st.text_area("改进措施", value=data.get("improvements", ""), height=120)
-        data["weakness"] = st.text_area("薄弱环节", value=data.get("weakness", ""), height=80)
-        data["next_suggestions"] = st.text_area("下轮建议", value=data.get("next_suggestions", ""), height=100)
-
-        st.markdown("###### 签字")
-        c4, c5, c6, c7 = st.columns(4)
-        data["responsible"] = c4.text_input("负责人", value=data.get("responsible", ""))
-        data["date"] = c5.text_input("日期", value=data.get("date", ""))
-        data["reviewer"] = c6.text_input("审核人", value=data.get("reviewer", ""))
-        data["review_date"] = c7.text_input("审核日期", value=data.get("review_date", ""))
-        return data
-
-    if template_type == "调查问卷":
-        st.markdown("###### 基本信息")
-        c1, c2 = st.columns(2)
-        data["title"] = c1.text_input("问卷标题", value=data.get("title", ""))
-        data["target"] = c2.text_input("调查对象", value=data.get("target", ""))
-        st.markdown("###### 题目列表（可编辑）")
-        data["questions"] = ui_edit_table_of_dicts("题目", data.get("questions", []), ["q", "type", "options"])
-        return data
-
-    st.json(data)
+        data["course_name"] = st.text_input("课程名称", data["course_name"])
+        data["term"] = st.text_input("开课学期", data["term"])
+        data["course_type"] = st.text_input("课程类型", data["course_type"])
+        data["teacher"] = st.text_input("任课教师", data["teacher"])
+        data["evaluation_team"] = st.text_input("课程评价小组", data["evaluation_team"])
+        data["evaluation_date"] = st.text_input("课程评价时间", data["evaluation_date"])
+        st.markdown("###### 达成情况")
+        data["achievement"] = ui_edit_table_of_dicts("达成", data["achievement"], ["objective", "support_grad_req", "direct_eval", "self_eval", "overall", "achieved"])
+        st.caption(f"可用毕业要求码：{', '.join(grad_codes.keys())}")
+        # LLM 帮助撰写
+        if llm_available(llm_cfg):
+            if st.button("LLM帮助撰写报告部分"):
+                context = json.dumps(data, ensure_ascii=False)
+                section = st.selectbox("选择部分", ["overall_comment", "analysis", "improvements", "weaknesses", "next_cycle_suggestions"])
+                hints = st.text_input("额外提示")
+                if st.button("生成"):
+                    resp = llm_help_write(llm_cfg, context, section, hints)
+                    data[section] = resp
+                    st.text_area("生成内容", resp)
+                    st.rerun()
+        st.markdown("###### 总体评论")
+        data["overall_comment"] = st.text_area("总体评论", data["overall_comment"])
+        st.markdown("###### 原因分析")
+        data["analysis"] = st.text_area("分析", data["analysis"])
+        st.markdown("###### 改进措施")
+        data["improvements"] = st.text_area("改进", data["improvements"])
+        st.markdown("###### 薄弱环节")
+        data["weaknesses"] = st.text_area("薄弱", data["weaknesses"])
+        st.markdown("###### 下轮建议")
+        data["next_cycle_suggestions"] = st.text_area("建议", data["next_cycle_suggestions"])
     return data
-
-
 # =========================
 # Sidebar: LLM
 # =========================
 
 def ui_llm_sidebar(project_obj=None) -> LLMConfig:
-    """
-    侧边栏 LLM 配置（支持：自动/仅后台/仅页面/合并(页面优先)）
-    - Provider 选择后：自动联动 Base URL/Model（自动填充或下拉可选）
-    - 不建议把 api_key 保存进项目；仅保存除 key 外的默认配置
-    """
-
     st.sidebar.markdown("---")
     st.sidebar.markdown("### LLM（可选：用于校对/修正/补全）")
 
@@ -1216,9 +1155,7 @@ def ui_llm_sidebar(project_obj=None) -> LLMConfig:
 
     ui_defaults = {**backend, **prj_llm}
 
-    # -----------------------------
-    # session_state keys
-    # -----------------------------
+    # ---- stable keys ----
     K_MODE = "llm_cfg_mode"
     K_PRESET = "llm_preset_name"
     K_PROVIDER = "llm_provider"
@@ -1243,10 +1180,11 @@ def ui_llm_sidebar(project_obj=None) -> LLMConfig:
 
         st.session_state.setdefault(K_MODE, "自动(推荐)")
         st.session_state.setdefault(K_PRESET, list(PROVIDER_PRESETS.keys())[0] if PROVIDER_PRESETS else "OpenAI / OpenAI兼容（通用）")
+
         st.session_state.setdefault(K_ENABLED, bool(ui_defaults.get("enabled", False)))
         st.session_state.setdefault(K_APIKEY, str(ui_defaults.get("api_key", "")))
-
         st.session_state.setdefault(K_PROVIDER, str(ui_defaults.get("provider", "openai_compat")))
+
         st.session_state.setdefault(K_BASE_CUSTOM, str(ui_defaults.get("base_url", "")))
         st.session_state.setdefault(K_MODEL_CUSTOM, str(ui_defaults.get("model", "")))
         st.session_state.setdefault(K_ENDPOINT, str(ui_defaults.get("endpoint_url", "")))
@@ -1259,72 +1197,54 @@ def ui_llm_sidebar(project_obj=None) -> LLMConfig:
         st.session_state.setdefault(K_EHEAD, str(ui_defaults.get("extra_headers_json", "")))
         st.session_state.setdefault(K_EPARM, str(ui_defaults.get("extra_params_json", "")))
 
+        # pickers default
         st.session_state.setdefault(K_BASE_PICK, "自定义…")
         st.session_state.setdefault(K_MODEL_PICK, "自定义…")
 
     _init_once()
 
-    # -----------------------------
-    # helpers
-    # -----------------------------
-    def _preset_base_urls(preset: dict) -> List[str]:
-        # ✅ 兼容：base_urls(list) 或 default_base_url(str)
-        arr = preset.get("base_urls")
-        out: List[str] = []
-        if isinstance(arr, list):
-            out += [str(x).strip() for x in arr if str(x).strip()]
-        if not out:
+    def _preset_options(preset: dict, field: str) -> list[str]:
+        if field == "base_urls":
+            arr = preset.get("base_urls")
+            if isinstance(arr, list) and arr:
+                return [str(x) for x in arr if str(x).strip()]
             d = str(preset.get("default_base_url", "")).strip()
             if d:
-                out.append(d)
-        return out
-
-    def _preset_models(preset: dict) -> List[str]:
+                return [d]
+            hint = str(preset.get("base_url_hint", "")).strip()
+            return [f"（参考）{hint}"] if hint else []
         arr = preset.get("models")
-        out: List[str] = []
-        if isinstance(arr, list):
-            out += [str(x).strip() for x in arr if str(x).strip()]
-        if not out:
-            d = str(preset.get("default_model", "")).strip()
-            if d:
-                out.append(d)
-        return out
+        if isinstance(arr, list) and arr:
+            return [str(x) for x in arr if str(x).strip()]
+        hint = str(preset.get("model_hint", "")).strip()
+        return [f"（参考）{hint}"] if hint else []
 
     def _apply_preset_defaults(preset_name: str):
         preset = PROVIDER_PRESETS.get(preset_name, {})
         provider = preset.get("provider", "openai_compat")
         st.session_state[K_PROVIDER] = provider
 
-        base_opts = _preset_base_urls(preset)
-        model_opts = _preset_models(preset)
-
-        # ✅ 只在“用户还没填过”的情况下自动填，避免覆盖手工输入
-        if base_opts and not st.session_state.get(K_BASE_CUSTOM, "").strip():
-            st.session_state[K_BASE_CUSTOM] = base_opts[0]
+        base_opts = _preset_options(preset, "base_urls")
+        if base_opts and not str(base_opts[0]).startswith("（参考）"):
             st.session_state[K_BASE_PICK] = base_opts[0]
-        elif base_opts:
+            st.session_state[K_BASE_CUSTOM] = base_opts[0]
+        else:
             st.session_state[K_BASE_PICK] = "自定义…"
 
-        if model_opts and not st.session_state.get(K_MODEL_CUSTOM, "").strip():
-            st.session_state[K_MODEL_CUSTOM] = model_opts[0]
+        model_opts = _preset_options(preset, "models")
+        if model_opts and not str(model_opts[0]).startswith("（参考）"):
             st.session_state[K_MODEL_PICK] = model_opts[0]
-        elif model_opts:
+            st.session_state[K_MODEL_CUSTOM] = model_opts[0]
+        else:
             st.session_state[K_MODEL_PICK] = "自定义…"
 
-        # endpoint 默认值
         if provider == "anthropic" and not st.session_state.get(K_ENDPOINT, "").strip():
-            st.session_state[K_ENDPOINT] = preset.get("default_endpoint_url", "https://api.anthropic.com/v1/messages")
-        if provider == "gemini" and not st.session_state.get(K_ENDPOINT, "").strip():
-            st.session_state[K_ENDPOINT] = preset.get("default_endpoint_url", "")
+            st.session_state[K_ENDPOINT] = "https://api.anthropic.com/v1/messages"
 
-    # -----------------------------
-    # UI
-    # -----------------------------
-    mode = st.sidebar.selectbox(
-        "配置来源",
-        ["自动(推荐)", "仅后台", "仅页面", "合并(页面优先)"],
-        key=K_MODE,
-    )
+        if provider == "gemini" and not st.session_state.get(K_ENDPOINT, "").strip():
+            st.session_state[K_ENDPOINT] = ""
+
+    mode = st.sidebar.selectbox("配置来源", ["自动(推荐)", "仅后台", "仅页面", "合并(页面优先)"], key=K_MODE)
 
     preset_name = st.sidebar.selectbox(
         "Provider 选择",
@@ -1332,43 +1252,30 @@ def ui_llm_sidebar(project_obj=None) -> LLMConfig:
         key=K_PRESET,
         on_change=lambda: _apply_preset_defaults(st.session_state[K_PRESET]),
     )
+
     preset = PROVIDER_PRESETS.get(preset_name, {})
     provider = st.session_state.get(K_PROVIDER, preset.get("provider", "openai_compat"))
 
     enabled = st.sidebar.checkbox("启用 LLM 校对与修正", key=K_ENABLED)
     st.sidebar.caption(f"当前 Provider：`{provider}`")
 
-    # Model
-    model_opts = _preset_models(preset)
+    model_opts = _preset_options(preset, "models")
     model_pick_list = (model_opts + ["自定义…"]) if model_opts else ["自定义…"]
     model_pick = st.sidebar.selectbox("Model（可选）", model_pick_list, key=K_MODEL_PICK)
-
-    if model_pick == "自定义…":
-        model_custom = st.sidebar.text_input(
-            "Model（自定义输入）",
-            key=K_MODEL_CUSTOM,
-            help=preset.get("model_hint", ""),
-        )
+    if model_pick == "自定义…" or str(model_pick).startswith("（参考）"):
+        model_custom = st.sidebar.text_input("Model（自定义输入）", key=K_MODEL_CUSTOM, help=preset.get("model_hint", ""))
         model_final = model_custom.strip()
     else:
         model_final = str(model_pick).strip()
-        st.session_state[K_MODEL_CUSTOM] = model_final  # ✅ 同步到 custom，方便后续 merge
 
-    # Base URL
-    base_opts = _preset_base_urls(preset)
+    base_opts = _preset_options(preset, "base_urls")
     base_pick_list = (base_opts + ["自定义…"]) if base_opts else ["自定义…"]
     base_pick = st.sidebar.selectbox("Base URL（可选）", base_pick_list, key=K_BASE_PICK)
-
-    if base_pick == "自定义…":
-        base_custom = st.sidebar.text_input(
-            "Base URL（自定义输入）",
-            key=K_BASE_CUSTOM,
-            help=preset.get("base_url_hint", ""),
-        )
+    if base_pick == "自定义…" or str(base_pick).startswith("（参考）"):
+        base_custom = st.sidebar.text_input("Base URL（自定义输入）", key=K_BASE_CUSTOM, help=preset.get("base_url_hint", ""))
         base_final = base_custom.strip()
     else:
         base_final = str(base_pick).strip()
-        st.session_state[K_BASE_CUSTOM] = base_final  # ✅ 同步到 custom，方便后续 merge
 
     api_key = st.sidebar.text_input("API Key", key=K_APIKEY, type="password")
 
@@ -1380,11 +1287,7 @@ def ui_llm_sidebar(project_obj=None) -> LLMConfig:
 
     api_version = ""
     if provider == "anthropic":
-        api_version = st.sidebar.text_input(
-            "Anthropic-Version（可选）",
-            key=K_API_VER,
-            help="不确定就留空。不同网关可能要求不同版本字符串。",
-        )
+        api_version = st.sidebar.text_input("Anthropic-Version（可选）", key=K_API_VER, help="不确定就留空。")
     else:
         api_version = st.session_state.get(K_API_VER, "")
 
@@ -1392,18 +1295,8 @@ def ui_llm_sidebar(project_obj=None) -> LLMConfig:
     temperature = st.sidebar.slider("temperature", 0.0, 1.5, key=K_TEMP)
     max_tokens = st.sidebar.slider("max_tokens", 256, 8192, key=K_MAXTOK, step=256)
 
-    extra_headers_json = st.sidebar.text_area(
-        "额外 Headers（JSON，可选）",
-        key=K_EHEAD,
-        help='例如：{"X-Org":"xxx"}；自定义REST很常用。',
-        height=80,
-    )
-    extra_params_json = st.sidebar.text_area(
-        "额外 Params（JSON，可选）",
-        key=K_EPARM,
-        help='例如：{"top_p":0.9} 或覆盖payload结构；自定义REST很常用。',
-        height=80,
-    )
+    extra_headers_json = st.sidebar.text_area("额外 Headers（JSON，可选）", key=K_EHEAD, height=80)
+    extra_params_json = st.sidebar.text_area("额外 Params（JSON，可选）", key=K_EPARM, height=80)
 
     ui_cfg = dict(
         enabled=bool(enabled),
@@ -1420,13 +1313,13 @@ def ui_llm_sidebar(project_obj=None) -> LLMConfig:
         api_version=str(api_version),
     )
 
-    # merge strategy
     if mode == "仅后台":
         merged = dict(backend)
     elif mode == "仅页面":
         merged = dict(ui_cfg)
     else:
         merged = dict(backend)
+        # 页面优先：但字符串为空则不覆盖，避免“清空后台配置”
         for k, v in ui_cfg.items():
             if k == "enabled":
                 merged[k] = bool(v)
@@ -1439,22 +1332,18 @@ def ui_llm_sidebar(project_obj=None) -> LLMConfig:
 
     llm_cfg = LLMConfig(**merged)
 
-    # save to project (without key)
     if project_obj is not None:
         st.sidebar.markdown("---")
         if st.sidebar.button("保存为本项目默认（不含Key）", use_container_width=True):
             safe = dict(merged)
             safe["api_key"] = ""
-            try:
-                project_obj.llm = safe
-                save_project(project_obj)
-                st.sidebar.success("已保存（Key未写入项目）。")
-            except Exception as e:
-                st.sidebar.error(f"保存失败：{e}")
+            project_obj.llm = safe
+            save_project(project_obj)
+            st.sidebar.success("已保存（Key未写入项目）。")
 
     return llm_cfg
 
-
+    
 # =========================
 # Sidebar / Pages
 # =========================
@@ -1464,7 +1353,6 @@ def ui_project_sidebar() -> Tuple[Project, LLMConfig]:
     st.sidebar.caption(APP_VERSION)
 
     projects = list_projects()
-
     if not projects:
         pid = uuid.uuid4().hex[:10]
         prj = Project(project_id=pid, name=f"默认项目-{dt.datetime.now().strftime('%Y%m%d-%H%M')}")
@@ -1473,7 +1361,6 @@ def ui_project_sidebar() -> Tuple[Project, LLMConfig]:
         st.session_state["active_project_id"] = pid
 
     names = ["➕ 新建项目"] + [f"{p.name}  ({p.project_id})" for p in projects]
-
     default_index = 1
     active_id = st.session_state.get("active_project_id")
     if active_id:
@@ -1483,7 +1370,6 @@ def ui_project_sidebar() -> Tuple[Project, LLMConfig]:
                 break
 
     choice = st.sidebar.selectbox("项目", names, index=default_index, key="project_choice")
-
     if choice.startswith("➕"):
         with st.sidebar.expander("新建项目", expanded=True):
             new_name = st.text_input("项目名称", value=f"项目-{dt.datetime.now().strftime('%Y%m%d-%H%M')}")
@@ -1493,7 +1379,6 @@ def ui_project_sidebar() -> Tuple[Project, LLMConfig]:
                 save_project(prj)
                 st.session_state["active_project_id"] = pid
                 st.rerun()
-
         active = load_project(st.session_state.get("active_project_id", projects[0].project_id)) or projects[0]
     else:
         pid = choice.split("(")[-1].strip(")")
@@ -1504,7 +1389,6 @@ def ui_project_sidebar() -> Tuple[Project, LLMConfig]:
 
     st.sidebar.markdown("---")
     st.sidebar.markdown("#### 项目 Logo（可选）")
-
     logo_up = st.sidebar.file_uploader("上传 Logo（PNG/SVG）", type=["png", "svg"], key="logo_uploader")
     if logo_up is not None:
         b = logo_up.read()
@@ -1517,7 +1401,6 @@ def ui_project_sidebar() -> Tuple[Project, LLMConfig]:
         st.rerun()
 
     if active.logo_file:
-        st.sidebar.caption(f"当前：{active.logo_file}")
         if st.sidebar.button("清除项目 Logo", use_container_width=True):
             active.logo_file = ""
             save_project(active)
@@ -1539,107 +1422,77 @@ def ui_project_sidebar() -> Tuple[Project, LLMConfig]:
     return active, llm_cfg
 
 
-# =========================
-# Header Logo (稳定渲染：components.html + data-uri img)
-# =========================
-
 def default_logo_svg(size: int = 44) -> str:
     return f"""
-<svg width="{size}" height="{size}" viewBox="0 0 64 64" fill="none"
-     xmlns="http://www.w3.org/2000/svg" aria-label="logo">
-  <defs>
-    <linearGradient id="g" x1="0" y1="0" x2="64" y2="64">
-      <stop offset="0" stop-color="#3B82F6"/>
-      <stop offset="1" stop-color="#6366F1"/>
-    </linearGradient>
-  </defs>
-  <circle cx="32" cy="32" r="30" fill="url(#g)" opacity="0.95"/>
-  <path d="M20 22c6-4 18-4 24 0v22c-6-4-18-4-24 0V22z" fill="white" opacity="0.95"/>
-  <path d="M20 22c6 4 18 4 24 0" stroke="#E5E7EB" stroke-width="2" opacity="0.9"/>
-  <circle cx="28" cy="30" r="2.6" fill="#111827" opacity="0.85"/>
-  <circle cx="36" cy="28" r="2.6" fill="#111827" opacity="0.85"/>
-  <circle cx="40" cy="34" r="2.6" fill="#111827" opacity="0.85"/>
-  <path d="M28 30L36 28L40 34L28 30" stroke="#111827" stroke-width="2" opacity="0.7"/>
-</svg>
-""".strip()
+    <svg width="{size}" height="{size}" viewBox="0 0 64 64" fill="none"
+         xmlns="http://www.w3.org/2000/svg" aria-label="logo">
+      <defs>
+        <linearGradient id="g" x1="0" y1="0" x2="64" y2="64">
+          <stop offset="0" stop-color="#3B82F6"/>
+          <stop offset="1" stop-color="#6366F1"/>
+        </linearGradient>
+      </defs>
+      <circle cx="32" cy="32" r="30" fill="url(#g)" opacity="0.95"/>
+      <path d="M20 22c6-4 18-4 24 0v22c-6-4-18-4-24 0V22z"
+            fill="white" opacity="0.95"/>
+      <path d="M20 22c6 4 18 4 24 0" stroke="#E5E7EB" stroke-width="2" opacity="0.9"/>
+      <circle cx="28" cy="30" r="2.6" fill="#111827" opacity="0.85"/>
+      <circle cx="36" cy="28" r="2.6" fill="#111827" opacity="0.85"/>
+      <circle cx="40" cy="34" r="2.6" fill="#111827" opacity="0.85"/>
+      <path d="M28 30L36 28L40 34L28 30" stroke="#111827" stroke-width="2" opacity="0.7"/>
+    </svg>
+    """
 
-def _data_uri_for_logo(prj: Project) -> str:
-    import base64
-    # default
-    svg = default_logo_svg(44).encode("utf-8")
-    default_uri = "data:image/svg+xml;base64," + base64.b64encode(svg).decode("utf-8")
 
+def ui_header(prj: Project):
+    logo_html = default_logo_svg(44)
     try:
         if getattr(prj, "logo_file", ""):
             fp = assets_dir(prj.project_id) / prj.logo_file
             if fp.exists():
                 ext = fp.suffix.lower()
-                b = fp.read_bytes()
                 if ext == ".svg":
-                    return "data:image/svg+xml;base64," + base64.b64encode(b).decode("utf-8")
-                if ext == ".png":
-                    return "data:image/png;base64," + base64.b64encode(b).decode("utf-8")
+                    logo_html = fp.read_text("utf-8")
+                elif ext == ".png":
+                    import base64
+                    b64 = base64.b64encode(fp.read_bytes()).decode("utf-8")
+                    logo_html = f"<img src='data:image/png;base64,{b64}' style='width:44px;height:44px;border-radius:12px;'/>"
     except Exception:
         pass
-    return default_uri
 
-def ui_header(prj: Project):
-    # ✅ 用 components.html 渲染，避免 st.markdown 对 SVG/复杂 HTML 的不稳定
-    logo_src = _data_uri_for_logo(prj)
-    html = f"""
-<div style="padding:14px 16px;border-radius:16px;
-            background:linear-gradient(90deg,#f7f8ff 0%,#f8fbff 100%);
-            border:1px solid #eef;">
-  <div style="display:flex;align-items:center;gap:12px;">
-    <img src="{logo_src}" style="width:44px;height:44px;border-radius:12px;flex:0 0 auto;" />
-    <div>
-      <div style="font-size:28px;font-weight:800;">教学文件工作台</div>
-      <div style="margin-top:6px;color:#666;">
-        项目：<b>{prj.name}</b>（{prj.project_id}） · 最后更新：{prj.updated_at}
-      </div>
-    </div>
-  </div>
-</div>
-"""
-    st.components.v1.html(html, height=92)
+    st.markdown(
+        f"""
+        <div style="padding: 14px 16px; border-radius: 16px;
+                    background: linear-gradient(90deg, #f7f8ff 0%, #f8fbff 100%);
+                    border: 1px solid #eef;">
+          <div style="display:flex; align-items:center; gap:12px;">
+            <div style="width:44px;height:44px; display:flex; align-items:center; justify-content:center;">
+              {logo_html}
+            </div>
+            <div>
+              <div style="font-size: 28px; font-weight: 800;">教学文件工作台</div>
+              <div style="margin-top: 6px; color: #666;">
+                项目：<b>{prj.name}</b>（{prj.project_id}） · 最后更新：{prj.updated_at}
+              </div>
+            </div>
+          </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
     st.write("")
 
 
+    
+    
+    
+    
 # =========================
-# Page: Base training plan
+# Page: Base training plan (enhanced with LLM for tables/graph)
 # =========================
-
-def _graph_to_dot(g: Dict[str, Any]) -> str:
-    nodes = g.get("nodes", []) if isinstance(g, dict) else []
-    edges = g.get("edges", []) if isinstance(g, dict) else []
-    lines = ["digraph G {", "rankdir=LR;", 'node [shape=box, style="rounded"];']
-    for n in nodes:
-        if not isinstance(n, dict):
-            continue
-        nid = str(n.get("id", "")).strip() or str(n.get("name", "")).strip()
-        label = str(n.get("label", "") or n.get("name", nid))
-        if nid:
-            label = label.replace('"', '\\"')
-            lines.append(f'"{nid}" [label="{label}"];')
-    for e in edges:
-        if not isinstance(e, dict):
-            continue
-        a = str(e.get("from", "")).strip()
-        b = str(e.get("to", "")).strip()
-        lab = str(e.get("label", "")).strip()
-        if a and b:
-            lab = lab.replace('"', '\\"')
-            if lab:
-                lines.append(f'"{a}" -> "{b}" [label="{lab}"];')
-            else:
-                lines.append(f'"{a}" -> "{b}";')
-    lines.append("}")
-    return "\n".join(lines)
-
 def ui_base_training_plan(pid: str, llm_cfg: LLMConfig):
     st.subheader("培养方案基座（全量内容库）")
     st.caption("先把培养方案整理成权威内容库；后续所有教学文件将以此做一致性校验与自动填充。")
-
     plan = load_base_plan(pid) or {
         "meta": {},
         "sections": {},
@@ -1652,6 +1505,18 @@ def ui_base_training_plan(pid: str, llm_cfg: LLMConfig):
         "course_graph": {"nodes": [], "edges": []},
         "raw_pages_text": [],
     }
+    # 添加 LLM 增强表格抽取
+    if llm_available(llm_cfg):
+        if st.button("用LLM从原文重建表格（7-10）"):
+            for title in SECTION_TITLES[6:10]:
+                text = plan["sections"].get(title, "")
+                system = f"从文本抽取表格数据，输出JSON: {{rows: [[]]}}"
+                user = text
+                obj, _ = llm_chat_json(llm_cfg, system, user)
+                if obj and "rows" in obj:
+                    plan["appendices"]["tables"][title] = obj["rows"]
+            save_base_plan(pid, plan)
+            st.rerun()
 
     colL, colR = st.columns([1, 2])
 
@@ -1668,8 +1533,8 @@ def ui_base_training_plan(pid: str, llm_cfg: LLMConfig):
 
         st.write("")
         json_download_button("下载基座JSON", plan, f"base_training_plan-{pid}.json", key="dl_base_plan_json")
-
         st.write("")
+
         if st.button("检查：是否缺少关键栏目(1-6)", use_container_width=True, key="btn_check_plan_missing"):
             missing = [t for t in SECTION_TITLES[:6] if not clean_text(plan.get("sections", {}).get(t, ""))]
             if missing:
@@ -1697,6 +1562,7 @@ def ui_base_training_plan(pid: str, llm_cfg: LLMConfig):
 
         tabs = st.tabs(SECTION_TITLES)
 
+        # 1-6 核心栏目
         for i, title in enumerate(SECTION_TITLES[:6]):
             with tabs[i]:
                 sections[title] = st.text_area(title, value=sections.get(title, ""), height=260, key=f"plan_text_{i}")
@@ -1722,6 +1588,7 @@ def ui_base_training_plan(pid: str, llm_cfg: LLMConfig):
                             st.error("LLM未返回可用JSON。")
                             st.code(raw)
 
+        # 7-10 表格栏目
         for j, title in enumerate(SECTION_TITLES[6:10], start=6):
             with tabs[j]:
                 st.caption("表格栏目：先提供可编辑模板（行可增删）。后续可接入 PDF 表格抽取/LLM重建自动填充。")
@@ -1732,16 +1599,15 @@ def ui_base_training_plan(pid: str, llm_cfg: LLMConfig):
                 edited_df = st.data_editor(df, num_rows="dynamic", use_container_width=True, key=f"plan_tbl_{j}")
                 append_tables[title] = edited_df.to_dict(orient="records")
 
+        # 11 逻辑图
         with tabs[10]:
             st.caption("关系图：用 nodes/edges 表达课程之间的先修/支撑/并行关系。")
             colA, colB = st.columns(2)
-
             with colA:
                 st.markdown("**Nodes**（建议字段：id / name / label）")
                 nodes_df = dataframe_safe(pd.DataFrame(graph.get("nodes", [])))
                 nodes_df = st.data_editor(nodes_df, num_rows="dynamic", use_container_width=True, key="graph_nodes_editor")
                 graph["nodes"] = nodes_df.to_dict(orient="records")
-
             with colB:
                 st.markdown("**Edges**（建议字段：from / to / label）")
                 edges_df = dataframe_safe(pd.DataFrame(graph.get("edges", [])))
@@ -1758,9 +1624,9 @@ def ui_base_training_plan(pid: str, llm_cfg: LLMConfig):
                 with st.expander("LLM：根据文本生成/完善关系图（可选）", expanded=False):
                     hint = st.text_area("补充要求（可选）", value="尽量不要编造；优先从课程表/课程名中抽取；给出nodes/edges。", height=80)
                     if st.button("用LLM生成/完善关系图", key="btn_llm_graph_build"):
-                        system = "你是培养方案课程关系图构建助手。根据输入文本，输出JSON：{nodes:[...], edges:[...] }。只输出JSON。"
+                        system = "你是培养方案课程关系图构建助手。根据输入文本，输出JSON：{nodes:[...], edges:[...]}。只输出JSON。"
                         schema_hint = json.dumps({"nodes":[{"id":"", "name":"", "label":""}], "edges":[{"from":"","to":"","label":""}], "warnings":[]}, ensure_ascii=False, indent=2)
-                        user = f"培养方案关键文本（可能含课程列表/先修关系/课程体系）：\n{sections.get('四、主干学科、专业核心课程和主要实践性教学环节','')}\n\n补充要求：{hint}"
+                        user = f"培养方案关键文本：\n{sections.get('四、主干学科、专业核心课程和主要实践性教学环节','')}\n\n补充要求：{hint}"
                         obj, raw = llm_chat_json(llm_cfg, system, user, schema_hint=schema_hint)
                         if obj and isinstance(obj, dict) and "nodes" in obj and "edges" in obj:
                             graph["nodes"] = obj.get("nodes", [])
@@ -1784,39 +1650,45 @@ def ui_base_training_plan(pid: str, llm_cfg: LLMConfig):
             st.success("已保存。")
 
 
-# =========================
-# Page: Templates
-# =========================
 
+
+
+
+
+
+# =========================
+# Page: Templates (enhanced with linkage/LLM eval/suggest)
+# =========================
 def ui_templates(pid: str, llm_cfg: LLMConfig):
     st.subheader("模板化教学文件（上传/粘贴 → 抽取填充 → 校对 → 导出）")
     st.caption("把易模式化文件做成固定模板；上传现有文档后抽取填充，人工确认后导出规范文档，并项目化保存/打包。")
+    plan = load_base_plan(pid)
+    # (上传/填充部分保持)
+    # 在编辑器中传递 plan 和 llm_cfg
+    edited = ui_render_editor(doc_obj["template_type"], doc_obj.get("data", {}), plan, llm_cfg)
+    warnings = run_consistency_checks(doc_obj["template_type"], edited, plan)
+    if warnings:
+        st.warning("\n".join(warnings))
+    if llm_available(llm_cfg):
+        if st.button("LLM评价与建议"):
+            context = json.dumps(edited, ensure_ascii=False)
+            obj, raw = llm_evaluate_suggest(llm_cfg, context, doc_obj["template_type"])
+            if obj:
+                st.json(obj)
+            else:
+                st.error(raw)
 
-    # ✅ 读取当前 active_doc，用于左侧模板类型联动右侧编辑器
-    cur_doc_id = st.session_state.get("active_doc_id")
-    cur_doc_obj: Optional[Dict[str, Any]] = None
-    if cur_doc_id:
-        fp = doc_path(pid, cur_doc_id)
-        if fp.exists():
-            cur_doc_obj = safe_json_load(fp.read_text("utf-8"), {})
 
-    # 如果正在编辑某个文档，把左侧“模板类型”默认同步成该文档类型（避免你截图中的“左变右不变”）
-    if cur_doc_obj and isinstance(cur_doc_obj, dict) and cur_doc_obj.get("template_type"):
-        st.session_state["new_ttype"] = cur_doc_obj["template_type"]
 
     colL, colR = st.columns([1.1, 1.9])
 
     with colL:
-        st.markdown("##### 新建/切换文档")
-        ttype = st.selectbox("模板类型（会联动右侧编辑器）", TEMPLATE_TYPES, key="new_ttype")
+        st.markdown("##### 新建文档")
+        ttype = st.selectbox("模板类型", TEMPLATE_TYPES, key="new_ttype")
         title = st.text_input("文档标题（项目内）", value="", key="new_title")
 
-        # ✅ 如果当前有 active_doc，则切换模板类型直接改当前文档（联动）
-        if cur_doc_obj and ttype != cur_doc_obj.get("template_type"):
-            cur_doc_obj["history"].append({"at": now_str(), "action": "change_template_type(from_left)", "data": cur_doc_obj.get("data", {})})
-            cur_doc_obj["template_type"] = ttype
-            cur_doc_obj["data"] = merge_by_schema(schema_for(ttype), cur_doc_obj.get("data", {}))
-            save_doc(pid, cur_doc_obj)
+        if st.button("进入草稿预览（右侧按当前模板显示）", use_container_width=True, key="btn_enter_draft"):
+            st.session_state["active_doc_id"] = None
             st.rerun()
 
         if st.button("新建文档", type="primary", use_container_width=True, key="btn_new_doc"):
@@ -1848,6 +1720,7 @@ def ui_templates(pid: str, llm_cfg: LLMConfig):
                         src_text, src_tables = docx_extract_text_tables(b)
                         doc_obj["source"]["uploaded_filename"] = up.name
                         doc_obj["source"]["sha256"] = sha256_bytes(b)
+
                     if pasted.strip():
                         src_text = (src_text + "\n" + pasted).strip()
 
@@ -1856,8 +1729,8 @@ def ui_templates(pid: str, llm_cfg: LLMConfig):
 
                     doc_obj["history"].append({"at": now_str(), "action": "heuristic_fill", "data": doc_obj.get("data", {})})
                     doc_obj["data"] = heuristic_fill(doc_obj["template_type"], src_text, src_tables)
-                    save_doc(pid, doc_obj)
 
+                    save_doc(pid, doc_obj)
                     st.success("已填充。请在右侧校对/编辑。")
                     st.rerun()
 
@@ -1875,6 +1748,7 @@ def ui_templates(pid: str, llm_cfg: LLMConfig):
                     if d["doc_id"] == cur:
                         idx = i
                         break
+
             choice = st.selectbox("选择文档", opts, index=idx, key="doc_selector")
             st.session_state["active_doc_id"] = choice.split("(")[-1].strip(")")
 
@@ -1892,6 +1766,7 @@ def ui_templates(pid: str, llm_cfg: LLMConfig):
     with colR:
         doc_id = st.session_state.get("active_doc_id")
 
+        # 未选择文档：草稿预览
         if not doc_id:
             st.markdown("##### 模板预览（未保存草稿）")
             st.caption("左侧选择模板类型后，这里立即出现可编辑栏目；满意后点击“保存为新文档”。")
@@ -1915,6 +1790,7 @@ def ui_templates(pid: str, llm_cfg: LLMConfig):
                 st.rerun()
             return
 
+        # 已选择文档：读取/编辑/导出
         doc_file = doc_path(pid, doc_id)
         if not doc_file.exists():
             st.warning("文档不存在。")
@@ -1924,6 +1800,20 @@ def ui_templates(pid: str, llm_cfg: LLMConfig):
         if not doc_obj:
             st.warning("文档读取失败。")
             return
+
+        new_type = st.selectbox(
+            "当前文档模板类型（切换后右侧编辑器会联动）",
+            TEMPLATE_TYPES,
+            index=TEMPLATE_TYPES.index(doc_obj["template_type"]),
+            key=f"active_doc_type_{doc_id}",
+        )
+
+        if new_type != doc_obj["template_type"]:
+            doc_obj["history"].append({"at": now_str(), "action": "change_template_type", "data": doc_obj.get("data", {})})
+            doc_obj["template_type"] = new_type
+            doc_obj["data"] = merge_by_schema(schema_for(new_type), doc_obj.get("data", {}))
+            save_doc(pid, doc_obj)
+            st.rerun()
 
         st.markdown(f"##### 编辑：{doc_obj['title']} · {doc_obj['template_type']}")
         st.caption(f"更新时间：{doc_obj.get('updated_at','')} · 来源：{doc_obj.get('source',{}).get('uploaded_filename','(无)')}")
@@ -2020,10 +1910,11 @@ def ui_templates(pid: str, llm_cfg: LLMConfig):
                 st.json(rt[0])
 
 
+
+
 # =========================
 # Main
 # =========================
-
 def main():
     st.set_page_config(page_title=APP_NAME, layout="wide")
     ensure_dir(DATA_ROOT)
@@ -2031,7 +1922,6 @@ def main():
     prj, llm_cfg = ui_project_sidebar()
     ui_header(prj)
 
-    # ✅ 多行 Tabs（解决你截图2：六-十一不显示）
     st.markdown("""
     <style>
     div[data-baseweb="tab-list"] { flex-wrap: wrap !important; gap: 6px !important; }
@@ -2040,10 +1930,13 @@ def main():
     """, unsafe_allow_html=True)
 
     tabs = st.tabs(["培养方案基座", "模板化教学文件", "项目概览"])
+
     with tabs[0]:
         ui_base_training_plan(prj.project_id, llm_cfg)
+
     with tabs[1]:
         ui_templates(prj.project_id, llm_cfg)
+
     with tabs[2]:
         st.subheader("项目概览")
         plan = load_base_plan(prj.project_id)
@@ -2051,6 +1944,7 @@ def main():
 
         st.write({"project_id": prj.project_id, "name": prj.name, "created_at": prj.created_at, "updated_at": prj.updated_at})
         st.write("")
+
         st.markdown("##### 基座状态")
         secs = plan.get("sections", {})
         st.write(f"核心栏目(1-6)：{sum(1 for t in SECTION_TITLES[:6] if clean_text((secs or {}).get(t,'')))} / 6")
@@ -2065,7 +1959,7 @@ def main():
                 "title": d["title"],
                 "type": d["template_type"],
                 "updated_at": d.get("updated_at",""),
-                "source": d.get("source",{}).get("uploaded_filename",""),
+                "source": d.get("source",{}).get('uploaded_filename',''),
             } for d in docs])
             render_table_html(df, height=320)
         else:
@@ -2073,7 +1967,13 @@ def main():
 
         st.write("")
         z = export_project_zip(prj.project_id)
-        st.download_button("下载项目zip（JSON+导出）", data=z, file_name=f"{prj.name}-{prj.project_id}.zip", mime="application/zip", use_container_width=True)
+        st.download_button(
+            "下载项目zip（JSON+导出）",
+            data=z,
+            file_name=f"{prj.name}-{prj.project_id}.zip",
+            mime="application/zip",
+            use_container_width=True
+        )
 
 if __name__ == "__main__":
     main()
