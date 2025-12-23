@@ -977,9 +977,7 @@ def find_appendix_pages(pdf_bytes: bytes) -> Dict[str, List[int]]:
             if "附表1" in text or "专业教学计划表" in text:
                 found["7"].append(i)
     return found
-# app.py 升级版逻辑
-import io, json, pd, streamlit as st, pdfplumber
-import google.generativeai as genai
+
 
 # ============================================================
 # 定义标准字段：确保 Table 1 列完全符合您的要求
