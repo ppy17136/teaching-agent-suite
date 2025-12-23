@@ -811,7 +811,7 @@ def call_gemini_ai(api_key: str, prompt: str, system_instruction: str = "") -> A
         genai.configure(api_key=api_key)
         # 使用 1.5 Flash 或 Pro 均可，Pro 对长表格理解更佳
         model = genai.GenerativeModel(
-            model_name="gemini-1.5-flash",
+            model_name="gemini-2.0-flash",
             system_instruction=system_instruction
         )
         
