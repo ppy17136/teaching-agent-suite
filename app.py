@@ -1792,7 +1792,7 @@ def ui_base_training_plan(pid: str, llm_cfg: LLMConfig):
                 st.markdown("**Edges**（建议字段：from / to / label）")
                 edges_df = dataframe_safe(pd.DataFrame(graph.get("edges", [])))
                
-                edges_df = st.data_editor(edges_df,num_rows="dynamicuse_container_width=True,key=f"graph_edges_editor_{pid}",)                
+                edges_df = st.data_editor(edges_df,num_rows="dynamicuse_container_width=True,key=f"graph_edges_editor_{pid}")                
                 
                 graph["edges"] = edges_df.to_dict(orient="records")
 
