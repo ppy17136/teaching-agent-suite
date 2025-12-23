@@ -153,6 +153,8 @@ class Project:
     llm: Dict[str, Any] = field(default_factory=dict)  # 保存项目默认LLM配置（不含Key）
     created_at: str = field(default_factory=now_str)
     updated_at: str = field(default_factory=now_str)
+    logo_file: str = ""   # 例如 "logo.png" 或 "logo.svg"    
+    
 
 def project_dir(pid: str) -> Path:
     return DATA_ROOT / pid
@@ -1514,6 +1516,27 @@ def ui_project_sidebar() -> Tuple[Project, LLMConfig]:
 
     llm_cfg = ui_llm_sidebar(project_obj=active)
 
+    st.sidebar.markdown("---")
+    st.sidebar.markdown("#### 项目 Logo（可选）")
+
+    logo_up = st.sidebar.file_uploader("上传 Logo（PNG/SVG）", type=["png", "svg"], key="logo_uploader")
+    if logo_up is not None:
+        b = logo_up.read()
+        ensure_dir(assets_dir(active.project_id))
+        fname = f"logo.{logo_up.name.split('.')[-1].lower()}"
+        (assets_dir(active.project_id) / fname).write_bytes(b)
+        active.logo_file = fname
+        save_project(active)
+        st.sidebar.success("Logo 已保存到项目。")
+        st.rerun()
+
+    if active.logo_file:
+        if st.sidebar.button("清除项目 Logo", use_container_width=True):
+            # 不强制删除文件，只清空引用（更安全）
+            active.logo_file = ""
+            save_project(active)
+            st.sidebar.success("已清除。")
+            st.rerun()
 
     st.sidebar.markdown("---")
     st.sidebar.markdown("### 导出/打包")
@@ -1529,18 +1552,76 @@ def ui_project_sidebar() -> Tuple[Project, LLMConfig]:
 
     return active, llm_cfg
 
+def default_logo_svg(size: int = 44) -> str:
+    """
+    默认矢量Logo：书本 + AI节点（简洁、偏教育+智能）
+    """
+    return f"""
+    <svg width="{size}" height="{size}" viewBox="0 0 64 64" fill="none"
+         xmlns="http://www.w3.org/2000/svg" aria-label="logo">
+      <defs>
+        <linearGradient id="g" x1="0" y1="0" x2="64" y2="64">
+          <stop offset="0" stop-color="#3B82F6"/>
+          <stop offset="1" stop-color="#6366F1"/>
+        </linearGradient>
+      </defs>
+
+      <!-- 圆底 -->
+      <circle cx="32" cy="32" r="30" fill="url(#g)" opacity="0.95"/>
+
+      <!-- 书本 -->
+      <path d="M20 22c6-4 18-4 24 0v22c-6-4-18-4-24 0V22z"
+            fill="white" opacity="0.95"/>
+      <path d="M20 22c6 4 18 4 24 0" stroke="#E5E7EB" stroke-width="2" opacity="0.9"/>
+
+      <!-- AI节点 -->
+      <circle cx="28" cy="30" r="2.6" fill="#111827" opacity="0.85"/>
+      <circle cx="36" cy="28" r="2.6" fill="#111827" opacity="0.85"/>
+      <circle cx="40" cy="34" r="2.6" fill="#111827" opacity="0.85"/>
+      <path d="M28 30L36 28L40 34L28 30" stroke="#111827" stroke-width="2" opacity="0.7"/>
+    </svg>
+    """
 
 def ui_header(prj: Project):
+    # 读取项目logo（如果有）
+    logo_html = default_logo_svg(44)
+
+    try:
+        if getattr(prj, "logo_file", ""):
+            fp = assets_dir(prj.project_id) / prj.logo_file
+            if fp.exists():
+                ext = fp.suffix.lower()
+                if ext == ".svg":
+                    logo_html = fp.read_text("utf-8")
+                elif ext == ".png":
+                    import base64
+                    b64 = base64.b64encode(fp.read_bytes()).decode("utf-8")
+                    logo_html = f"<img src='data:image/png;base64,{b64}' style='width:44px;height:44px;border-radius:12px;'/>"
+    except Exception:
+        pass
+
     st.markdown(
         f"""
-        <div style="padding: 14px 16px; border-radius: 16px; background: linear-gradient(90deg, #f7f8ff 0%, #f8fbff 100%); border: 1px solid #eef;">
-          <div style="font-size: 28px; font-weight: 800;">教学文件工作台</div>
-          <div style="margin-top: 6px; color: #666;">项目：<b>{prj.name}</b>（{prj.project_id}） · 最后更新：{prj.updated_at}</div>
+        <div style="padding: 14px 16px; border-radius: 16px;
+                    background: linear-gradient(90deg, #f7f8ff 0%, #f8fbff 100%);
+                    border: 1px solid #eef;">
+          <div style="display:flex; align-items:center; gap:12px;">
+            <div style="width:44px;height:44px; display:flex; align-items:center; justify-content:center;">
+              {logo_html}
+            </div>
+            <div>
+              <div style="font-size: 28px; font-weight: 800;">教学文件工作台</div>
+              <div style="margin-top: 6px; color: #666;">
+                项目：<b>{prj.name}</b>（{prj.project_id}） · 最后更新：{prj.updated_at}
+              </div>
+            </div>
+          </div>
         </div>
         """,
         unsafe_allow_html=True,
     )
     st.write("")
+
 
 
 # =========================
