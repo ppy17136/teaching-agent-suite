@@ -23,6 +23,8 @@ from typing import Dict, List, Tuple, Optional, Any
 import pandas as pd
 import streamlit as st
 import pdfplumber
+import google.generativeai as genai
+
 
 def extract_with_gemini(api_key: str, raw_text: str, task_type: str):
     genai.configure(api_key=api_key)
