@@ -882,172 +882,12 @@ def split_sections_from_pages_all(pages_text: List[str], titles: List[str]) -> D
         chunk = clean_text(full[pos:end])
         out[h] = chunk
     return out
-def _find_appendix_starts(pages_text: list[str]) -> dict[int, int]:
-    """
-    返回 {appendix_no: page_index}，例如 {1: 23, 2: 25, 3: 28, 4: 31}
-    依据关键字：附表1 / 附表 1 / 附表一 等
-    """
-    starts: dict[int, int] = {}
-
-    patterns = {
-        1: r"(附表\s*1\b|附表一\b)",
-        2: r"(附表\s*2\b|附表二\b)",
-        3: r"(附表\s*3\b|附表三\b)",
-        4: r"(附表\s*4\b|附表四\b)",
-        5: r"(附表\s*5\b|附表五\b)",
-    }
-
-    for i, txt in enumerate(pages_text):
-        t = txt or ""
-        for no, pat in patterns.items():
-            if no not in starts and re.search(pat, t):
-                starts[no] = i
-    return starts
-
-
-def _extract_tables_from_pages(pdf_bytes: bytes, page_indices: list[int]) -> list[list[list[str]]]:
-    """
-    返回：一堆表格，每个表格是二维 list（行×列）
-    """
-    if pdfplumber is None:
-        return []
-
-    # 两套策略：先 lines，再 text（有些PDF没有清晰线条）
-    settings_lines = {
-        "vertical_strategy": "lines",
-        "horizontal_strategy": "lines",
-        "snap_tolerance": 3,
-        "join_tolerance": 3,
-        "intersection_tolerance": 3,
-        "edge_min_length": 3,
-        "text_tolerance": 2,
-        "keep_blank_chars": False,
-    }
-    settings_text = {
-        "vertical_strategy": "text",
-        "horizontal_strategy": "text",
-        "snap_tolerance": 3,
-        "join_tolerance": 3,
-        "intersection_tolerance": 3,
-        "edge_min_length": 3,
-        "text_tolerance": 2,
-        "keep_blank_chars": False,
-    }
-
-    tables_all: list[list[list[str]]] = []
-    with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
-        for pno in page_indices:
-            if pno < 0 or pno >= len(pdf.pages):
-                continue
-            page = pdf.pages[pno]
-
-            tables = page.extract_tables(table_settings=settings_lines) or []
-            if not tables:
-                tables = page.extract_tables(table_settings=settings_text) or []
-
-            # 清洗 None
-            for tb in tables:
-                tb2 = []
-                for row in tb:
-                    tb2.append([clean_text("" if c is None else str(c)) for c in row])
-                # 过滤全空行
-                tb2 = [r for r in tb2 if any(x.strip() for x in r)]
-                if len(tb2) >= 2 and any(x.strip() for x in tb2[0]):
-                    tables_all.append(tb2)
-
-    return tables_all
-
-
-def _table_to_records(table_2d: list[list[str]]) -> list[dict[str, str]]:
-    """
-    2D table -> list-of-dict（DataEditor 友好）
-    默认用首行做表头；表头太空则用 col_1...
-    """
-    if not table_2d or len(table_2d) < 2:
-        return []
-
-    header = [h.strip() for h in table_2d[0]]
-    ncol = max(len(r) for r in table_2d)
-    header = header + [""] * (ncol - len(header))
-
-    # 表头兜底
-    if sum(1 for h in header if h) <= 1:
-        header = [f"col_{i+1}" for i in range(ncol)]
-        body = table_2d
-    else:
-        # 保证唯一列名
-        seen = {}
-        fixed = []
-        for h in header:
-            h = h or "col"
-            seen[h] = seen.get(h, 0) + 1
-            fixed.append(h if seen[h] == 1 else f"{h}_{seen[h]}")
-        header = fixed
-        body = table_2d[1:]
-
-    records: list[dict[str, str]] = []
-    for r in body:
-        r = r + [""] * (ncol - len(r))
-        records.append({header[i]: r[i] for i in range(ncol)})
-
-    return records
-
-
-def extract_appendix_tables_best_effort(pdf_bytes: bytes, pages_text: list[str]) -> tuple[dict[str, list[dict[str, str]]], dict[str, Any]]:
-    """
-    尝试抽取附表1-4 => 写入 七-十 的表格区
-    返回：(tables_map, debug_meta)
-    tables_map 的 key 是 SECTION_TITLES 中对应的标题
-    """
-    starts = _find_appendix_starts(pages_text)
-
-    # 只关心 1-4（七～十）
-    mapping = {
-        1: "七、专业教学计划表",
-        2: "八、学分统计表",
-        3: "九、教学进程表",
-        4: "十、课程设置对毕业要求支撑关系表",
-        # 5 若你后面要抽，先留着
-        5: "十一、课程设置逻辑思维导图",
-    }
-
-    # 计算每个附表的页范围：start -> next_start-1
-    ranges: dict[int, list[int]] = {}
-    sorted_nos = sorted([no for no in starts.keys() if no in mapping])
-    for idx, no in enumerate(sorted_nos):
-        s = starts[no]
-        e = (starts[sorted_nos[idx + 1]] - 1) if idx + 1 < len(sorted_nos) else (len(pages_text) - 1)
-        # 为了避免正文里“附表x”标题页只有标题，往后多扫几页（最多 +6）
-        e = min(e + 6, len(pages_text) - 1)
-        ranges[no] = list(range(s, e + 1))
-
-    out_tables: dict[str, list[dict[str, str]]] = {mapping[k]: [] for k in mapping.keys() if k in ranges}
-
-    debug = {"appendix_starts": starts, "appendix_ranges": ranges, "row_counts": {}}
-
-    # 抽表并合并
-    for no, page_idx_list in ranges.items():
-        title = mapping[no]
-        raw_tables = _extract_tables_from_pages(pdf_bytes, page_idx_list)
-
-        # 合并策略：把每个表都转成 records，然后拼接
-        merged: list[dict[str, str]] = []
-        for tb in raw_tables:
-            rec = _table_to_records(tb)
-            if rec:
-                merged.extend(rec)
-
-        out_tables[title] = merged
-        debug["row_counts"][title] = len(merged)
-
-    return out_tables, debug
 
 def base_plan_from_pdf(pdf_bytes: bytes) -> Dict[str, Any]:
     pages = pdf_extract_pages_text(pdf_bytes)
-
-    # 1-11 正文切分（你原来已经有）
     sections = split_sections_from_pages_all(pages, SECTION_TITLES)
 
+    # 表格栏：pdfplumber 很难稳定抽结构化表格；先保留“文本+可手工表格”
     append_tables = {
         "七、专业教学计划表": [],
         "八、学分统计表": [],
@@ -1055,29 +895,21 @@ def base_plan_from_pdf(pdf_bytes: bytes) -> Dict[str, Any]:
         "十、课程设置对毕业要求支撑关系表": [],
     }
 
-    # ✅ 新增：从“附表页”自动抽表
-    auto_tables, debug_meta = extract_appendix_tables_best_effort(pdf_bytes, pages)
-    for k, v in auto_tables.items():
-        if k in append_tables:
-            append_tables[k] = v
-
     meta = {
         "sha256": sha256_bytes(pdf_bytes),
         "created_at": now_str(),
         "updated_at": now_str(),
-        "extractor": "pdfplumber-text-split-1-11 + appendix-table-best-effort",
+        "extractor": "pdfplumber-text-split-1-11",
         "rev": 1,
-        "appendix_table_debug": debug_meta,   # ✅ 方便你调试：在哪页找到附表、抽了多少行
     }
 
     return {
         "meta": meta,
-        "sections": sections,
+        "sections": sections,            # ✅ 1-11 全部（能找到的都会写）
         "appendices": {"tables": append_tables},
         "raw_pages_text": pages,
         "course_graph": {"nodes": [], "edges": []},
     }
-
 
 
 # =========================
