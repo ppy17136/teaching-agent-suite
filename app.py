@@ -77,7 +77,7 @@ def payload_to_jsonable(obj):
 def configure_ai(api_key: str):
     genai.configure(api_key=api_key)
     # 使用最新的稳定模型 [cite: 106]
-    return genai.GenerativeModel('gemini-1.5-flash')
+    return genai.GenerativeModel('gemini-2.5-flash')
 
 def ai_query_json(model, prompt: str) -> Any:
     """强制要求 AI 返回结构化 JSON [cite: 108, 120]"""
