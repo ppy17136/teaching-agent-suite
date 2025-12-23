@@ -840,8 +840,27 @@ def ui_project_sidebar() -> Tuple[Project, LLMConfig]:
     st.sidebar.caption(APP_VERSION)
 
     projects = list_projects()
+
+    # --- 关键修复：如果一个项目都没有，则自动创建默认项目 ---
+    if not projects:
+        pid = uuid.uuid4().hex[:10]
+        prj = Project(project_id=pid, name=f"默认项目-{dt.datetime.now().strftime('%Y%m%d-%H%M')}")
+        save_project(prj)
+        projects = [prj]
+        st.session_state["active_project_id"] = pid
+
     names = ["➕ 新建项目"] + [f"{p.name}  ({p.project_id})" for p in projects]
-    choice = st.sidebar.selectbox("项目", names, index=0)
+
+    # 如果 session_state 里已有 active_project_id，则默认选中它
+    default_index = 1
+    active_id = st.session_state.get("active_project_id")
+    if active_id:
+        for i, p in enumerate(projects, start=1):
+            if p.project_id == active_id:
+                default_index = i
+                break
+
+    choice = st.sidebar.selectbox("项目", names, index=default_index)
 
     if choice.startswith("➕"):
         with st.sidebar.expander("新建项目", expanded=True):
@@ -852,20 +871,15 @@ def ui_project_sidebar() -> Tuple[Project, LLMConfig]:
                 save_project(prj)
                 st.session_state["active_project_id"] = pid
                 st.rerun()
-        active = None
-        pid = st.session_state.get("active_project_id")
-        if pid:
-            active = load_project(pid)
-        if not active and projects:
-            active = projects[0]
+
+        # 如果用户选择“新建项目”但还没创建，就回退到当前已有项目（不会断言）
+        active = load_project(st.session_state.get("active_project_id", projects[0].project_id)) or projects[0]
     else:
         pid = choice.split("(")[-1].strip(")")
         st.session_state["active_project_id"] = pid
-        active = load_project(pid)
+        active = load_project(pid) or projects[0]
 
-    assert active is not None, "No active project"
-
-    # ---- LLM toggle (你要的开关在这里) ----
+    # --- LLM toggle（你要的侧边栏开关） ---
     st.sidebar.markdown("---")
     st.sidebar.markdown("#### LLM 校对与修正（可选）")
     enabled = st.sidebar.checkbox("启用 LLM 校对与修正", value=False)
@@ -875,7 +889,7 @@ def ui_project_sidebar() -> Tuple[Project, LLMConfig]:
     timeout = st.sidebar.slider("超时（秒）", 10, 180, 60)
     llm_cfg = LLMConfig(enabled=enabled, base_url=base_url, api_key=api_key, model=model, timeout=timeout)
 
-    # ---- Export zip ----
+    # --- Export zip ---
     st.sidebar.markdown("---")
     st.sidebar.markdown("#### 导出/打包")
     if st.sidebar.button("打包导出（JSON + Docx/Xlsx）", use_container_width=True):
@@ -889,6 +903,7 @@ def ui_project_sidebar() -> Tuple[Project, LLMConfig]:
         )
 
     return active, llm_cfg
+
 
 def ui_header(prj: Project):
     st.markdown(
