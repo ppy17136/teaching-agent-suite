@@ -20,6 +20,35 @@ import streamlit as st
 import pdfplumber
 import streamlit.components.v1 as components
 
+def payload_to_jsonable(payload: dict) -> dict:
+    """把 payload 里的 DataFrame / numpy 类型转成 JSON 可序列化对象。"""
+    if payload is None:
+        return {}
+
+    out = {}
+    for k, v in payload.items():
+        if isinstance(v, pd.DataFrame):
+            df = v.copy()
+            df = df.fillna("")
+            out[k] = {
+                "__type__": "dataframe",
+                "columns": [str(c) for c in df.columns.tolist()],
+                "data": df.astype(str).values.tolist(),
+            }
+        elif isinstance(v, dict):
+            out[k] = payload_to_jsonable(v)
+        elif isinstance(v, list):
+            out[k] = [payload_to_jsonable(x) if isinstance(x, dict) else x for x in v]
+        else:
+            # 兜底：把 pandas/numpy 的标量转成 Python 标量
+            try:
+                if hasattr(v, "item") and callable(v.item):
+                    out[k] = v.item()
+                else:
+                    out[k] = v
+            except Exception:
+                out[k] = str(v)
+    return out
 
 # -----------------------------
 # Helpers
@@ -471,14 +500,17 @@ def ui_base_training_plan(project: Project):
         # 下载 JSON
         payload = st.session_state.project_data.get(project.project_id)
         if payload:
+            json_payload = payload_to_jsonable(payload)
+
             st.download_button(
                 "下载基座 JSON",
-                data=json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8"),
+                data=json.dumps(json_payload, ensure_ascii=False, indent=2).encode("utf-8"),
                 file_name=f"base_{project.project_id}.json",
                 mime="application/json",
                 use_container_width=True,
                 key=f"dl_{project.project_id}",
             )
+
 
         st.divider()
         if payload:
