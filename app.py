@@ -210,21 +210,80 @@ def _valid_table_settings_lines() -> dict:
     )
 
 
-def _extract_tables_from_pages(
-    pdf_bytes: bytes, page_idx_list: List[int]
-) -> List[Tuple[int, List[List[str]]]]:
+def _drop_repeated_header_row(df: pd.DataFrame) -> pd.DataFrame:
+    """如果数据第一行就是重复表头（值≈列名），就删掉。"""
+    if df is None or df.empty:
+        return df
+    first = [str(x).strip() for x in df.iloc[0].tolist()]
+    cols = [str(c).strip() for c in df.columns.tolist()]
+
+    # “第一行与列名高度一致”就认为是重复表头
+    if len(first) == len(cols):
+        same = sum(1 for a, b in zip(first, cols) if a == b and a != "")
+        if same >= max(2, int(0.6 * len(cols))):
+            return df.iloc[1:].reset_index(drop=True)
+    return df
+
+
+def _align_to_canonical_cols(df: pd.DataFrame, canonical_cols: List[str]) -> pd.DataFrame:
+    """把 df 对齐到 canonical_cols：同列数则直接按位置改名；不同列数则按位置填充。"""
+    if df is None:
+        return pd.DataFrame(columns=canonical_cols)
+    df = df.copy()
+
+    if df.empty:
+        return pd.DataFrame(columns=canonical_cols)
+
+    # 同列数：直接按位置对齐列名
+    if len(df.columns) == len(canonical_cols):
+        df.columns = canonical_cols
+        return df
+
+    # 不同列数：创建新表，按位置填充
+    new_df = pd.DataFrame(columns=canonical_cols)
+    m = min(len(df.columns), len(canonical_cols))
+    for i in range(m):
+        new_df[canonical_cols[i]] = df.iloc[:, i].astype(str)
+    # 剩余 canonical 列保持空
+    return new_df
+
+
+def _merge_table_fragments(fragments: List[pd.DataFrame]) -> pd.DataFrame:
     """
-    Return: list of (page_idx, table_rows)
-      table_rows: list of rows; row: list of cell strings
+    纵向合并多个片段：列对齐 + 去重复表头 + concat
     """
-    out: List[Tuple[int, List[List[str]]]] = []
+    fragments = [f for f in fragments if f is not None and not f.empty]
+    if not fragments:
+        return pd.DataFrame()
+
+    # 选“列最多”的那张作为 canonical（通常第一页最完整）
+    canonical = max(fragments, key=lambda d: len(d.columns))
+    canonical_cols = [str(c) for c in canonical.columns.tolist()]
+
+    merged_parts = []
+    for i, df in enumerate(fragments):
+        df2 = _align_to_canonical_cols(df, canonical_cols)
+        df2 = _clean_df(df2)
+        # 第二页开始经常会重复表头，删掉
+        if i > 0:
+            df2 = _drop_repeated_header_row(df2)
+        merged_parts.append(df2)
+
+    merged = pd.concat(merged_parts, axis=0, ignore_index=True)
+    merged = _clean_df(merged)
+    return merged
+
+def _extract_tables_from_pages(pdf_bytes: bytes, page_idx_list: List[int]) -> List[Dict[str, Any]]:
+    """
+    Return: list of {"page": page_idx, "order": table_order_in_page, "rows": table_rows}
+    """
+    out: List[Dict[str, Any]] = []
     with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
         for idx in page_idx_list:
             if idx < 0 or idx >= len(pdf.pages):
                 continue
             page = pdf.pages[idx]
 
-            tables = []
             try:
                 tables = page.extract_tables(table_settings=_valid_table_settings_lines()) or []
             except TypeError:
@@ -235,12 +294,13 @@ def _extract_tables_from_pages(
                 except Exception:
                     tables = []
 
-            for t in tables:
+            for t_i, t in enumerate(tables):
                 norm = []
                 for row in t:
                     norm.append([_safe_text(c) for c in row])
-                out.append((idx, norm))
+                out.append({"page": idx, "order": t_i, "rows": norm})
     return out
+
 
 
 def _dedup_cols(cols: List[str]) -> List[str]:
@@ -379,141 +439,70 @@ def _find_appendix_anchor_pages(pages_text: List[str]) -> Dict[str, List[int]]:
     return anchors
 
 
-def extract_appendix_tables_best_effort(
-    pdf_bytes: bytes, pages_text: List[str]
-) -> Tuple[Dict[str, pd.DataFrame], Dict[str, Any]]:
+def extract_appendix_tables_best_effort(pdf_bytes: bytes, pages_text: List[str]) -> Tuple[Dict[str, pd.DataFrame], Dict[str, Any]]:
     """
-    从 PDF 末尾页面 + 附表锚点页面抽取表格，自动分类分配到 7-10。
-    Return:
-      tables_map: {"7":df, "8":df, "9":df, "10":df}
-      debug_meta: helpful debug info
+    从 PDF 末尾页面抽取表格，自动分类分配到 7-10。
+    ✅ 支持同一附表跨多页：按页序合并（特别是附表1/附表4）
     """
     n = len(pages_text)
+    tail_pages = list(range(max(0, n - 18), n))  # 末尾多抓一点页，跨页更稳
+    raw_tables = _extract_tables_from_pages(pdf_bytes, tail_pages)
 
-    # 1) 先找锚点页
-    anchors = _find_appendix_anchor_pages(pages_text)
+    dfs_info: List[Tuple[int, int, pd.DataFrame, str, int]] = []
+    # (page, order, df, sec, score)
 
-    # 2) 生成候选抽取页：锚点附近 + 末尾兜底
-    page_set = set()
-    for sec, idxs in anchors.items():
-        for idx in idxs[-3:]:  # 只取最后几个锚点（避免目录页）
-            for d in [-2, -1, 0, 1, 2, 3]:
-                j = idx + d
-                if 0 <= j < n:
-                    page_set.add(j)
-
-    # 兜底：最后 12 页
-    for j in range(max(0, n - 12), n):
-        page_set.add(j)
-
-    page_idx_list = sorted(page_set)
-
-    # 3) 抽表（带页号）
-    raw_tables = _extract_tables_from_pages(pdf_bytes, page_idx_list)
-
-    # 4) 变成 df，并记录来源页
-    dfs: List[Tuple[int, pd.DataFrame]] = []
-    for page_idx, t in raw_tables:
-        df = _table_to_df(t)
+    for item in raw_tables:
+        page_idx = item["page"]
+        order = item["order"]
+        df = _table_to_df(item["rows"])
         if df is None or df.empty:
             continue
-        # 过滤极小噪声表
         if df.shape[0] < 2 and df.shape[1] < 3:
             continue
-        dfs.append((page_idx, df))
 
-    # 5) 评分+分类
-    candidates: List[Dict[str, Any]] = []
-    for i, (pidx, df) in enumerate(dfs):
         sec, score = _classify_table(df)
-        area = int(df.shape[0] * df.shape[1])
-        candidates.append(
-            dict(
-                i=i,
-                page=pidx,
-                sec=sec,
-                score=score,
-                area=area,
-                shape=list(df.shape),
-            )
-        )
+        if sec:
+            dfs_info.append((page_idx, order, df, sec, score))
 
-    # 6) 分配：优先 “score高”，再看“同分更大面积”，再偏向“靠近该附表锚点页”
+    # 分组：同一个 sec 收集所有片段
+    frags: Dict[str, List[Tuple[int, int, int, pd.DataFrame]]] = {"7": [], "8": [], "9": [], "10": []}
+    for page_idx, order, df, sec, score in dfs_info:
+        if sec in frags:
+            frags[sec].append((page_idx, order, score, df))
+
     assigned: Dict[str, pd.DataFrame] = {}
-    chosen_idx = set()
+    debug_sec = {}
 
-    def _anchor_distance(sec: str, page: int) -> int:
-        idxs = anchors.get(sec, [])
-        if not idxs:
-            return 9999
-        # 距离最近的锚点
-        return min(abs(page - a) for a in idxs)
+    for sec, lst in frags.items():
+        if not lst:
+            continue
 
-    # 为每个候选生成一个全局排序键
-    ranked = []
-    for c in candidates:
-        sec = c["sec"]
-        if not sec:
-            continue
-        dist = _anchor_distance(sec, c["page"])
-        # 排序：score desc, area desc, dist asc
-        ranked.append((c["sec"], c["i"], c["score"], c["area"], dist, c["page"]))
-    ranked.sort(key=lambda x: (x[2], x[3], -x[4] * 0), reverse=True)  # 先粗排
-    # 更严格：我们自己再按规则挑（每个 sec 选最优）
-    for sec in ["7", "8", "9", "10"]:
-        # sec 专属候选
-        sec_cands = []
-        for c in candidates:
-            if c["sec"] != sec:
-                continue
-            dist = _anchor_distance(sec, c["page"])
-            sec_cands.append((c["score"], c["area"], -dist, c["page"], c["i"]))
-        # score高、面积大、距离近优先
-        sec_cands.sort(reverse=True)
-        for score, area, neg_dist, page, i in sec_cands:
-            if i in chosen_idx:
-                continue
-            assigned[sec] = dfs[i][1].copy(deep=True)
-            chosen_idx.add(i)
-            break
+        # 过滤掉明显误判：只保留接近该 sec “最高分”的片段
+        max_score = max(x[2] for x in lst)
+        kept = [x for x in lst if x[2] >= max(6, max_score - 3)]  # >=6 或接近最高分
+        kept.sort(key=lambda x: (x[0], x[1]))  # 按页序/表序
 
-    # 7) 如果某些 sec 没分到，但有锚点页：就从锚点页附近的所有表里挑“最大”的那张作为兜底
-    for sec in ["7", "8", "9", "10"]:
-        if sec in assigned:
-            continue
-        idxs = anchors.get(sec, [])
-        if not idxs:
-            continue
-        near_pages = set()
-        for idx in idxs[-2:]:
-            for d in [-2, -1, 0, 1, 2, 3]:
-                j = idx + d
-                if 0 <= j < n:
-                    near_pages.add(j)
-        best_i = None
-        best_area = -1
-        for i, (pidx, df) in enumerate(dfs):
-            if i in chosen_idx:
-                continue
-            if pidx not in near_pages:
-                continue
-            area = int(df.shape[0] * df.shape[1])
-            if area > best_area:
-                best_area = area
-                best_i = i
-        if best_i is not None:
-            assigned[sec] = dfs[best_i][1].copy(deep=True)
-            chosen_idx.add(best_i)
+        merged = _merge_table_fragments([x[3] for x in kept])
+        if merged is not None and not merged.empty:
+            assigned[sec] = merged
+
+        debug_sec[sec] = {
+            "fragments_total": len(lst),
+            "fragments_kept": len(kept),
+            "max_score": max_score,
+            "pages": [x[0] for x in kept],
+            "shape_merged": list(merged.shape) if merged is not None else None,
+        }
 
     debug = {
-        "candidate_pages": page_idx_list,
-        "anchors": anchors,
+        "tail_pages": tail_pages,
         "raw_tables_count": len(raw_tables),
-        "dfs_count": len(dfs),
-        "candidates_top": sorted(candidates, key=lambda x: (x["score"], x["area"]), reverse=True)[:30],
+        "classified_tables_count": len(dfs_info),
         "assigned": {k: list(v.shape) for k, v in assigned.items()},
+        "merge_debug": debug_sec,
     }
     return assigned, debug
+
 
 
 def base_plan_from_pdf(pdf_bytes: bytes) -> Dict[str, Any]:
