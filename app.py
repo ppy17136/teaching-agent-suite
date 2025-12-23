@@ -1636,6 +1636,35 @@ def _graph_to_dot(g: Dict[str, Any]) -> str:
     lines.append("}")
     return "\n".join(lines)
 
+def _reset_base_plan_editor_state(pid: str, plan: Dict[str, Any]) -> None:
+    """把右侧(1-6文本、7-10表格、11图)的 widget state 强制同步为 plan 里的内容。"""
+    sections = plan.get("sections", {}) if isinstance(plan.get("sections", {}), dict) else {}
+    append_tables = plan.get("appendices", {}).get("tables", {})
+    if not isinstance(append_tables, dict):
+        append_tables = {}
+    graph = plan.get("course_graph", {"nodes": [], "edges": []})
+    if not isinstance(graph, dict):
+        graph = {"nodes": [], "edges": []}
+
+    # 1-6 文本
+    for i, title in enumerate(SECTION_TITLES[:6]):
+        st.session_state[f"plan_text_{pid}_{i}"] = sections.get(title, "")
+
+    # 7-10 表格（records）
+    for j, title in enumerate(SECTION_TITLES[6:10], start=6):
+        rows = append_tables.get(title, [])
+        if not isinstance(rows, list):
+            rows = []
+        st.session_state[f"plan_tbl_{pid}_{j}"] = dataframe_safe(pd.DataFrame(rows))
+
+    # 11 图
+    st.session_state[f"graph_nodes_editor_{pid}"] = dataframe_safe(pd.DataFrame(graph.get("nodes", [])))
+    st.session_state[f"graph_edges_editor_{pid}"] = dataframe_safe(pd.DataFrame(graph.get("edges", [])))
+
+    # 记录当前 plan 的 sha，便于后续自动同步
+    st.session_state[f"_plan_sha_{pid}"] = (plan.get("meta", {}) or {}).get("sha256", "")
+
+
 def ui_base_training_plan(pid: str, llm_cfg: LLMConfig):
     st.subheader("培养方案基座（全量内容库）")
     st.caption("先把培养方案整理成权威内容库；后续所有教学文件将以此做一致性校验与自动填充。")
@@ -1653,6 +1682,14 @@ def ui_base_training_plan(pid: str, llm_cfg: LLMConfig):
         "raw_pages_text": [],
     }
 
+    # ✅ 如果培养方案基座发生变化（sha256变了），强制把右侧编辑器 state 同步到最新 plan
+    cur_sha = (plan.get("meta", {}) or {}).get("sha256", "")
+    last_sha = st.session_state.get(f"_plan_sha_{pid}", None)
+    if last_sha != cur_sha:
+        _reset_base_plan_editor_state(pid, plan)
+
+
+
     colL, colR = st.columns([1, 2])
 
     with colL:
@@ -1663,8 +1700,13 @@ def ui_base_training_plan(pid: str, llm_cfg: LLMConfig):
             if st.button("抽取并写入基座", type="primary", use_container_width=True, key="btn_extract_plan"):
                 extracted = base_plan_minimal_from_pdf(pdf_bytes)
                 save_base_plan(pid, extracted)
-                st.success("已写入培养方案基座。")
+
+                # ✅ 关键：把右侧所有编辑器的 session_state 强制写成抽取结果
+                _reset_base_plan_editor_state(pid, extracted)
+
+                st.success("已写入培养方案基座，并同步填充右侧栏目。")
                 st.rerun()
+
 
         st.write("")
         json_download_button("下载基座JSON", plan, f"base_training_plan-{pid}.json", key="dl_base_plan_json")
@@ -1699,7 +1741,7 @@ def ui_base_training_plan(pid: str, llm_cfg: LLMConfig):
 
         for i, title in enumerate(SECTION_TITLES[:6]):
             with tabs[i]:
-                sections[title] = st.text_area(title, value=sections.get(title, ""), height=260, key=f"plan_text_{i}")
+                sections[title] = st.text_area(title, value=sections.get(title, ""), height=260, key=f"plan_text_{pid}_{i}",)
 
                 if llm_available(llm_cfg):
                     if st.button(f"用 LLM 校对该栏目：{title}", key=f"btn_llm_fix_{i}"):
@@ -1729,7 +1771,9 @@ def ui_base_training_plan(pid: str, llm_cfg: LLMConfig):
                 if not isinstance(rows, list):
                     rows = []
                 df = dataframe_safe(pd.DataFrame(rows))
-                edited_df = st.data_editor(df, num_rows="dynamic", use_container_width=True, key=f"plan_tbl_{j}")
+               
+                edited_df = st.data_editor(df, num_rows="dynamic", use_container_width=True, key=f"plan_tbl_{pid}_{j}",)
+                
                 append_tables[title] = edited_df.to_dict(orient="records")
 
         with tabs[10]:
@@ -1739,13 +1783,17 @@ def ui_base_training_plan(pid: str, llm_cfg: LLMConfig):
             with colA:
                 st.markdown("**Nodes**（建议字段：id / name / label）")
                 nodes_df = dataframe_safe(pd.DataFrame(graph.get("nodes", [])))
-                nodes_df = st.data_editor(nodes_df, num_rows="dynamic", use_container_width=True, key="graph_nodes_editor")
+               
+                nodes_df = st.data_editor(nodes_df,num_rows="dynamic",use_container_width=True,key=f"graph_nodes_editor_{pid}",)                
+                
                 graph["nodes"] = nodes_df.to_dict(orient="records")
 
             with colB:
                 st.markdown("**Edges**（建议字段：from / to / label）")
                 edges_df = dataframe_safe(pd.DataFrame(graph.get("edges", [])))
-                edges_df = st.data_editor(edges_df, num_rows="dynamic", use_container_width=True, key="graph_edges_editor")
+               
+                edges_df = st.data_editor(edges_df,num_rows="dynamicuse_container_width=True,key=f"graph_edges_editor_{pid}",)                
+                
                 graph["edges"] = edges_df.to_dict(orient="records")
 
             st.markdown("**预览**")
