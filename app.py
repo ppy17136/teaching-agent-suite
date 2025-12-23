@@ -1811,17 +1811,25 @@ def ui_base_training_plan(pid: str, llm_cfg: LLMConfig):
             with colA:
                 st.markdown("**Nodes**（建议字段：id / name / label）")
                 nodes_df = dataframe_safe(pd.DataFrame(graph.get("nodes", [])))
-               
-                nodes_df = st.data_editor(nodes_df,num_rows="dynamic",use_container_width=True,key=f"graph_nodes_editor_{pid}_{rev}",)                
-                
+                nodes_df = st.data_editor(
+                    nodes_df,
+                    num_rows="dynamic",
+                    use_container_width=True,
+                    key=f"graph_nodes_editor_{pid}_{rev}",   # ✅ nodes 专用 key
+                )
                 graph["nodes"] = nodes_df.to_dict(orient="records")
 
             with colB:
                 st.markdown("**Edges**（建议字段：from / to / label）")
                 edges_df = dataframe_safe(pd.DataFrame(graph.get("edges", [])))
-                edges_df = st.data_editor(edges_df,num_rows="dynamic",use_container_width=True,key=f"graph_nodes_editor_{pid}_{rev}",) 
-                
+                edges_df = st.data_editor(
+                    edges_df,
+                    num_rows="dynamic",
+                    use_container_width=True,
+                    key=f"graph_edges_editor_{pid}_{rev}",   # ✅ edges 专用 key（别再用 nodes 的 key）
+                )
                 graph["edges"] = edges_df.to_dict(orient="records")
+
 
             st.markdown("**预览**")
             try:
