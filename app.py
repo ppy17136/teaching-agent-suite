@@ -297,60 +297,54 @@ def _read_llm_defaults() -> Dict[str, Any]:
 PROVIDER_PRESETS: Dict[str, Dict[str, Any]] = {
     "OpenAI / OpenAI兼容（通用）": {
         "provider": "openai_compat",
-        "base_url_hint": "例如：https://xxx/v1 （通常以 /v1 结尾）",
-        "model_hint": "例如：gpt-4.1-mini / deepseek-chat / qwen-plus / kimi-k1 / yi-lightning 等（以平台实际为准）",
+        "default_base_url": "https://api.openai.com/v1",   # 可改成你的网关
+        "models": ["gpt-4.1-mini", "gpt-4.1", "gpt-4o-mini"],
+        "default_model": "gpt-4.1-mini",
+        "default_endpoint_url": "",
+        "base_url_hint": "OpenAI兼容一般是 https://xxx/v1",
     },
-    "DeepSeek（通常可用OpenAI兼容）": {
+    "DeepSeek（OpenAI兼容）": {
         "provider": "openai_compat",
-        "base_url_hint": "填 DeepSeek 提供的 OpenAI 兼容 base_url（一般以 /v1 结尾）",
-        "model_hint": "填平台给的 model id",
+        "default_base_url": "",  # ✅ 建议留空，由你填实际网关
+        "models": ["deepseek-chat", "deepseek-reasoner"],
+        "default_model": "deepseek-chat",
+        "default_endpoint_url": "",
+        "base_url_hint": "填 DeepSeek 提供的 OpenAI 兼容 base_url（通常以 /v1 结尾）",
     },
-    "通义千问 / 阿里云 DashScope/百炼（通常可用OpenAI兼容）": {
+    "月之暗面 Kimi（OpenAI兼容）": {
         "provider": "openai_compat",
-        "base_url_hint": "填 DashScope/百炼 的 OpenAI 兼容 base_url",
-        "model_hint": "填平台给的 model id（如 qwen-*）",
-    },
-    "豆包 Doubao（通常可用OpenAI兼容）": {
-        "provider": "openai_compat",
-        "base_url_hint": "填 Doubao 的 OpenAI 兼容 base_url",
-        "model_hint": "填平台给的 model id",
-    },
-    "零一万物 Yi（通常可用OpenAI兼容）": {
-        "provider": "openai_compat",
-        "base_url_hint": "填 Yi 的 OpenAI 兼容 base_url",
-        "model_hint": "填平台给的 model id",
-    },
-    "月之暗面 Kimi（通常可用OpenAI兼容）": {
-        "provider": "openai_compat",
-        "base_url_hint": "填 Kimi 的 OpenAI 兼容 base_url",
-        "model_hint": "填平台给的 model id",
-    },
-    "智谱AI GLM（通常可用OpenAI兼容）": {
-        "provider": "openai_compat",
-        "base_url_hint": "填 GLM 的 OpenAI 兼容 base_url",
-        "model_hint": "填平台给的 model id",
-    },
-    "百度千帆 / 文心一言（优先尝试OpenAI兼容；不行用自定义REST）": {
-        "provider": "openai_compat",
-        "base_url_hint": "若提供 OpenAI 兼容则填；否则选“自定义REST”并填 endpoint_url",
-        "model_hint": "填平台给的 model id",
+        "default_base_url": "",
+        "models": ["moonshot-v1-8k", "moonshot-v1-32k", "moonshot-v1-128k"],
+        "default_model": "moonshot-v1-8k",
+        "default_endpoint_url": "",
+        "base_url_hint": "填 Kimi 的 OpenAI 兼容 base_url（通常以 /v1 结尾）",
     },
     "Claude (Anthropic) 原生接口": {
         "provider": "anthropic",
-        "base_url_hint": "可留空（使用 endpoint_url）；或填 https://api.anthropic.com",
-        "model_hint": "例如：claude-3-5-sonnet-2024xxxx（以账号实际为准）",
+        "default_base_url": "https://api.anthropic.com",
+        "models": ["claude-3-5-sonnet-latest", "claude-3-5-haiku-latest"],
+        "default_model": "claude-3-5-sonnet-latest",
+        "default_endpoint_url": "",  # 也可填你的网关完整URL
+        "base_url_hint": "不确定可用默认；如走网关可改。",
     },
     "Gemini 原生接口": {
         "provider": "gemini",
-        "base_url_hint": "可留空（使用 endpoint_url）",
-        "model_hint": "例如：gemini-1.5-pro / gemini-2.0-...（以账号实际为准）",
+        "default_base_url": "",
+        "models": ["gemini-1.5-pro", "gemini-1.5-flash"],
+        "default_model": "gemini-1.5-flash",
+        "default_endpoint_url": "",  # 也可填完整 generateContent URL
+        "base_url_hint": "通常不需要 Base URL；可用 endpoint_url 覆盖。",
     },
     "自定义 REST（任意平台/私有模型）": {
         "provider": "custom_rest",
-        "base_url_hint": "填完整URL（例如 https://host/path）。也可用 Endpoint URL。",
-        "model_hint": "可选：有的平台需要 model 字段，有的不需要",
+        "default_base_url": "",
+        "models": [],
+        "default_model": "",
+        "default_endpoint_url": "",
+        "base_url_hint": "填完整URL（例如 https://host/path）",
     },
 }
+
 
 def llm_available(cfg: LLMConfig) -> bool:
     if not cfg or not cfg.enabled:
@@ -1221,25 +1215,68 @@ def ui_llm_sidebar(project_obj: Optional[Project]) -> LLMConfig:
         help="自动：后台(secrets/env) 与 项目默认 合并；仅页面：每次手输；合并：页面优先覆盖后台/项目默认。",
     )
 
-    preset_name = st.sidebar.selectbox("Provider 选择", list(PROVIDER_PRESETS.keys()), index=0)
-    preset = PROVIDER_PRESETS[preset_name]
-    provider = preset["provider"]
+    # --- Provider preset select + auto fill ---
+    preset_names = list(PROVIDER_PRESETS.keys())
 
-    enabled = st.sidebar.checkbox("启用 LLM 校对与修正", value=bool(ui_defaults.get("enabled", False)))
+    def apply_preset():
+        name = st.session_state.get("provider_preset_name", preset_names[0])
+        p = PROVIDER_PRESETS[name]
 
-    api_key = st.sidebar.text_input("API Key", value=str(ui_defaults.get("api_key", "")), type="password")
-    model = st.sidebar.text_input("Model", value=str(ui_defaults.get("model", "")), help=preset.get("model_hint", ""))
+        # provider 写入 session
+        st.session_state["llm_provider"] = p.get("provider", "openai_compat")
 
-    base_url = st.sidebar.text_input(
-        "Base URL",
-        value=str(ui_defaults.get("base_url", "")),
-        help=preset.get("base_url_hint", ""),
+        # base_url / endpoint_url 自动填充（如果 preset 给了值）
+        if p.get("default_base_url", "") != "":
+            st.session_state["llm_base_url"] = p["default_base_url"]
+        else:
+            # 不强行覆盖用户已有输入
+            st.session_state.setdefault("llm_base_url", "")
+
+        if p.get("default_endpoint_url", "") != "":
+            st.session_state["llm_endpoint_url"] = p["default_endpoint_url"]
+        else:
+            st.session_state.setdefault("llm_endpoint_url", "")
+
+        # model 自动填充（如果 preset 给了默认）
+        if p.get("default_model", "") != "":
+            st.session_state["llm_model"] = p["default_model"]
+        else:
+            st.session_state.setdefault("llm_model", "")
+
+        # 重置“自定义model”开关
+        st.session_state["llm_model_mode"] = "下拉选择"
+
+    preset_name = st.sidebar.selectbox(
+        "Provider 选择",
+        preset_names,
+        key="provider_preset_name",
+        on_change=apply_preset,
     )
+    preset = PROVIDER_PRESETS[preset_name]
+    provider = st.session_state.get("llm_provider", preset.get("provider", "openai_compat"))
+
+    enabled = st.sidebar.checkbox("启用 LLM 校对与修正", value=bool(ui_defaults.get("enabled", False)), key="llm_enabled")
+    api_key = st.sidebar.text_input("API Key", value=str(ui_defaults.get("api_key", "")), type="password", key="llm_api_key")
+
+    # --- Model: 下拉 + 可自定义 ---
+    model_mode = st.sidebar.radio("Model 输入方式", ["下拉选择", "自定义输入"], horizontal=True, key="llm_model_mode")
+
+    if model_mode == "下拉选择" and preset.get("models"):
+        model = st.sidebar.selectbox("Model", preset["models"], key="llm_model")
+    else:
+        model = st.sidebar.text_input("Model", value=st.session_state.get("llm_model", str(ui_defaults.get("model", ""))), key="llm_model_custom")
+        # 让后续统一取 llm_model
+        st.session_state["llm_model"] = model
+
+    # --- Base URL / Endpoint URL ---
+    base_url_help = preset.get("base_url_hint", "")
+    base_url = st.sidebar.text_input("Base URL", value=st.session_state.get("llm_base_url", str(ui_defaults.get("base_url", ""))), help=base_url_help, key="llm_base_url")
 
     endpoint_url = st.sidebar.text_input(
         "Endpoint URL（可选，用于原生/自定义覆盖）",
-        value=str(ui_defaults.get("endpoint_url", "")),
+        value=st.session_state.get("llm_endpoint_url", str(ui_defaults.get("endpoint_url", ""))),
         help="Gemini/Claude/自定义REST建议填完整URL；OpenAI兼容一般不需要。",
+        key="llm_endpoint_url",
     )
 
     api_version = ""
@@ -1247,8 +1284,10 @@ def ui_llm_sidebar(project_obj: Optional[Project]) -> LLMConfig:
         api_version = st.sidebar.text_input(
             "Anthropic-Version（可选）",
             value=str(ui_defaults.get("api_version", "")),
-            help="不确定就留空。不同网关可能要求不同版本字符串。",
+            help="不确定就留空。",
+            key="llm_api_version",
         )
+
 
     timeout = st.sidebar.slider("超时（秒）", 10, 180, int(ui_defaults.get("timeout", 60)))
     temperature = st.sidebar.slider("temperature", 0.0, 1.5, float(ui_defaults.get("temperature", 0.2)))
