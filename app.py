@@ -20,35 +20,75 @@ import streamlit as st
 import pdfplumber
 import streamlit.components.v1 as components
 
-def payload_to_jsonable(payload: dict) -> dict:
-    """把 payload 里的 DataFrame / numpy 类型转成 JSON 可序列化对象。"""
-    if payload is None:
-        return {}
+import base64
+import datetime as _dt
+from pathlib import Path
+from decimal import Decimal
 
-    out = {}
-    for k, v in payload.items():
-        if isinstance(v, pd.DataFrame):
-            df = v.copy()
-            df = df.fillna("")
-            out[k] = {
+def payload_to_jsonable(obj):
+    """递归把各种常见不可 JSON 序列化对象转成可序列化结构。"""
+    # pandas
+    try:
+        import pandas as pd
+        if isinstance(obj, pd.DataFrame):
+            df = obj.copy().fillna("")
+            return {
                 "__type__": "dataframe",
                 "columns": [str(c) for c in df.columns.tolist()],
                 "data": df.astype(str).values.tolist(),
             }
-        elif isinstance(v, dict):
-            out[k] = payload_to_jsonable(v)
-        elif isinstance(v, list):
-            out[k] = [payload_to_jsonable(x) if isinstance(x, dict) else x for x in v]
-        else:
-            # 兜底：把 pandas/numpy 的标量转成 Python 标量
-            try:
-                if hasattr(v, "item") and callable(v.item):
-                    out[k] = v.item()
-                else:
-                    out[k] = v
-            except Exception:
-                out[k] = str(v)
-    return out
+        if hasattr(pd, "Timestamp") and isinstance(obj, pd.Timestamp):
+            return obj.isoformat()
+    except Exception:
+        pass
+
+    # numpy
+    try:
+        import numpy as np
+        if isinstance(obj, (np.integer, np.floating, np.bool_)):
+            return obj.item()
+        if isinstance(obj, np.ndarray):
+            return obj.tolist()
+    except Exception:
+        pass
+
+    # bytes（比如 pdf_bytes）
+    if isinstance(obj, (bytes, bytearray)):
+        return {
+            "__type__": "bytes_base64",
+            "data": base64.b64encode(bytes(obj)).decode("ascii"),
+        }
+
+    # datetime / date
+    if isinstance(obj, (_dt.datetime, _dt.date)):
+        return obj.isoformat()
+
+    # Path
+    if isinstance(obj, Path):
+        return str(obj)
+
+    # Decimal
+    if isinstance(obj, Decimal):
+        return float(obj)
+
+    # set/tuple
+    if isinstance(obj, (set, tuple)):
+        return [payload_to_jsonable(x) for x in obj]
+
+    # dict / list
+    if isinstance(obj, dict):
+        return {str(k): payload_to_jsonable(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [payload_to_jsonable(x) for x in obj]
+
+    # 其它：尽量原样返回，必要时转字符串
+    try:
+        import json
+        json.dumps(obj)  # probe
+        return obj
+    except Exception:
+        return str(obj)
+
 
 # -----------------------------
 # Helpers
@@ -504,7 +544,9 @@ def ui_base_training_plan(project: Project):
 
             st.download_button(
                 "下载基座 JSON",
+                json_payload = payload_to_jsonable(payload)
                 data=json.dumps(json_payload, ensure_ascii=False, indent=2).encode("utf-8"),
+                
                 file_name=f"base_{project.project_id}.json",
                 mime="application/json",
                 use_container_width=True,
