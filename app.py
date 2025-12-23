@@ -24,7 +24,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import streamlit as st
 import pandas as pd
 import requests
-
+import streamlit.components.v1 as components
 # ---- Optional deps ----
 try:
     import pdfplumber
@@ -1244,19 +1244,17 @@ def ui_header(prj: Project):
     st.write("")
 
 def ui_sidebar_brand(prj: Project):
-    """
-    ✅ 修复 sidebar 顶部 logo/HTML 显示成纯文本的问题
-    """
     kind, png_bytes, svg_text = _read_project_logo(prj)
 
     if kind == "png" and png_bytes:
         st.sidebar.image(png_bytes, width=46)
     else:
-        # svg 用 components.html，避免 markdown 渲染为文本
-        st.sidebar.components.v1.html(svg_text, height=54)
+        # ✅ sidebar 渲染 SVG：直接 markdown + unsafe
+        st.sidebar.markdown(svg_text, unsafe_allow_html=True)
 
     st.sidebar.markdown(f"### {APP_NAME}")
     st.sidebar.caption(APP_VERSION)
+
 
 
 # =========================
