@@ -24,315 +24,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import streamlit as st
 import pandas as pd
-
-import os, json, time
-from dataclasses import dataclass, asdict
-from typing import Any, Dict, List, Optional
 import requests
-import streamlit as st
-
-
-# -------------------------
-# LLM Config + Provider presets
-# -------------------------
-@dataclass
-class LLMConfig:
-    enabled: bool = False
-    provider: str = "openai_compat"   # openai_compat / anthropic / gemini / custom_rest
-    api_key: str = ""
-    base_url: str = ""                # openai_compat: https://xxx/v1 ; custom_rest: full URL
-    model: str = ""
-    timeout: int = 60
-    temperature: float = 0.2
-    max_tokens: int = 2048
-
-    # for advanced / custom
-    extra_headers_json: str = ""      # JSON dict string
-    extra_params_json: str = ""       # JSON dict string
-    # gemini/anthropic extra
-    api_version: str = ""             # optional
-    endpoint_url: str = ""            # gemini/custom full URL override
-
-
-def _safe_json_loads(s: str) -> Dict[str, Any]:
-    if not s or not str(s).strip():
-        return {}
-    try:
-        obj = json.loads(s)
-        return obj if isinstance(obj, dict) else {}
-    except Exception:
-        return {}
-
-
-def _read_llm_defaults() -> Dict[str, Any]:
-    """
-    Defaults priority: secrets.llm > env > hardcode
-    """
-    s = {}
-    try:
-        s = dict(st.secrets.get("llm", {}))
-    except Exception:
-        s = {}
-
-    return {
-        "enabled": bool(s.get("enabled", False)),
-        "provider": str(s.get("provider", os.environ.get("LLM_PROVIDER", "openai_compat"))),
-        "api_key": str(s.get("api_key", os.environ.get("LLM_API_KEY", ""))),
-        "base_url": str(s.get("base_url", os.environ.get("LLM_BASE_URL", ""))),
-        "model": str(s.get("model", os.environ.get("LLM_MODEL", ""))),
-        "timeout": int(s.get("timeout", int(os.environ.get("LLM_TIMEOUT", 60)))),
-        "temperature": float(s.get("temperature", float(os.environ.get("LLM_TEMPERATURE", 0.2)))),
-        "max_tokens": int(s.get("max_tokens", int(os.environ.get("LLM_MAX_TOKENS", 2048)))),
-        "extra_headers_json": str(s.get("extra_headers_json", "")),
-        "extra_params_json": str(s.get("extra_params_json", "")),
-        "endpoint_url": str(s.get("endpoint_url", "")),
-        "api_version": str(s.get("api_version", "")),
-    }
-
-
-# 你可以给一些“预设模板”，但不要把 base_url 写死成唯一答案（平台经常变）。
-# 这些 preset 的核心作用：让 UI 有“品牌选择”，同时告诉用户要填哪些字段。
-PROVIDER_PRESETS: Dict[str, Dict[str, Any]] = {
-    # --- OpenAI compatible: 只要平台提供 OpenAI 兼容接口，就选这个 ---
-    "OpenAI / OpenAI兼容（通用）": {
-        "provider": "openai_compat",
-        "base_url_hint": "例如：https://xxx/v1 （通常以 /v1 结尾）",
-        "model_hint": "例如：gpt-4.1-mini / deepseek-chat / qwen-plus / kimi-k1 / yi-lightning 等（以你平台实际为准）",
-    },
-    "DeepSeek（通常可用OpenAI兼容）": {
-        "provider": "openai_compat",
-        "base_url_hint": "填 DeepSeek 提供的 OpenAI 兼容 base_url（一般以 /v1 结尾）",
-        "model_hint": "填平台给的 model id",
-    },
-    "通义千问 / 阿里云 DashScope/百炼（通常可用OpenAI兼容）": {
-        "provider": "openai_compat",
-        "base_url_hint": "填 DashScope/百炼 的 OpenAI 兼容 base_url",
-        "model_hint": "填平台给的 model id（如 qwen-*）",
-    },
-    "豆包 Doubao（通常可用OpenAI兼容）": {
-        "provider": "openai_compat",
-        "base_url_hint": "填 Doubao 的 OpenAI 兼容 base_url",
-        "model_hint": "填平台给的 model id",
-    },
-    "零一万物 Yi（通常可用OpenAI兼容）": {
-        "provider": "openai_compat",
-        "base_url_hint": "填 Yi 的 OpenAI 兼容 base_url",
-        "model_hint": "填平台给的 model id",
-    },
-    "月之暗面 Kimi（通常可用OpenAI兼容）": {
-        "provider": "openai_compat",
-        "base_url_hint": "填 Kimi 的 OpenAI 兼容 base_url",
-        "model_hint": "填平台给的 model id",
-    },
-    "智谱AI GLM（通常可用OpenAI兼容）": {
-        "provider": "openai_compat",
-        "base_url_hint": "填 GLM 的 OpenAI 兼容 base_url",
-        "model_hint": "填平台给的 model id",
-    },
-    "百度千帆 / 文心一言（建议优先尝试OpenAI兼容；不行则用自定义REST）": {
-        "provider": "openai_compat",
-        "base_url_hint": "若平台提供 OpenAI 兼容则填；否则选“自定义REST”",
-        "model_hint": "填平台给的 model id",
-    },
-
-    # --- Native adapters (optional) ---
-    "Claude (Anthropic) 原生接口": {
-        "provider": "anthropic",
-        "base_url_hint": "可留空（使用 endpoint_url）；或填 https://api.anthropic.com",
-        "model_hint": "例如：claude-3-5-sonnet-2024xxxx（以你账号实际为准）",
-    },
-    "Gemini 原生接口": {
-        "provider": "gemini",
-        "base_url_hint": "可留空（使用 endpoint_url）",
-        "model_hint": "例如：gemini-1.5-pro / gemini-2.0-...（以你账号实际为准）",
-    },
-
-    # --- Custom REST ---
-    "自定义 REST（任意平台/私有模型）": {
-        "provider": "custom_rest",
-        "base_url_hint": "填完整 URL（例如 https://host/path）",
-        "model_hint": "可选：有的平台需要 model 字段，有的不需要",
-    },
-}
-
-
-# -------------------------
-# LLM unified call
-# -------------------------
-def llm_chat(messages: List[Dict[str, str]], cfg: LLMConfig) -> str:
-    """
-    messages: [{"role":"system|user|assistant","content":"..."}]
-    return: assistant text
-    """
-    if not cfg.enabled:
-        raise RuntimeError("LLM is disabled")
-
-    if cfg.provider == "openai_compat":
-        return _call_openai_compat(messages, cfg)
-    if cfg.provider == "anthropic":
-        return _call_anthropic(messages, cfg)
-    if cfg.provider == "gemini":
-        return _call_gemini(messages, cfg)
-    if cfg.provider == "custom_rest":
-        return _call_custom_rest(messages, cfg)
-
-    raise ValueError(f"Unknown provider: {cfg.provider}")
-
-
-def _call_openai_compat(messages: List[Dict[str, str]], cfg: LLMConfig) -> str:
-    base = (cfg.base_url or "").rstrip("/")
-    # 兼容：用户可能填到 /v1，也可能没填
-    if base.endswith("/v1"):
-        url = base + "/chat/completions"
-    elif base.endswith("/chat/completions"):
-        url = base
-    else:
-        # 尝试拼成 /v1/chat/completions
-        url = base + "/v1/chat/completions"
-
-    headers = {"Authorization": f"Bearer {cfg.api_key}"}
-    headers.update(_safe_json_loads(cfg.extra_headers_json))
-
-    payload = {
-        "model": cfg.model,
-        "messages": messages,
-        "temperature": cfg.temperature,
-        "max_tokens": cfg.max_tokens,
-    }
-    payload.update(_safe_json_loads(cfg.extra_params_json))
-
-    r = requests.post(url, headers=headers, json=payload, timeout=cfg.timeout)
-    r.raise_for_status()
-    data = r.json()
-    # 兼容多数 OpenAI 风格响应
-    return data["choices"][0]["message"]["content"]
-
-
-def _call_anthropic(messages: List[Dict[str, str]], cfg: LLMConfig) -> str:
-    """
-    Anthropic Messages API (REST). 如果你用的是代理/网关，也可在 UI 改 endpoint_url
-    """
-    endpoint = cfg.endpoint_url.strip()
-    if not endpoint:
-        base = (cfg.base_url or "https://api.anthropic.com").rstrip("/")
-        endpoint = base + "/v1/messages"
-
-    # Anthropic 不使用 OpenAI messages 的 system 合并方式，这里做个简单转换：
-    system_text = "\n".join([m["content"] for m in messages if m["role"] == "system"]).strip()
-    user_parts = []
-    for m in messages:
-        if m["role"] == "user":
-            user_parts.append({"type": "text", "text": m["content"]})
-        elif m["role"] == "assistant":
-            # 作为对话历史，可选；简单起见当成 user 的上下文也可以
-            user_parts.append({"type": "text", "text": f"(assistant) {m['content']}"})
-
-    headers = {
-        "x-api-key": cfg.api_key,
-        "content-type": "application/json",
-        # 版本号不同平台可能要求不同；UI 可填 api_version 覆盖
-        "anthropic-version": cfg.api_version.strip() or "2023-06-01",
-    }
-    headers.update(_safe_json_loads(cfg.extra_headers_json))
-
-    payload = {
-        "model": cfg.model,
-        "max_tokens": cfg.max_tokens,
-        "temperature": cfg.temperature,
-        "messages": [{"role": "user", "content": user_parts or [{"type":"text","text":"(empty)"}]}],
-    }
-    if system_text:
-        payload["system"] = system_text
-    payload.update(_safe_json_loads(cfg.extra_params_json))
-
-    r = requests.post(endpoint, headers=headers, json=payload, timeout=cfg.timeout)
-    r.raise_for_status()
-    data = r.json()
-    # 常见返回：content=[{type:"text",text:"..."}]
-    parts = data.get("content", [])
-    texts = [p.get("text", "") for p in parts if isinstance(p, dict)]
-    return "\n".join([t for t in texts if t]).strip()
-
-
-def _call_gemini(messages: List[Dict[str, str]], cfg: LLMConfig) -> str:
-    """
-    Gemini Generative Language API（REST）。如果你的接口不一样，直接在 UI 里填 endpoint_url 用自定义/覆盖。
-    """
-    endpoint = cfg.endpoint_url.strip()
-    if not endpoint:
-        # 这里给一个“可编辑模板”，如果不匹配你账号的 endpoint，就改 endpoint_url 或用 custom_rest
-        # 常见形式：.../v1beta/models/{model}:generateContent?key=API_KEY
-        endpoint = f"https://generativelanguage.googleapis.com/v1beta/models/{cfg.model}:generateContent?key={cfg.api_key}"
-
-    # 转换 messages -> contents
-    contents = []
-    for m in messages:
-        role = "user" if m["role"] != "assistant" else "model"
-        contents.append({"role": role, "parts": [{"text": m["content"]}]})
-
-    payload = {
-        "contents": contents,
-        "generationConfig": {
-            "temperature": cfg.temperature,
-            "maxOutputTokens": cfg.max_tokens,
-        },
-    }
-    payload.update(_safe_json_loads(cfg.extra_params_json))
-
-    headers = {"content-type": "application/json"}
-    headers.update(_safe_json_loads(cfg.extra_headers_json))
-
-    r = requests.post(endpoint, headers=headers, json=payload, timeout=cfg.timeout)
-    r.raise_for_status()
-    data = r.json()
-    # 常见返回：candidates[0].content.parts[0].text
-    c0 = (data.get("candidates") or [{}])[0]
-    content = c0.get("content", {})
-    parts = content.get("parts", []) if isinstance(content, dict) else []
-    texts = [p.get("text", "") for p in parts if isinstance(p, dict)]
-    return "\n".join([t for t in texts if t]).strip()
-
-
-def _call_custom_rest(messages: List[Dict[str, str]], cfg: LLMConfig) -> str:
-    """
-    自定义 REST：你自己提供 URL + headers + params。
-    约定 payload 里会给 messages/model/temperature/max_tokens，你可以用 extra_params_json 覆盖结构。
-    """
-    url = cfg.endpoint_url.strip() or cfg.base_url.strip()
-    if not url:
-        raise ValueError("custom_rest requires endpoint_url or base_url")
-
-    headers = _safe_json_loads(cfg.extra_headers_json)
-    # 可选：如果你希望 custom 也自动带 Bearer
-    if cfg.api_key and "authorization" not in {k.lower(): v for k, v in headers.items()}:
-        headers["Authorization"] = f"Bearer {cfg.api_key}"
-
-    payload = {
-        "model": cfg.model,
-        "messages": messages,
-        "temperature": cfg.temperature,
-        "max_tokens": cfg.max_tokens,
-    }
-    payload.update(_safe_json_loads(cfg.extra_params_json))
-
-    r = requests.post(url, headers=headers, json=payload, timeout=cfg.timeout)
-    r.raise_for_status()
-    data = r.json()
-
-    # 你可以在 extra_params_json 里指定如何取回字段；这里先做通用兜底
-    # 1) OpenAI风格
-    try:
-        return data["choices"][0]["message"]["content"]
-    except Exception:
-        pass
-    # 2) 常见 text 字段
-    for k in ["text", "output", "result", "answer", "content"]:
-        if isinstance(data.get(k), str):
-            return data[k]
-    return json.dumps(data, ensure_ascii=False)[:4000]
-
-
-
 
 # ---- Optional deps ----
 try:
@@ -347,18 +39,13 @@ try:
 except Exception:
     Document = None
 
-try:
-    import requests
-except Exception:
-    requests = None
-
 
 # =========================
 # Globals / constants
 # =========================
 
 APP_NAME = "Teaching Agent Suite"
-APP_VERSION = "v0.4 (template-first)"
+APP_VERSION = "v0.5 (template-first + LLM optional)"
 DATA_ROOT = Path("data/projects")
 
 SECTION_TITLES = [
@@ -420,7 +107,7 @@ def clamp(s: str, n: int = 12000) -> str:
 def dataframe_safe(df: pd.DataFrame) -> pd.DataFrame:
     """
     解决 Streamlit/pyarrow 常见崩溃：列里出现 dict/list/None 混合类型。
-    统一转成 str。
+    统一转成 str，保证可展示、可导出。
     """
     if df is None:
         return pd.DataFrame()
@@ -438,21 +125,20 @@ def render_table_html(df: pd.DataFrame, height: int = 420) -> None:
     html = df2.to_html(index=False, escape=True)
     st.components.v1.html(
         f"<div style='max-height:{height}px; overflow:auto; border:1px solid #eee; padding:8px'>{html}</div>",
-        height=min(height + 40, 800),
+        height=min(height + 40, 900),
         scrolling=True,
     )
 
-def json_download_button(label: str, obj: Any, filename: str):
+def json_download_button(label: str, obj: Any, filename: str, key: Optional[str] = None):
     data = json.dumps(obj, ensure_ascii=False, indent=2).encode("utf-8")
-    st.download_button(label, data=data, file_name=filename, mime="application/json")
+    st.download_button(label, data=data, file_name=filename, mime="application/json", key=key)
 
 def to_xlsx_bytes(sheets: Dict[str, pd.DataFrame]) -> bytes:
     buf = io.BytesIO()
     with pd.ExcelWriter(buf, engine="xlsxwriter") as writer:
         for name, df in sheets.items():
-            name = name[:31]
-            df2 = dataframe_safe(df)
-            df2.to_excel(writer, sheet_name=name, index=False)
+            name = str(name)[:31]
+            dataframe_safe(df).to_excel(writer, sheet_name=name, index=False)
     return buf.getvalue()
 
 
@@ -464,6 +150,7 @@ def to_xlsx_bytes(sheets: Dict[str, pd.DataFrame]) -> bytes:
 class Project:
     project_id: str
     name: str
+    llm: Dict[str, Any] = field(default_factory=dict)  # 保存项目默认LLM配置（不含Key）
     created_at: str = field(default_factory=now_str)
     updated_at: str = field(default_factory=now_str)
 
@@ -496,7 +183,10 @@ def list_projects() -> List[Project]:
             continue
         meta = safe_json_load(meta_file.read_text("utf-8"), {})
         if meta and "project_id" in meta:
-            out.append(Project(**meta))
+            try:
+                out.append(Project(**meta))
+            except Exception:
+                pass
     out.sort(key=lambda x: x.updated_at, reverse=True)
     return out
 
@@ -514,7 +204,10 @@ def load_project(pid: str) -> Optional[Project]:
     if not p.exists():
         return None
     meta = safe_json_load(p.read_text("utf-8"), {})
-    return Project(**meta) if meta else None
+    try:
+        return Project(**meta) if meta else None
+    except Exception:
+        return None
 
 def load_base_plan(pid: str) -> Dict[str, Any]:
     p = base_plan_path(pid)
@@ -546,19 +239,280 @@ def delete_doc(pid: str, doc_id: str) -> None:
 
 
 # =========================
-# LLM (optional, OpenAI-compatible endpoint)
+# LLM Config + Provider presets
 # =========================
 
 @dataclass
 class LLMConfig:
     enabled: bool = False
-    base_url: str = ""
+    provider: str = "openai_compat"   # openai_compat / anthropic / gemini / custom_rest
     api_key: str = ""
-    model: str = "qwen-plus"
+    base_url: str = ""                # openai_compat: https://xxx/v1 ; custom_rest: full URL (or endpoint_url)
+    model: str = ""
     timeout: int = 60
+    temperature: float = 0.2
+    max_tokens: int = 2048
+
+    # advanced/custom
+    extra_headers_json: str = ""      # JSON dict string
+    extra_params_json: str = ""       # JSON dict string
+    # native extras
+    api_version: str = ""             # anthropic optional
+    endpoint_url: str = ""            # gemini/custom full URL override
+
+def _safe_json_loads(s: str) -> Dict[str, Any]:
+    if not s or not str(s).strip():
+        return {}
+    try:
+        obj = json.loads(s)
+        return obj if isinstance(obj, dict) else {}
+    except Exception:
+        return {}
+
+def _read_llm_defaults() -> Dict[str, Any]:
+    """
+    Defaults priority: secrets.llm > env > hardcode
+    """
+    s: Dict[str, Any] = {}
+    try:
+        s = dict(st.secrets.get("llm", {}))
+    except Exception:
+        s = {}
+
+    return {
+        "enabled": bool(s.get("enabled", False)),
+        "provider": str(s.get("provider", os.environ.get("LLM_PROVIDER", "openai_compat"))),
+        "api_key": str(s.get("api_key", os.environ.get("LLM_API_KEY", ""))),
+        "base_url": str(s.get("base_url", os.environ.get("LLM_BASE_URL", ""))),
+        "model": str(s.get("model", os.environ.get("LLM_MODEL", ""))),
+        "timeout": int(s.get("timeout", int(os.environ.get("LLM_TIMEOUT", 60)))),
+        "temperature": float(s.get("temperature", float(os.environ.get("LLM_TEMPERATURE", 0.2)))),
+        "max_tokens": int(s.get("max_tokens", int(os.environ.get("LLM_MAX_TOKENS", 2048)))),
+        "extra_headers_json": str(s.get("extra_headers_json", "")),
+        "extra_params_json": str(s.get("extra_params_json", "")),
+        "endpoint_url": str(s.get("endpoint_url", "")),
+        "api_version": str(s.get("api_version", "")),
+    }
+
+PROVIDER_PRESETS: Dict[str, Dict[str, Any]] = {
+    "OpenAI / OpenAI兼容（通用）": {
+        "provider": "openai_compat",
+        "base_url_hint": "例如：https://xxx/v1 （通常以 /v1 结尾）",
+        "model_hint": "例如：gpt-4.1-mini / deepseek-chat / qwen-plus / kimi-k1 / yi-lightning 等（以平台实际为准）",
+    },
+    "DeepSeek（通常可用OpenAI兼容）": {
+        "provider": "openai_compat",
+        "base_url_hint": "填 DeepSeek 提供的 OpenAI 兼容 base_url（一般以 /v1 结尾）",
+        "model_hint": "填平台给的 model id",
+    },
+    "通义千问 / 阿里云 DashScope/百炼（通常可用OpenAI兼容）": {
+        "provider": "openai_compat",
+        "base_url_hint": "填 DashScope/百炼 的 OpenAI 兼容 base_url",
+        "model_hint": "填平台给的 model id（如 qwen-*）",
+    },
+    "豆包 Doubao（通常可用OpenAI兼容）": {
+        "provider": "openai_compat",
+        "base_url_hint": "填 Doubao 的 OpenAI 兼容 base_url",
+        "model_hint": "填平台给的 model id",
+    },
+    "零一万物 Yi（通常可用OpenAI兼容）": {
+        "provider": "openai_compat",
+        "base_url_hint": "填 Yi 的 OpenAI 兼容 base_url",
+        "model_hint": "填平台给的 model id",
+    },
+    "月之暗面 Kimi（通常可用OpenAI兼容）": {
+        "provider": "openai_compat",
+        "base_url_hint": "填 Kimi 的 OpenAI 兼容 base_url",
+        "model_hint": "填平台给的 model id",
+    },
+    "智谱AI GLM（通常可用OpenAI兼容）": {
+        "provider": "openai_compat",
+        "base_url_hint": "填 GLM 的 OpenAI 兼容 base_url",
+        "model_hint": "填平台给的 model id",
+    },
+    "百度千帆 / 文心一言（优先尝试OpenAI兼容；不行用自定义REST）": {
+        "provider": "openai_compat",
+        "base_url_hint": "若提供 OpenAI 兼容则填；否则选“自定义REST”并填 endpoint_url",
+        "model_hint": "填平台给的 model id",
+    },
+    "Claude (Anthropic) 原生接口": {
+        "provider": "anthropic",
+        "base_url_hint": "可留空（使用 endpoint_url）；或填 https://api.anthropic.com",
+        "model_hint": "例如：claude-3-5-sonnet-2024xxxx（以账号实际为准）",
+    },
+    "Gemini 原生接口": {
+        "provider": "gemini",
+        "base_url_hint": "可留空（使用 endpoint_url）",
+        "model_hint": "例如：gemini-1.5-pro / gemini-2.0-...（以账号实际为准）",
+    },
+    "自定义 REST（任意平台/私有模型）": {
+        "provider": "custom_rest",
+        "base_url_hint": "填完整URL（例如 https://host/path）。也可用 Endpoint URL。",
+        "model_hint": "可选：有的平台需要 model 字段，有的不需要",
+    },
+}
 
 def llm_available(cfg: LLMConfig) -> bool:
-    return cfg.enabled and bool(cfg.base_url) and bool(cfg.api_key) and requests is not None
+    if not cfg or not cfg.enabled:
+        return False
+    if cfg.provider == "openai_compat":
+        return bool(cfg.api_key) and bool(cfg.base_url) and bool(cfg.model)
+    if cfg.provider == "anthropic":
+        return bool(cfg.api_key) and bool(cfg.model)
+    if cfg.provider == "gemini":
+        return bool(cfg.api_key) and bool(cfg.model)
+    if cfg.provider == "custom_rest":
+        return bool(cfg.endpoint_url or cfg.base_url)
+    return False
+
+
+# =========================
+# LLM unified call
+# =========================
+
+def llm_chat(messages: List[Dict[str, str]], cfg: LLMConfig) -> str:
+    if not cfg.enabled:
+        raise RuntimeError("LLM is disabled")
+
+    if cfg.provider == "openai_compat":
+        return _call_openai_compat(messages, cfg)
+    if cfg.provider == "anthropic":
+        return _call_anthropic(messages, cfg)
+    if cfg.provider == "gemini":
+        return _call_gemini(messages, cfg)
+    if cfg.provider == "custom_rest":
+        return _call_custom_rest(messages, cfg)
+
+    raise ValueError(f"Unknown provider: {cfg.provider}")
+
+def _call_openai_compat(messages: List[Dict[str, str]], cfg: LLMConfig) -> str:
+    base = (cfg.base_url or "").rstrip("/")
+    if base.endswith("/v1"):
+        url = base + "/chat/completions"
+    elif base.endswith("/chat/completions"):
+        url = base
+    else:
+        url = base + "/v1/chat/completions"
+
+    headers = {"Authorization": f"Bearer {cfg.api_key}"}
+    headers.update(_safe_json_loads(cfg.extra_headers_json))
+
+    payload: Dict[str, Any] = {
+        "model": cfg.model,
+        "messages": messages,
+        "temperature": cfg.temperature,
+        "max_tokens": cfg.max_tokens,
+    }
+    payload.update(_safe_json_loads(cfg.extra_params_json))
+
+    r = requests.post(url, headers=headers, json=payload, timeout=cfg.timeout)
+    r.raise_for_status()
+    data = r.json()
+    return data["choices"][0]["message"]["content"]
+
+def _call_anthropic(messages: List[Dict[str, str]], cfg: LLMConfig) -> str:
+    endpoint = cfg.endpoint_url.strip()
+    if not endpoint:
+        base = (cfg.base_url or "https://api.anthropic.com").rstrip("/")
+        endpoint = base + "/v1/messages"
+
+    system_text = "\n".join([m["content"] for m in messages if m["role"] == "system"]).strip()
+
+    # Anthropic 的 messages：这里用简化策略，把 user/assistant 都塞进 user content 里
+    user_parts: List[Dict[str, str]] = []
+    for m in messages:
+        if m["role"] == "user":
+            user_parts.append({"type": "text", "text": m["content"]})
+        elif m["role"] == "assistant":
+            user_parts.append({"type": "text", "text": f"(assistant) {m['content']}"})
+
+    headers: Dict[str, str] = {
+        "x-api-key": cfg.api_key,
+        "content-type": "application/json",
+        "anthropic-version": cfg.api_version.strip() or "2023-06-01",
+    }
+    headers.update(_safe_json_loads(cfg.extra_headers_json))
+
+    payload: Dict[str, Any] = {
+        "model": cfg.model,
+        "max_tokens": cfg.max_tokens,
+        "temperature": cfg.temperature,
+        "messages": [{"role": "user", "content": user_parts or [{"type": "text", "text": "(empty)"}]}],
+    }
+    if system_text:
+        payload["system"] = system_text
+    payload.update(_safe_json_loads(cfg.extra_params_json))
+
+    r = requests.post(endpoint, headers=headers, json=payload, timeout=cfg.timeout)
+    r.raise_for_status()
+    data = r.json()
+    parts = data.get("content", [])
+    texts = [p.get("text", "") for p in parts if isinstance(p, dict)]
+    return "\n".join([t for t in texts if t]).strip()
+
+def _call_gemini(messages: List[Dict[str, str]], cfg: LLMConfig) -> str:
+    endpoint = cfg.endpoint_url.strip()
+    if not endpoint:
+        endpoint = f"https://generativelanguage.googleapis.com/v1beta/models/{cfg.model}:generateContent?key={cfg.api_key}"
+
+    contents: List[Dict[str, Any]] = []
+    for m in messages:
+        role = "user" if m["role"] != "assistant" else "model"
+        contents.append({"role": role, "parts": [{"text": m["content"]}]})
+
+    payload: Dict[str, Any] = {
+        "contents": contents,
+        "generationConfig": {"temperature": cfg.temperature, "maxOutputTokens": cfg.max_tokens},
+    }
+    payload.update(_safe_json_loads(cfg.extra_params_json))
+
+    headers = {"content-type": "application/json"}
+    headers.update(_safe_json_loads(cfg.extra_headers_json))
+
+    r = requests.post(endpoint, headers=headers, json=payload, timeout=cfg.timeout)
+    r.raise_for_status()
+    data = r.json()
+    c0 = (data.get("candidates") or [{}])[0]
+    content = c0.get("content", {})
+    parts = content.get("parts", []) if isinstance(content, dict) else []
+    texts = [p.get("text", "") for p in parts if isinstance(p, dict)]
+    return "\n".join([t for t in texts if t]).strip()
+
+def _call_custom_rest(messages: List[Dict[str, str]], cfg: LLMConfig) -> str:
+    url = cfg.endpoint_url.strip() or cfg.base_url.strip()
+    if not url:
+        raise ValueError("custom_rest requires endpoint_url or base_url")
+
+    headers = _safe_json_loads(cfg.extra_headers_json)
+    # 如果用户提供了 key 且没有 authorization，就自动加 Bearer
+    if cfg.api_key and "authorization" not in {k.lower() for k in headers.keys()}:
+        headers["Authorization"] = f"Bearer {cfg.api_key}"
+
+    payload: Dict[str, Any] = {
+        "model": cfg.model,
+        "messages": messages,
+        "temperature": cfg.temperature,
+        "max_tokens": cfg.max_tokens,
+    }
+    payload.update(_safe_json_loads(cfg.extra_params_json))
+
+    r = requests.post(url, headers=headers, json=payload, timeout=cfg.timeout)
+    r.raise_for_status()
+    data = r.json()
+
+    try:
+        return data["choices"][0]["message"]["content"]
+    except Exception:
+        pass
+    for k in ["text", "output", "result", "answer", "content"]:
+        if isinstance(data.get(k), str):
+            return data[k]
+    return json.dumps(data, ensure_ascii=False)[:4000]
+
+
+# =========================
+# LLM JSON helpers
+# =========================
 
 def extract_json_from_text(text: str) -> Optional[Dict[str, Any]]:
     if not text:
@@ -566,11 +520,13 @@ def extract_json_from_text(text: str) -> Optional[Dict[str, Any]]:
     obj = safe_json_load(text, None)
     if isinstance(obj, dict):
         return obj
+
     m = re.search(r"```(?:json)?\s*([\s\S]*?)\s*```", text)
     if m:
         obj = safe_json_load(m.group(1), None)
         if isinstance(obj, dict):
             return obj
+
     m = re.search(r"(\{[\s\S]*\})", text)
     if m:
         obj = safe_json_load(m.group(1), None)
@@ -579,31 +535,49 @@ def extract_json_from_text(text: str) -> Optional[Dict[str, Any]]:
     return None
 
 def llm_chat_json(cfg: LLMConfig, system: str, user: str, schema_hint: str = "") -> Tuple[Optional[Dict[str, Any]], str]:
-    """
-    调 OpenAI-compatible /v1/chat/completions
-    """
     if not llm_available(cfg):
         return None, "LLM 未启用或配置不完整。"
 
-    url = cfg.base_url.rstrip("/") + "/v1/chat/completions"
-    headers = {"Authorization": f"Bearer {cfg.api_key}", "Content-Type": "application/json"}
     messages = [
         {"role": "system", "content": system.strip()},
         {"role": "user", "content": (user.strip() + ("\n\nJSON schema hint:\n" + schema_hint if schema_hint else "")).strip()},
     ]
-    payload = {
-        "model": cfg.model,
-        "messages": messages,
-        "temperature": 0.2,
-        # 尽量要求直接 JSON；有些厂商忽略也没事，我们会兜底解析
-        "response_format": {"type": "json_object"},
-    }
 
+    # 对 openai_compat 尝试 response_format 强制 JSON
+    if cfg.provider == "openai_compat":
+        base = (cfg.base_url or "").rstrip("/")
+        if base.endswith("/v1"):
+            url = base + "/chat/completions"
+        elif base.endswith("/chat/completions"):
+            url = base
+        else:
+            url = base + "/v1/chat/completions"
+
+        headers = {"Authorization": f"Bearer {cfg.api_key}", "Content-Type": "application/json"}
+        headers.update(_safe_json_loads(cfg.extra_headers_json))
+
+        payload: Dict[str, Any] = {
+            "model": cfg.model,
+            "messages": messages,
+            "temperature": cfg.temperature,
+            "max_tokens": cfg.max_tokens,
+            "response_format": {"type": "json_object"},
+        }
+        payload.update(_safe_json_loads(cfg.extra_params_json))
+
+        try:
+            r = requests.post(url, headers=headers, json=payload, timeout=cfg.timeout)
+            r.raise_for_status()
+            data = r.json()
+            content = data["choices"][0]["message"]["content"]
+            obj = extract_json_from_text(content)
+            return obj, content
+        except Exception as e:
+            return None, f"LLM 调用失败：{e}"
+
+    # 其他 provider 走统一 llm_chat
     try:
-        r = requests.post(url, headers=headers, json=payload, timeout=cfg.timeout)
-        r.raise_for_status()
-        data = r.json()
-        content = data["choices"][0]["message"]["content"]
+        content = llm_chat(messages, cfg)
         obj = extract_json_from_text(content)
         return obj, content
     except Exception as e:
@@ -653,9 +627,9 @@ def docx_extract_text_tables(file_bytes: bytes) -> Tuple[str, List[pd.DataFrame]
 
     return "\n".join(paras), dfs
 
-def docx_export_simple(template_title: str, sections: List[Tuple[str, str]], tables: List[Tuple[str, pd.DataFrame]] = None) -> bytes:
+def docx_export_simple(template_title: str, sections: List[Tuple[str, str]], tables: Optional[List[Tuple[str, pd.DataFrame]]] = None) -> bytes:
     """
-    最简洁、稳定的 Word 导出：标题 + 一级标题 + 段落 + 表格
+    稳定的 Word 导出：标题 + 一级标题 + 段落 + 表格
     """
     if Document is None:
         raise RuntimeError("python-docx 未安装或不可用。")
@@ -681,6 +655,11 @@ def docx_export_simple(template_title: str, sections: List[Tuple[str, str]], tab
         doc.add_heading(name, level=2)
         df2 = dataframe_safe(df)
         nrows, ncols = df2.shape
+        if ncols == 0:
+            doc.add_paragraph("(空表)")
+            doc.add_paragraph("")
+            continue
+
         word_tbl = doc.add_table(rows=nrows + 1, cols=ncols)
         word_tbl.style = "Table Grid"
         for j, col in enumerate(df2.columns):
@@ -785,10 +764,11 @@ def schema_for(template_type: str) -> Dict[str, Any]:
 
 def merge_by_schema(schema: Dict[str, Any], obj: Dict[str, Any]) -> Dict[str, Any]:
     """
-    只保留 schema 里的字段（避免 LLM 返回乱七八糟字段导致展示崩）
+    只保留 schema 里的字段（避免 LLM 返回乱字段导致展示崩）
     """
     if not isinstance(schema, dict) or not isinstance(obj, dict):
         return obj if obj is not None else schema
+
     out: Dict[str, Any] = {}
     for k, v in schema.items():
         if k in obj:
@@ -800,6 +780,8 @@ def merge_by_schema(schema: Dict[str, Any], obj: Dict[str, Any]) -> Dict[str, An
                 out[k] = obj[k]
         else:
             out[k] = v
+
+    # 附加 warnings
     if "warnings" in obj and "warnings" not in out:
         out["warnings"] = obj["warnings"]
     return out
@@ -841,7 +823,6 @@ def heuristic_fill(template_type: str, raw_text: str, raw_tables: List[pd.DataFr
         return ""
 
     if template_type == "教学日历":
-        # schedule table: header has 周次/课次/教学内容
         schedule: List[Dict[str, Any]] = []
         for df in raw_tables:
             df2 = dataframe_safe(df)
@@ -875,8 +856,7 @@ def heuristic_fill(template_type: str, raw_text: str, raw_tables: List[pd.DataFr
         if objectives:
             data["teaching_objectives"] = objectives
         if not data.get("course_name"):
-            # 例如：xxx《课程名》教学大纲
-            for ln in lines[:30]:
+            for ln in lines[:40]:
                 if "《" in ln and "》" in ln and ("教学大纲" in ln):
                     m = re.findall(r"《([^》]+)》", ln)
                     if m:
@@ -884,13 +864,11 @@ def heuristic_fill(template_type: str, raw_text: str, raw_tables: List[pd.DataFr
                         break
         return data
 
-    # 其他模板先给空壳（后续你可以继续补 heuristic 规则）
     return data
 
 
 # =========================
 # Training plan base (minimal PDF extractor)
-# 你后续可以把你现有的强解析器接进来替换这里
 # =========================
 
 def pdf_extract_pages_text(pdf_bytes: bytes) -> List[str]:
@@ -910,10 +888,14 @@ def split_sections_from_pages(pages_text: List[str]) -> Dict[str, str]:
 
     heads: List[Tuple[str, int]] = []
     for title in SECTION_TITLES[:6]:
-        key = re.escape(title.split("、", 1)[0]) + r"\s*、\s*" + re.escape(title.split("、", 1)[1])
+        parts = title.split("、", 1)
+        if len(parts) != 2:
+            continue
+        key = re.escape(parts[0]) + r"\s*、\s*" + re.escape(parts[1])
         m = re.search(key, full2)
         if m:
             heads.append((title, m.start()))
+
     heads.sort(key=lambda x: x[1])
 
     out: Dict[str, str] = {}
@@ -927,26 +909,32 @@ def base_plan_minimal_from_pdf(pdf_bytes: bytes) -> Dict[str, Any]:
     sections = split_sections_from_pages(pages)
     return {
         "meta": {"sha256": sha256_bytes(pdf_bytes), "created_at": now_str(), "extractor": "minimal-pdfplumber"},
-        "sections": sections,
-        "appendices": {},
-        "raw_pages_text": pages,  # 方便你 debug 是否文本可抽
-        "course_graph": {"nodes": [], "edges": []},  # 逻辑图（后续增强）
+        "sections": sections,  # 1-6
+        "appendices": {
+            "tables": {
+                "七、专业教学计划表": [],
+                "八、学分统计表": [],
+                "九、教学进程表": [],
+                "十、课程设置对毕业要求支撑关系表": [],
+            }
+        },
+        "raw_pages_text": pages,
+        "course_graph": {"nodes": [], "edges": []},  # 11
     }
 
 
 # =========================
-# Consistency checks (base version)
+# Consistency checks
 # =========================
 
 def run_consistency_checks(template_type: str, data: Dict[str, Any], plan: Dict[str, Any]) -> List[str]:
     warnings: List[str] = []
-    sections = plan.get("sections", {})
+    sections = plan.get("sections", {}) if isinstance(plan, dict) else {}
 
     if template_type in ("教学日历", "课程大纲", "授课手册", "达成度评价依据审核表", "达成度评价报告"):
-        if not clean_text(data.get("course_name", "")):
+        if not clean_text(str(data.get("course_name", ""))):
             warnings.append("课程名称为空：建议填写以便后续一致性校验/自动填充。")
 
-    # 支撑码一致性：从培养方案“毕业要求”里提取 5.2/10.1 之类
     if template_type in ("课程大纲", "达成度评价报告"):
         grad_req = sections.get("二、毕业要求", "")
         codes_in_plan = set(re.findall(r"\b\d+\.\d+\b", grad_req)) if grad_req else set()
@@ -1011,7 +999,6 @@ def export_docx_for_template(template_type: str, data: Dict[str, Any], title: st
         ]
         return docx_export_simple(title, sections, tables)
 
-    # 其他模板先用 JSON 文本导出（你后续可按学校规范再细化）
     return docx_export_simple(title, [("内容", json.dumps(data, ensure_ascii=False, indent=2))], [])
 
 def export_xlsx_for_template(template_type: str, data: Dict[str, Any]) -> Optional[bytes]:
@@ -1041,25 +1028,25 @@ def export_project_zip(pid: str) -> bytes:
             doc_id = d["doc_id"]
             z.writestr(f"docs/{doc_id}.json", json.dumps(d, ensure_ascii=False, indent=2))
 
-            # 导出 docx/xlsx（失败就写 error 文件）
+            safe_title = re.sub(r"[\\/:*?\"<>|]+", "_", d.get("title", doc_id))
             try:
                 docx_bytes = export_docx_for_template(d["template_type"], d.get("data", {}), d.get("title", doc_id))
-                z.writestr(f"exports/{d.get('title',doc_id)}.docx", docx_bytes)
+                z.writestr(f"exports/{safe_title}.docx", docx_bytes)
             except Exception as e:
-                z.writestr(f"exports/{d.get('title',doc_id)}.docx.ERROR.txt", str(e))
+                z.writestr(f"exports/{safe_title}.docx.ERROR.txt", str(e))
 
             try:
                 x = export_xlsx_for_template(d["template_type"], d.get("data", {}))
                 if x:
-                    z.writestr(f"exports/{d.get('title',doc_id)}.xlsx", x)
+                    z.writestr(f"exports/{safe_title}.xlsx", x)
             except Exception as e:
-                z.writestr(f"exports/{d.get('title',doc_id)}.xlsx.ERROR.txt", str(e))
+                z.writestr(f"exports/{safe_title}.xlsx.ERROR.txt", str(e))
 
-        # assets 目录原样打包（你后续可以把“附表/思维导图文件”放这里）
         ap = assets_dir(pid)
         if ap.exists():
             for fp in ap.glob("*"):
-                z.write(fp, arcname=f"assets/{fp.name}")
+                if fp.is_file():
+                    z.write(fp, arcname=f"assets/{fp.name}")
 
     return buf.getvalue()
 
@@ -1134,10 +1121,196 @@ def ui_render_editor(template_type: str, data: Dict[str, Any]) -> Dict[str, Any]
         data["remarks"] = st.text_area("备注", value=data.get("remarks", ""), height=120)
         return data
 
-    # 其余模板：先给 JSON 形式，后续你再逐个做“专用编辑器”
-    st.info("该模板暂未定制编辑器（先以JSON展示/编辑）。后续可以按学校规范做成专用表单。")
+    if template_type == "授课手册":
+        st.markdown("###### 基本信息")
+        c1, c2, c3, c4 = st.columns(4)
+        data["course_name"] = c1.text_input("课程名称", value=data.get("course_name", ""))
+        data["term"] = c2.text_input("学期", value=data.get("term", ""))
+        data["class"] = c3.text_input("班级", value=data.get("class", ""))
+        data["teacher"] = c4.text_input("教师", value=data.get("teacher", ""))
+
+        st.markdown("###### 周记录")
+        data["weekly_log"] = ui_edit_table_of_dicts("周记录", data.get("weekly_log", []), ["date", "progress", "issues", "actions"])
+
+        st.markdown("###### 总结/分析/改进")
+        data["summary"] = st.text_area("课程总结", value=data.get("summary", ""), height=120)
+        data["exam_analysis"] = st.text_area("试卷分析", value=data.get("exam_analysis", ""), height=120)
+        data["improvement"] = st.text_area("改进措施", value=data.get("improvement", ""), height=120)
+        return data
+
+    if template_type == "达成度评价依据审核表":
+        st.markdown("###### 基本信息")
+        c1, c2 = st.columns(2)
+        data["course_name"] = c1.text_input("课程名称", value=data.get("course_name", ""))
+        data["term"] = c2.text_input("学期", value=data.get("term", ""))
+
+        st.markdown("###### 评价依据")
+        ev = data.get("evidence_used", {})
+        cols = st.columns(5)
+        keys = list(ev.keys()) if isinstance(ev, dict) else ["期末试卷", "平时考试", "作业", "实验", "讨论小论文"]
+        ev2: Dict[str, bool] = {}
+        for i, k in enumerate(keys):
+            ev2[k] = cols[i % 5].checkbox(k, value=bool(ev.get(k, False)))
+        data["evidence_used"] = ev2
+
+        data["calc_method"] = st.text_area("计算方法说明", value=data.get("calc_method", ""), height=120)
+        data["conclusion"] = st.text_area("结论", value=data.get("conclusion", ""), height=100)
+        c3, c4 = st.columns(2)
+        data["review_team"] = c3.text_input("审核小组/人员", value=data.get("review_team", ""))
+        data["review_date"] = c4.text_input("审核日期", value=data.get("review_date", ""))
+        return data
+
+    if template_type == "达成度评价报告":
+        st.markdown("###### 基本信息")
+        c1, c2, c3 = st.columns(3)
+        data["course_name"] = c1.text_input("课程名称", value=data.get("course_name", ""))
+        data["term"] = c2.text_input("学期", value=data.get("term", ""))
+        data["threshold"] = c3.text_input("达成阈值（如0.65）", value=str(data.get("threshold", "0.65")))
+
+        st.markdown("###### 课程目标达成情况（可编辑）")
+        data["objectives"] = ui_edit_table_of_dicts("目标达成", data.get("objectives", []),
+                                                    ["obj", "support_grad_req", "direct_score", "self_score", "achieved"])
+
+        st.markdown("###### 结论与改进")
+        data["overall_comment"] = st.text_area("总体评价", value=data.get("overall_comment", ""), height=100)
+        data["analysis"] = st.text_area("原因分析", value=data.get("analysis", ""), height=120)
+        data["improvements"] = st.text_area("改进措施", value=data.get("improvements", ""), height=120)
+        data["weakness"] = st.text_area("薄弱环节", value=data.get("weakness", ""), height=80)
+        data["next_suggestions"] = st.text_area("下轮建议", value=data.get("next_suggestions", ""), height=100)
+
+        st.markdown("###### 签字")
+        c4, c5, c6, c7 = st.columns(4)
+        data["responsible"] = c4.text_input("负责人", value=data.get("responsible", ""))
+        data["date"] = c5.text_input("日期", value=data.get("date", ""))
+        data["reviewer"] = c6.text_input("审核人", value=data.get("reviewer", ""))
+        data["review_date"] = c7.text_input("审核日期", value=data.get("review_date", ""))
+        return data
+
+    if template_type == "调查问卷":
+        st.markdown("###### 基本信息")
+        c1, c2 = st.columns(2)
+        data["title"] = c1.text_input("问卷标题", value=data.get("title", ""))
+        data["target"] = c2.text_input("调查对象", value=data.get("target", ""))
+        st.markdown("###### 题目列表（可编辑）")
+        data["questions"] = ui_edit_table_of_dicts("题目", data.get("questions", []), ["q", "type", "options"])
+        return data
+
     st.json(data)
     return data
+
+
+# =========================
+# Sidebar: LLM
+# =========================
+
+def ui_llm_sidebar(project_obj: Optional[Project]) -> LLMConfig:
+    st.sidebar.markdown("---")
+    st.sidebar.markdown("### LLM（可选：用于校对/修正/补全）")
+
+    backend = _read_llm_defaults()
+    prj_llm: Dict[str, Any] = {}
+    if project_obj is not None and isinstance(getattr(project_obj, "llm", None), dict):
+        prj_llm = project_obj.llm
+
+    ui_defaults = {**backend, **prj_llm}
+
+    mode = st.sidebar.selectbox(
+        "配置来源",
+        ["自动(推荐)", "仅后台", "仅页面", "合并(页面优先)"],
+        index=0,
+        help="自动：后台(secrets/env) 与 项目默认 合并；仅页面：每次手输；合并：页面优先覆盖后台/项目默认。",
+    )
+
+    preset_name = st.sidebar.selectbox("Provider 选择", list(PROVIDER_PRESETS.keys()), index=0)
+    preset = PROVIDER_PRESETS[preset_name]
+    provider = preset["provider"]
+
+    enabled = st.sidebar.checkbox("启用 LLM 校对与修正", value=bool(ui_defaults.get("enabled", False)))
+
+    api_key = st.sidebar.text_input("API Key", value=str(ui_defaults.get("api_key", "")), type="password")
+    model = st.sidebar.text_input("Model", value=str(ui_defaults.get("model", "")), help=preset.get("model_hint", ""))
+
+    base_url = st.sidebar.text_input(
+        "Base URL",
+        value=str(ui_defaults.get("base_url", "")),
+        help=preset.get("base_url_hint", ""),
+    )
+
+    endpoint_url = st.sidebar.text_input(
+        "Endpoint URL（可选，用于原生/自定义覆盖）",
+        value=str(ui_defaults.get("endpoint_url", "")),
+        help="Gemini/Claude/自定义REST建议填完整URL；OpenAI兼容一般不需要。",
+    )
+
+    api_version = ""
+    if provider == "anthropic":
+        api_version = st.sidebar.text_input(
+            "Anthropic-Version（可选）",
+            value=str(ui_defaults.get("api_version", "")),
+            help="不确定就留空。不同网关可能要求不同版本字符串。",
+        )
+
+    timeout = st.sidebar.slider("超时（秒）", 10, 180, int(ui_defaults.get("timeout", 60)))
+    temperature = st.sidebar.slider("temperature", 0.0, 1.5, float(ui_defaults.get("temperature", 0.2)))
+    max_tokens = st.sidebar.slider("max_tokens", 256, 8192, int(ui_defaults.get("max_tokens", 2048)), step=256)
+
+    extra_headers_json = st.sidebar.text_area(
+        "额外 Headers（JSON，可选）",
+        value=str(ui_defaults.get("extra_headers_json", "")),
+        help='例如：{"X-Org":"xxx"}；自定义REST很常用。',
+        height=70,
+    )
+    extra_params_json = st.sidebar.text_area(
+        "额外 Params（JSON，可选）",
+        value=str(ui_defaults.get("extra_params_json", "")),
+        help='例如：{"top_p":0.9} 或覆盖payload结构；自定义REST很常用。',
+        height=70,
+    )
+
+    ui_cfg = dict(
+        enabled=enabled,
+        provider=provider,
+        api_key=api_key,
+        base_url=base_url,
+        model=model,
+        timeout=timeout,
+        temperature=temperature,
+        max_tokens=max_tokens,
+        extra_headers_json=extra_headers_json,
+        extra_params_json=extra_params_json,
+        endpoint_url=endpoint_url,
+        api_version=api_version,
+    )
+
+    # 合并逻辑
+    if mode == "仅后台":
+        merged = dict(backend)
+    elif mode == "仅页面":
+        merged = dict(ui_cfg)
+    else:
+        merged = dict(ui_defaults) if mode == "自动(推荐)" else dict(backend)
+        for k, v in ui_cfg.items():
+            if k == "enabled":
+                merged[k] = bool(v)
+            elif isinstance(v, str):
+                if v.strip() != "":
+                    merged[k] = v.strip()
+            elif v is not None:
+                merged[k] = v
+
+    llm_cfg = LLMConfig(**merged)
+
+    if project_obj is not None and st.sidebar.button("保存为本项目默认（不含Key）", use_container_width=True):
+        safe_cfg = dict(merged)
+        safe_cfg["api_key"] = ""
+        project_obj.llm = safe_cfg
+        save_project(project_obj)
+        st.sidebar.success("已保存（Key未写入项目）。")
+
+    if enabled and not llm_available(llm_cfg):
+        st.sidebar.warning("LLM 已勾选，但配置不完整（通常需要 model + key + base_url/endpoint）。")
+
+    return llm_cfg
 
 
 # =========================
@@ -1145,12 +1318,11 @@ def ui_render_editor(template_type: str, data: Dict[str, Any]) -> Dict[str, Any]
 # =========================
 
 def ui_project_sidebar() -> Tuple[Project, LLMConfig]:
-    st.sidebar.markdown(f"### {APP_NAME}")
+    st.sidebar.markdown(f"## {APP_NAME}")
     st.sidebar.caption(APP_VERSION)
 
     projects = list_projects()
 
-    # --- 关键修复：如果一个项目都没有，则自动创建默认项目 ---
     if not projects:
         pid = uuid.uuid4().hex[:10]
         prj = Project(project_id=pid, name=f"默认项目-{dt.datetime.now().strftime('%Y%m%d-%H%M')}")
@@ -1160,7 +1332,6 @@ def ui_project_sidebar() -> Tuple[Project, LLMConfig]:
 
     names = ["➕ 新建项目"] + [f"{p.name}  ({p.project_id})" for p in projects]
 
-    # 如果 session_state 里已有 active_project_id，则默认选中它
     default_index = 1
     active_id = st.session_state.get("active_project_id")
     if active_id:
@@ -1169,7 +1340,7 @@ def ui_project_sidebar() -> Tuple[Project, LLMConfig]:
                 default_index = i
                 break
 
-    choice = st.sidebar.selectbox("项目", names, index=default_index)
+    choice = st.sidebar.selectbox("项目", names, index=default_index, key="project_choice")
 
     if choice.startswith("➕"):
         with st.sidebar.expander("新建项目", expanded=True):
@@ -1181,26 +1352,16 @@ def ui_project_sidebar() -> Tuple[Project, LLMConfig]:
                 st.session_state["active_project_id"] = pid
                 st.rerun()
 
-        # 如果用户选择“新建项目”但还没创建，就回退到当前已有项目（不会断言）
         active = load_project(st.session_state.get("active_project_id", projects[0].project_id)) or projects[0]
     else:
         pid = choice.split("(")[-1].strip(")")
         st.session_state["active_project_id"] = pid
         active = load_project(pid) or projects[0]
 
-    # --- LLM toggle（你要的侧边栏开关） ---
-    st.sidebar.markdown("---")
-    st.sidebar.markdown("#### LLM 校对与修正（可选）")
-    enabled = st.sidebar.checkbox("启用 LLM 校对与修正", value=False)
-    base_url = st.sidebar.text_input("Base URL（OpenAI兼容）", value=os.environ.get("LLM_BASE_URL", ""))
-    api_key = st.sidebar.text_input("API Key", value=os.environ.get("LLM_API_KEY", ""), type="password")
-    model = st.sidebar.text_input("Model", value=os.environ.get("LLM_MODEL", "qwen-plus"))
-    timeout = st.sidebar.slider("超时（秒）", 10, 180, 60)
-    llm_cfg = LLMConfig(enabled=enabled, base_url=base_url, api_key=api_key, model=model, timeout=timeout)
+    llm_cfg = ui_llm_sidebar(active)
 
-    # --- Export zip ---
     st.sidebar.markdown("---")
-    st.sidebar.markdown("#### 导出/打包")
+    st.sidebar.markdown("### 导出/打包")
     if st.sidebar.button("打包导出（JSON + Docx/Xlsx）", use_container_width=True):
         z = export_project_zip(active.project_id)
         st.sidebar.download_button(
@@ -1226,30 +1387,73 @@ def ui_header(prj: Project):
     )
     st.write("")
 
+
+# =========================
+# Page: Base training plan
+# =========================
+
+def _graph_to_dot(g: Dict[str, Any]) -> str:
+    nodes = g.get("nodes", []) if isinstance(g, dict) else []
+    edges = g.get("edges", []) if isinstance(g, dict) else []
+    lines = ["digraph G {", "rankdir=LR;", 'node [shape=box, style="rounded"];']
+    for n in nodes:
+        if not isinstance(n, dict):
+            continue
+        nid = str(n.get("id", "")).strip() or str(n.get("name", "")).strip()
+        label = str(n.get("label", "") or n.get("name", nid))
+        if nid:
+            label = label.replace('"', '\\"')
+            lines.append(f'"{nid}" [label="{label}"];')
+    for e in edges:
+        if not isinstance(e, dict):
+            continue
+        a = str(e.get("from", "")).strip()
+        b = str(e.get("to", "")).strip()
+        lab = str(e.get("label", "")).strip()
+        if a and b:
+            lab = lab.replace('"', '\\"')
+            if lab:
+                lines.append(f'"{a}" -> "{b}" [label="{lab}"];')
+            else:
+                lines.append(f'"{a}" -> "{b}";')
+    lines.append("}")
+    return "\n".join(lines)
+
 def ui_base_training_plan(pid: str, llm_cfg: LLMConfig):
     st.subheader("培养方案基座（全量内容库）")
-    st.caption("建议先把培养方案整理成权威内容库；后续所有教学文件将以此做一致性校验与自动填充。")
+    st.caption("先把培养方案整理成权威内容库；后续所有教学文件将以此做一致性校验与自动填充。")
 
-    plan = load_base_plan(pid) or {"meta": {}, "sections": {}, "appendices": {}, "course_graph": {"nodes": [], "edges": []}}
+    plan = load_base_plan(pid) or {
+        "meta": {},
+        "sections": {},
+        "appendices": {"tables": {
+            "七、专业教学计划表": [],
+            "八、学分统计表": [],
+            "九、教学进程表": [],
+            "十、课程设置对毕业要求支撑关系表": [],
+        }},
+        "course_graph": {"nodes": [], "edges": []},
+        "raw_pages_text": [],
+    }
 
     colL, colR = st.columns([1, 2])
 
     with colL:
-        up = st.file_uploader("上传培养方案 PDF（可选）", type=["pdf"])
+        up = st.file_uploader("上传培养方案 PDF（可选）", type=["pdf"], key="plan_pdf_uploader")
         if up:
             pdf_bytes = up.read()
             st.info("已读取PDF。你可以点击“抽取并写入基座”。")
-            if st.button("抽取并写入基座", type="primary", use_container_width=True):
+            if st.button("抽取并写入基座", type="primary", use_container_width=True, key="btn_extract_plan"):
                 extracted = base_plan_minimal_from_pdf(pdf_bytes)
                 save_base_plan(pid, extracted)
                 st.success("已写入培养方案基座。")
                 st.rerun()
 
         st.write("")
-        json_download_button("下载基座JSON", plan, f"base_training_plan-{pid}.json")
+        json_download_button("下载基座JSON", plan, f"base_training_plan-{pid}.json", key="dl_base_plan_json")
 
         st.write("")
-        if st.button("检查：是否缺少关键栏目", use_container_width=True):
+        if st.button("检查：是否缺少关键栏目(1-6)", use_container_width=True, key="btn_check_plan_missing"):
             missing = [t for t in SECTION_TITLES[:6] if not clean_text(plan.get("sections", {}).get(t, ""))]
             if missing:
                 st.warning("缺少栏目：\n- " + "\n- ".join(missing))
@@ -1257,38 +1461,35 @@ def ui_base_training_plan(pid: str, llm_cfg: LLMConfig):
                 st.success("6个核心栏目均已存在（仍建议人工快速扫读）。")
 
         st.write("")
-        st.markdown("##### 关系图（课程逻辑思维导图的最小表达）")
-        gtxt = st.text_area(
-            "course_graph JSON（nodes/edges）",
-            value=json.dumps(plan.get("course_graph", {"nodes": [], "edges": []}), ensure_ascii=False, indent=2),
-            height=180,
-        )
-        gobj = safe_json_load(gtxt, None)
-        if isinstance(gobj, dict) and "nodes" in gobj and "edges" in gobj:
-            if st.button("保存关系图", use_container_width=True):
-                plan["course_graph"] = gobj
-                save_base_plan(pid, plan)
-                st.success("已保存关系图。")
-        else:
-            st.warning("格式不正确：需要包含 nodes / edges。")
+        with st.expander("调试：分页原文（raw_pages_text）", expanded=False):
+            pages = plan.get("raw_pages_text", [])
+            st.write(f"页数：{len(pages)}")
+            if pages:
+                pno = st.number_input("页码（从0开始）", min_value=0, max_value=max(0, len(pages)-1), value=0)
+                st.text_area("该页文本", value=clamp(str(pages[int(pno)]), 20000), height=240)
 
     with colR:
-        st.markdown("##### 核心栏目（可编辑）")
-        sections = plan.get("sections", {})
-        tabs = st.tabs(SECTION_TITLES[:6])
+        st.markdown("##### 培养方案内容（按栏目展示，可编辑）")
+        sections = plan.get("sections", {}) if isinstance(plan.get("sections", {}), dict) else {}
+        append_tables = plan.get("appendices", {}).get("tables", {})
+        if not isinstance(append_tables, dict):
+            append_tables = {}
+        graph = plan.get("course_graph", {"nodes": [], "edges": []})
+        if not isinstance(graph, dict):
+            graph = {"nodes": [], "edges": []}
+
+        tabs = st.tabs(SECTION_TITLES)
 
         for i, title in enumerate(SECTION_TITLES[:6]):
             with tabs[i]:
-                sections[title] = st.text_area(title, value=sections.get(title, ""), height=240)
+                sections[title] = st.text_area(title, value=sections.get(title, ""), height=260, key=f"plan_text_{i}")
 
-                # 可选：对单栏用 LLM 校对（更强的“纠断行/补编号/修错别字/结构化提炼”）
                 if llm_available(llm_cfg):
-                    if st.button(f"用 LLM 校对该栏目：{title}", key=f"llm_fix_{i}"):
+                    if st.button(f"用 LLM 校对该栏目：{title}", key=f"btn_llm_fix_{i}"):
                         system = "你是高校培养方案的严谨审校助手。对给定栏目做纠错、断行修复、编号修复；尽量不改原意。只输出JSON。"
                         schema_hint = json.dumps({
                             "title": title,
                             "corrected_text": "纠错后的完整栏目文本（保持原意，修正常见断行/丢字/编号）",
-                            "key_points": ["可选：要点列表"],
                             "warnings": ["可选：缺失/疑点提示"],
                         }, ensure_ascii=False, indent=2)
                         user = f"栏目标题：{title}\n\n原文：\n{sections[title]}\n"
@@ -1304,24 +1505,84 @@ def ui_base_training_plan(pid: str, llm_cfg: LLMConfig):
                             st.error("LLM未返回可用JSON。")
                             st.code(raw)
 
+        for j, title in enumerate(SECTION_TITLES[6:10], start=6):
+            with tabs[j]:
+                st.caption("表格栏目：先提供可编辑模板（行可增删）。后续可接入 PDF 表格抽取/LLM重建自动填充。")
+                rows = append_tables.get(title, [])
+                if not isinstance(rows, list):
+                    rows = []
+                df = dataframe_safe(pd.DataFrame(rows))
+                edited_df = st.data_editor(df, num_rows="dynamic", use_container_width=True, key=f"plan_tbl_{j}")
+                append_tables[title] = edited_df.to_dict(orient="records")
+
+        with tabs[10]:
+            st.caption("关系图：用 nodes/edges 表达课程之间的先修/支撑/并行关系。")
+            colA, colB = st.columns(2)
+
+            with colA:
+                st.markdown("**Nodes**（建议字段：id / name / label）")
+                nodes_df = dataframe_safe(pd.DataFrame(graph.get("nodes", [])))
+                nodes_df = st.data_editor(nodes_df, num_rows="dynamic", use_container_width=True, key="graph_nodes_editor")
+                graph["nodes"] = nodes_df.to_dict(orient="records")
+
+            with colB:
+                st.markdown("**Edges**（建议字段：from / to / label）")
+                edges_df = dataframe_safe(pd.DataFrame(graph.get("edges", [])))
+                edges_df = st.data_editor(edges_df, num_rows="dynamic", use_container_width=True, key="graph_edges_editor")
+                graph["edges"] = edges_df.to_dict(orient="records")
+
+            st.markdown("**预览**")
+            try:
+                st.graphviz_chart(_graph_to_dot(graph), use_container_width=True)
+            except Exception:
+                st.code(_graph_to_dot(graph))
+
+            if llm_available(llm_cfg):
+                with st.expander("LLM：根据文本生成/完善关系图（可选）", expanded=False):
+                    hint = st.text_area("补充要求（可选）", value="尽量不要编造；优先从课程表/课程名中抽取；给出nodes/edges。", height=80)
+                    if st.button("用LLM生成/完善关系图", key="btn_llm_graph_build"):
+                        system = "你是培养方案课程关系图构建助手。根据输入文本，输出JSON：{nodes:[...], edges:[...] }。只输出JSON。"
+                        schema_hint = json.dumps({"nodes":[{"id":"", "name":"", "label":""}], "edges":[{"from":"","to":"","label":""}], "warnings":[]}, ensure_ascii=False, indent=2)
+                        user = f"培养方案关键文本（可能含课程列表/先修关系/课程体系）：\n{sections.get('四、主干学科、专业核心课程和主要实践性教学环节','')}\n\n补充要求：{hint}"
+                        obj, raw = llm_chat_json(llm_cfg, system, user, schema_hint=schema_hint)
+                        if obj and isinstance(obj, dict) and "nodes" in obj and "edges" in obj:
+                            graph["nodes"] = obj.get("nodes", [])
+                            graph["edges"] = obj.get("edges", [])
+                            plan["course_graph"] = graph
+                            plan.setdefault("llm_log", []).append({"at": now_str(), "title": "graph_build", "raw": raw})
+                            save_base_plan(pid, plan)
+                            st.success("已写入关系图。")
+                            st.rerun()
+                        else:
+                            st.error("LLM未返回可用 nodes/edges JSON。")
+                            st.code(raw)
+
         st.write("")
-        if st.button("保存基座（手工编辑）", type="primary", use_container_width=True):
+        if st.button("保存基座（全部栏目）", type="primary", use_container_width=True, key="btn_save_base_all"):
             plan["sections"] = sections
+            plan.setdefault("appendices", {})["tables"] = append_tables
+            plan["course_graph"] = graph
             plan.setdefault("meta", {})["updated_at"] = now_str()
             save_base_plan(pid, plan)
             st.success("已保存。")
 
+
+# =========================
+# Page: Templates
+# =========================
+
 def ui_templates(pid: str, llm_cfg: LLMConfig):
     st.subheader("模板化教学文件（上传/粘贴 → 抽取填充 → 校对 → 导出）")
-    st.caption("你提出的方案：把易模式化文件做成固定模板；支持上传现有文档后抽取填充，人工确认后导出规范文档，并项目化保存/打包。")
+    st.caption("把易模式化文件做成固定模板；上传现有文档后抽取填充，人工确认后导出规范文档，并项目化保存/打包。")
 
     colL, colR = st.columns([1.1, 1.9])
 
     with colL:
         st.markdown("##### 新建文档")
-        ttype = st.selectbox("模板类型", TEMPLATE_TYPES)
-        title = st.text_input("文档标题（项目内）", value="")
-        if st.button("新建文档", type="primary", use_container_width=True):
+        ttype = st.selectbox("模板类型", TEMPLATE_TYPES, key="new_ttype")
+        title = st.text_input("文档标题（项目内）", value="", key="new_title")
+
+        if st.button("新建文档", type="primary", use_container_width=True, key="btn_new_doc"):
             doc_obj = new_doc_object(ttype, title=title)
             doc_obj["data"] = schema_for(ttype)
             save_doc(pid, doc_obj)
@@ -1331,33 +1592,37 @@ def ui_templates(pid: str, llm_cfg: LLMConfig):
 
         st.write("")
         st.markdown("##### 导入已有内容")
-        up = st.file_uploader("上传 docx（推荐）", type=["docx"])
-        pasted = st.text_area("或粘贴全文（可选）", height=120)
+        up = st.file_uploader("上传 docx（推荐）", type=["docx"], key="docx_uploader")
+        pasted = st.text_area("或粘贴全文（可选）", height=120, key="paste_fulltext")
 
-        if st.button("抽取并填充到当前模板", use_container_width=True):
+        if st.button("抽取并填充到当前文档", use_container_width=True, key="btn_fill_current"):
             doc_id = st.session_state.get("active_doc_id")
             if not doc_id:
-                st.error("请先新建一个文档。")
+                st.error("请先新建/选择一个文档（右侧也可先做草稿并保存）。")
             else:
-                doc_obj = safe_json_load(doc_path(pid, doc_id).read_text("utf-8"), {})
-                src_text, src_tables = "", []
-                if up:
-                    b = up.read()
-                    src_text, src_tables = docx_extract_text_tables(b)
-                    doc_obj["source"]["uploaded_filename"] = up.name
-                    doc_obj["source"]["sha256"] = sha256_bytes(b)
-                if pasted.strip():
-                    src_text = (src_text + "\n" + pasted).strip()
+                doc_file = doc_path(pid, doc_id)
+                if not doc_file.exists():
+                    st.error("当前文档不存在。")
+                else:
+                    doc_obj = safe_json_load(doc_file.read_text("utf-8"), {})
+                    src_text, src_tables = "", []
+                    if up:
+                        b = up.read()
+                        src_text, src_tables = docx_extract_text_tables(b)
+                        doc_obj["source"]["uploaded_filename"] = up.name
+                        doc_obj["source"]["sha256"] = sha256_bytes(b)
+                    if pasted.strip():
+                        src_text = (src_text + "\n" + pasted).strip()
 
-                doc_obj["raw"]["text"] = src_text
-                doc_obj["raw"]["tables"] = [dataframe_safe(df).to_dict(orient="records") for df in src_tables]
+                    doc_obj["raw"]["text"] = src_text
+                    doc_obj["raw"]["tables"] = [dataframe_safe(df).to_dict(orient="records") for df in src_tables]
 
-                doc_obj["history"].append({"at": now_str(), "action": "heuristic_fill", "data": doc_obj.get("data", {})})
-                doc_obj["data"] = heuristic_fill(doc_obj["template_type"], src_text, src_tables)
-                save_doc(pid, doc_obj)
+                    doc_obj["history"].append({"at": now_str(), "action": "heuristic_fill", "data": doc_obj.get("data", {})})
+                    doc_obj["data"] = heuristic_fill(doc_obj["template_type"], src_text, src_tables)
+                    save_doc(pid, doc_obj)
 
-                st.success("已填充。请在右侧校对/编辑。")
-                st.rerun()
+                    st.success("已填充。请在右侧校对/编辑。")
+                    st.rerun()
 
         st.write("")
         st.markdown("##### 文档列表")
@@ -1373,40 +1638,64 @@ def ui_templates(pid: str, llm_cfg: LLMConfig):
                     if d["doc_id"] == cur:
                         idx = i
                         break
-            choice = st.selectbox("选择文档", opts, index=idx)
+            choice = st.selectbox("选择文档", opts, index=idx, key="doc_selector")
             st.session_state["active_doc_id"] = choice.split("(")[-1].strip(")")
 
             c1, c2 = st.columns(2)
             with c1:
-                if st.button("删除该文档", use_container_width=True):
+                if st.button("删除该文档", use_container_width=True, key="btn_delete_doc"):
                     delete_doc(pid, st.session_state["active_doc_id"])
                     st.session_state["active_doc_id"] = None
                     st.success("已删除。")
                     st.rerun()
             with c2:
-                if st.button("下载该文档JSON", use_container_width=True):
-                    doc_obj = safe_json_load(doc_path(pid, st.session_state["active_doc_id"]).read_text("utf-8"), {})
-                    json_download_button("下载JSON", doc_obj, f"{doc_obj['title']}-{doc_obj['doc_id']}.json")
+                doc_obj = safe_json_load(doc_path(pid, st.session_state["active_doc_id"]).read_text("utf-8"), {})
+                json_download_button("下载该文档JSON", doc_obj, f"{doc_obj.get('title','doc')}-{doc_obj.get('doc_id','')}.json", key="dl_doc_json")
 
     with colR:
         doc_id = st.session_state.get("active_doc_id")
+
+        # ✅ 关键增强：没有 active_doc 也展示“模板预览草稿”
         if not doc_id:
-            st.info("请在左侧新建/选择一个文档。")
+            st.markdown("##### 模板预览（未保存草稿）")
+            st.caption("左侧选择模板类型后，这里立即出现可编辑栏目；满意后点击“保存为新文档”。")
+
+            draft_type = st.session_state.get("new_ttype", TEMPLATE_TYPES[0])
+            draft = st.session_state.get("draft_data")
+            if not isinstance(draft, dict) or st.session_state.get("draft_type") != draft_type:
+                draft = schema_for(draft_type)
+                st.session_state["draft_data"] = draft
+                st.session_state["draft_type"] = draft_type
+
+            edited_draft = ui_render_editor(draft_type, draft)
+            st.session_state["draft_data"] = edited_draft
+
+            if st.button("保存为新文档", type="primary", use_container_width=True, key="btn_save_draft_as_doc"):
+                doc_obj = new_doc_object(draft_type, title=f"{draft_type}-{dt.datetime.now().strftime('%Y%m%d-%H%M')}")
+                doc_obj["data"] = edited_draft
+                save_doc(pid, doc_obj)
+                st.session_state["active_doc_id"] = doc_obj["doc_id"]
+                st.success("已保存为新文档。")
+                st.rerun()
             return
 
-        doc_obj = safe_json_load(doc_path(pid, doc_id).read_text("utf-8"), {})
-        if not doc_obj:
+        doc_file = doc_path(pid, doc_id)
+        if not doc_file.exists():
             st.warning("文档不存在。")
+            return
+
+        doc_obj = safe_json_load(doc_file.read_text("utf-8"), {})
+        if not doc_obj:
+            st.warning("文档读取失败。")
             return
 
         st.markdown(f"##### 编辑：{doc_obj['title']} · {doc_obj['template_type']}")
         st.caption(f"更新时间：{doc_obj.get('updated_at','')} · 来源：{doc_obj.get('source',{}).get('uploaded_filename','(无)')}")
 
-        # 可选：LLM结构化重建
         if llm_available(llm_cfg):
             with st.expander("LLM：结构化重建 / 校对（可选）", expanded=False):
                 extra = st.text_area("额外要求（可选）", value="尽量保留原意；修复断行；字段找不到就留空并给warnings。", height=80)
-                if st.button("用LLM重建结构化数据", type="primary"):
+                if st.button("用LLM重建结构化数据", type="primary", key="btn_llm_rebuild_doc"):
                     schema_hint = json.dumps(schema_for(doc_obj["template_type"]), ensure_ascii=False, indent=2)
                     system = (
                         "你是高校教学质量管理系统的结构化抽取助手。"
@@ -1433,10 +1722,8 @@ def ui_templates(pid: str, llm_cfg: LLMConfig):
                         st.error("LLM未返回有效JSON。")
                         st.code(raw)
 
-        # editor
         edited = ui_render_editor(doc_obj["template_type"], doc_obj.get("data", {}))
 
-        # consistency checks vs base plan
         plan = load_base_plan(pid)
         warnings = run_consistency_checks(doc_obj["template_type"], edited, plan) if plan else []
         if warnings:
@@ -1444,15 +1731,14 @@ def ui_templates(pid: str, llm_cfg: LLMConfig):
                 for w in warnings:
                     st.warning(w)
 
-        # Save / Export
         c1, c2, c3 = st.columns(3)
         with c1:
-            if st.button("保存", type="primary", use_container_width=True):
+            if st.button("保存", type="primary", use_container_width=True, key="btn_save_doc"):
                 doc_obj["data"] = edited
                 save_doc(pid, doc_obj)
                 st.success("已保存。")
         with c2:
-            if st.button("回滚到上一版", use_container_width=True):
+            if st.button("回滚到上一版", use_container_width=True, key="btn_rollback_doc"):
                 if doc_obj.get("history"):
                     last = doc_obj["history"].pop()
                     doc_obj["data"] = last.get("data", doc_obj["data"])
@@ -1462,36 +1748,36 @@ def ui_templates(pid: str, llm_cfg: LLMConfig):
                 else:
                     st.info("没有历史记录。")
         with c3:
-            json_download_button("下载JSON", doc_obj, f"{doc_obj['title']}-{doc_obj['doc_id']}.json")
+            json_download_button("下载JSON", doc_obj, f"{doc_obj['title']}-{doc_obj['doc_id']}.json", key="dl_doc_json2")
 
         st.write("")
         c4, c5 = st.columns(2)
         with c4:
-            if st.button("导出 DOCX", use_container_width=True):
-                b = export_docx_for_template(doc_obj["template_type"], edited, doc_obj["title"])
-                st.download_button(
-                    "下载 DOCX",
-                    data=b,
-                    file_name=f"{doc_obj['title']}.docx",
-                    mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-                    use_container_width=True,
-                )
+            b = export_docx_for_template(doc_obj["template_type"], edited, doc_obj["title"])
+            st.download_button(
+                "导出并下载 DOCX",
+                data=b,
+                file_name=f"{doc_obj['title']}.docx",
+                mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                use_container_width=True,
+                key="dl_docx",
+            )
         with c5:
-            if st.button("导出 XLSX（表格）", use_container_width=True):
-                x = export_xlsx_for_template(doc_obj["template_type"], edited)
-                if x:
-                    st.download_button(
-                        "下载 XLSX",
-                        data=x,
-                        file_name=f"{doc_obj['title']}.xlsx",
-                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                        use_container_width=True,
-                    )
-                else:
-                    st.info("该模板无可导出表格。")
+            x = export_xlsx_for_template(doc_obj["template_type"], edited)
+            if x:
+                st.download_button(
+                    "导出并下载 XLSX（表格）",
+                    data=x,
+                    file_name=f"{doc_obj['title']}.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    use_container_width=True,
+                    key="dl_xlsx",
+                )
+            else:
+                st.info("该模板无可导出表格。")
 
         with st.expander("原始抽取（文本/表格）", expanded=False):
-            st.text_area("raw_text", value=clamp(doc_obj.get("raw", {}).get("text", "")), height=220)
+            st.text_area("raw_text", value=clamp(doc_obj.get("raw", {}).get("text", "")), height=220, key="raw_text_view")
             rt = doc_obj.get("raw", {}).get("tables", [])
             if rt:
                 st.caption(f"raw_tables: {len(rt)} 个（展示第1个）")
@@ -1523,8 +1809,9 @@ def main():
         st.write("")
         st.markdown("##### 基座状态")
         secs = plan.get("sections", {})
-        st.write(f"核心栏目：{sum(1 for t in SECTION_TITLES[:6] if clean_text(secs.get(t,'')))} / 6")
-        st.write(f"关系图节点：{len(plan.get('course_graph',{}).get('nodes',[]))} · 边：{len(plan.get('course_graph',{}).get('edges',[]))}")
+        st.write(f"核心栏目(1-6)：{sum(1 for t in SECTION_TITLES[:6] if clean_text((secs or {}).get(t,'')))} / 6")
+        st.write(f"附表(7-10)：{len((plan.get('appendices',{}).get('tables',{}) or {}).keys())} 个栏目")
+        st.write(f"关系图节点：{len((plan.get('course_graph',{}) or {}).get('nodes',[]))} · 边：{len((plan.get('course_graph',{}) or {}).get('edges',[]))}")
 
         st.write("")
         st.markdown("##### 文件列表")
@@ -1541,129 +1828,8 @@ def main():
             st.info("暂无教学文件。")
 
         st.write("")
-        if st.button("下载项目zip（JSON+导出）", type="primary"):
-            z = export_project_zip(prj.project_id)
-            st.download_button("下载 zip", data=z, file_name=f"{prj.name}-{prj.project_id}.zip", mime="application/zip")
-
-
-def ui_llm_sidebar(project_obj=None) -> LLMConfig:
-    st.sidebar.markdown("---")
-    st.sidebar.markdown("### LLM（可选：用于校对/修正/补全）")
-
-    backend = _read_llm_defaults()
-
-    # 项目里如果存了 llm 配置（可选）
-    prj_llm = {}
-    if project_obj is not None and hasattr(project_obj, "llm") and isinstance(project_obj.llm, dict):
-        prj_llm = project_obj.llm
-
-    ui_defaults = {**backend, **prj_llm}
-
-    mode = st.sidebar.selectbox(
-        "配置来源",
-        ["自动(推荐)", "仅后台", "仅页面", "合并(页面优先)"],
-        index=0,
-    )
-
-    preset_name = st.sidebar.selectbox(
-        "Provider 选择",
-        list(PROVIDER_PRESETS.keys()),
-        index=0,
-    )
-    preset = PROVIDER_PRESETS[preset_name]
-    provider = preset["provider"]
-
-    enabled = st.sidebar.checkbox("启用 LLM 校对与修正", value=bool(ui_defaults.get("enabled", False)))
-
-    # 通用字段
-    api_key = st.sidebar.text_input("API Key", value=str(ui_defaults.get("api_key", "")), type="password")
-    model = st.sidebar.text_input("Model", value=str(ui_defaults.get("model", "")), help=preset.get("model_hint", ""))
-
-    # OpenAI兼容需要 base_url；custom_rest/原生也可以填
-    base_url = st.sidebar.text_input(
-        "Base URL",
-        value=str(ui_defaults.get("base_url", "")),
-        help=preset.get("base_url_hint", ""),
-    )
-
-    # 原生/自定义可填完整 endpoint_url
-    endpoint_url = st.sidebar.text_input(
-        "Endpoint URL（可选，用于原生/自定义覆盖）",
-        value=str(ui_defaults.get("endpoint_url", "")),
-        help="Gemini/Claude/自定义REST建议填完整URL；OpenAI兼容一般不需要。",
-    )
-
-    api_version = ""
-    if provider == "anthropic":
-        api_version = st.sidebar.text_input(
-            "Anthropic-Version（可选）",
-            value=str(ui_defaults.get("api_version", "")),
-            help="不确定就留空。不同网关可能要求不同版本字符串。",
-        )
-
-    timeout = st.sidebar.slider("超时（秒）", 10, 180, int(ui_defaults.get("timeout", 60)))
-    temperature = st.sidebar.slider("temperature", 0.0, 1.5, float(ui_defaults.get("temperature", 0.2)))
-    max_tokens = st.sidebar.slider("max_tokens", 256, 8192, int(ui_defaults.get("max_tokens", 2048)), step=256)
-
-    extra_headers_json = st.sidebar.text_area(
-        "额外 Headers（JSON，可选）",
-        value=str(ui_defaults.get("extra_headers_json", "")),
-        help='例如：{"X-Org":"xxx"}；自定义REST很常用。',
-        height=80,
-    )
-    extra_params_json = st.sidebar.text_area(
-        "额外 Params（JSON，可选）",
-        value=str(ui_defaults.get("extra_params_json", "")),
-        help='例如：{"top_p":0.9} 或覆盖payload结构；自定义REST很常用。',
-        height=80,
-    )
-
-    ui_cfg = dict(
-        enabled=enabled,
-        provider=provider,
-        api_key=api_key,
-        base_url=base_url,
-        model=model,
-        timeout=timeout,
-        temperature=temperature,
-        max_tokens=max_tokens,
-        extra_headers_json=extra_headers_json,
-        extra_params_json=extra_params_json,
-        endpoint_url=endpoint_url,
-        api_version=api_version,
-    )
-
-    # 合并逻辑
-    if mode == "仅后台":
-        merged = backend
-    elif mode == "仅页面":
-        merged = ui_cfg
-    else:
-        merged = dict(backend)
-        for k, v in ui_cfg.items():
-            if k in ["enabled"]:
-                merged[k] = bool(v)
-            elif isinstance(v, str):
-                if v.strip() != "":
-                    merged[k] = v.strip()
-            elif v is not None:
-                merged[k] = v
-
-    llm_cfg = LLMConfig(**merged)
-
-    # 保存到项目（不建议保存 api_key，除非你明确要）
-    if project_obj is not None and st.sidebar.button("保存为本项目默认（不含Key）", use_container_width=True):
-        safe = dict(merged)
-        safe["api_key"] = ""
-        project_obj.llm = safe
-        # 你项目保存函数按你工程里现有的来
-        # save_project(project_obj)
-        st.sidebar.success("已保存（Key未写入项目）。")
-
-    return llm_cfg
-
-
+        z = export_project_zip(prj.project_id)
+        st.download_button("下载项目zip（JSON+导出）", data=z, file_name=f"{prj.name}-{prj.project_id}.zip", mime="application/zip", use_container_width=True)
 
 if __name__ == "__main__":
     main()
-    llm_cfg = ui_llm_sidebar(project_obj=prj)  # prj 是你当前项目对象，没有就传 None
