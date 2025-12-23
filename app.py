@@ -909,7 +909,7 @@ def call_gemini_structured(api_key: str, prompt: str) -> Any:
     """调用 Gemini 并强制要求返回 JSON 列表或字典"""
     try:
         genai.configure(api_key=api_key)
-        model = genai.GenerativeModel('gemini-1.5-flash')
+        model = genai.GenerativeModel('gemini-2.5-flash')
         response = model.generate_content(
             prompt,
             generation_config={"response_mime_type": "application/json"}
