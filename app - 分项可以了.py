@@ -24,20 +24,6 @@ import pandas as pd
 import streamlit as st
 import pdfplumber
 
-def extract_with_gemini(api_key: str, raw_text: str, task_type: str):
-    genai.configure(api_key=api_key)
-    model = genai.GenerativeModel('gemini-1.5-pro') # 建议使用 pro 版本处理长文档
-    
-    if task_type == "sections":
-        prompt = f"请从以下文本中提取培养方案的 1-11 项内容，按 JSON 格式返回：\n\n{raw_text}"
-    elif task_type == "table_align":
-        prompt = f"请将以下原始表格数据对齐到标准教学计划表模版：\n\n{raw_text}"
-        
-    response = model.generate_content(
-        prompt,
-        generation_config={"response_mime_type": "application/json"} # 强制返回 JSON
-    )
-    return json.loads(response.text)
 
 # ============================================================
 # JSON serialization helper
@@ -775,196 +761,28 @@ def ui_base_training_plan(project: Project):
             st.info("逻辑思维导图（附表5）通常是图片/流程图，pdfplumber 的表格抽取不一定有效。可后续加“末页图片抽取”。")
 
 
-# def main():
-    # st.set_page_config(page_title="Teaching Agent Suite", page_icon="🧠", layout="wide")
-    # _init_state()
-
-    # prj = ui_project_sidebar()
-    # _render_top_header(prj)
-
-    # tab1, tab2, tab3 = st.tabs(["培养方案基座", "模板化教学文件", "项目概览"])
-    # with tab1:
-        # ui_base_training_plan(prj)
-    # with tab2:
-        # st.info("这里留给你的“模板化教学文件”模块（你原来的生成/校对/导出流程可以放回这里）。")
-    # with tab3:
-        # st.write("项目ID：", prj.project_id)
-        # st.write("最后更新：", prj.updated_at)
-        # payload = st.session_state.project_data.get(prj.project_id)
-        # if payload:
-            # st.write("已写入基座：✅")
-            # st.write("已抽取附表：", payload.get("debug", {}).get("assigned", {}))
-        # else:
-            # st.write("已写入基座：❌")
-
-# app.py
-
-
-# ============================================================
-# LLM 核心处理模块
-# ============================================================
-def call_gemini_ai(api_key: str, prompt: str, system_instruction: str = "") -> Any:
-    """调用 Gemini 1.5 Pro 并返回结构化数据"""
-    try:
-        genai.configure(api_key=api_key)
-        # 使用 1.5 Flash 或 Pro 均可，Pro 对长表格理解更佳
-        model = genai.GenerativeModel(
-            model_name="gemini-1.5-flash",
-            system_instruction=system_instruction
-        )
-        
-        response = model.generate_content(
-            prompt,
-            generation_config={"response_mime_type": "application/json"}
-        )
-        return json.loads(response.text)
-    except Exception as e:
-        st.error(f"AI 抽取失败: {str(e)}")
-        return None
-
-def ai_extract_sections(api_key: str, full_text: str) -> Dict[str, str]:
-    """使用 AI 提取 1-11 项正文"""
-    sys_msg = "你是一个高校教务专家，负责从培养方案中准确提取信息。请严格按照 1-11 的键值返回 JSON。"
-    prompt = f"""
-    请从以下培养方案原始文本中，提取出对应的 11 个栏目内容。
-    1: 培养目标
-    2: 毕业要求
-    3: 专业定位与特色
-    4: 主干学科/核心课程/实践环节
-    5: 标准学制与授予学位
-    6: 毕业条件
-    7-11: 仅提取这些章节的标题和简短描述（如果有）。
-    
-    原始文本：
-    {full_text[:15000]} # 截取前 15000 字避免超出 Token 限制
-    """
-    return call_gemini_ai(api_key, prompt, sys_msg)
-
-def ai_align_table(api_key: str, raw_table_data: List[List[str]], table_type: str) -> pd.DataFrame:
-    """使用 AI 将非结构化表格行对齐到标准模版列"""
-    cols_map = {
-        "7": ["课程体系", "课程编码", "课程名称", "开课模式", "考核方式", "学分", "总学时", "上课学期"],
-        "8": ["课程体系", "必修学分", "选修学分", "合计", "学分占比"],
-        "10": ["课程名称", "指标点1.1", "指标点1.2", "指标点2.1", "以此类推..."]
-    }
-    target_cols = cols_map.get(table_type, [])
-    
-    sys_msg = f"你负责将混乱的 PDF 表格行转换成标准的 {target_cols} 格式。返回格式为 [{{...}}, {{...}}]"
-    prompt = f"""
-    以下是从 PDF 附表{table_type}中抽取的原始行数据。请根据语义将其映射到标准列：{target_cols}。
-    如果原始数据跨行或错位，请根据课程名称进行合并。
-    原始数据：{json.dumps(raw_table_data, ensure_ascii=False)}
-    """
-    result = call_gemini_ai(api_key, prompt, sys_msg)
-    if result and isinstance(result, list):
-        return pd.DataFrame(result)
-    return pd.DataFrame(columns=target_cols)
-
-# ============================================================
-# 原有 Helper 与 JSON 序列化（保持不变，用于兼容性）
-# ============================================================
-def payload_to_jsonable(obj):
-    if isinstance(obj, pd.DataFrame):
-        return obj.fillna("").to_dict(orient="records")
-    if isinstance(obj, (bytes, bytearray)):
-        return base64.b64encode(bytes(obj)).decode("ascii")
-    if isinstance(obj, (_dt.datetime, _dt.date)):
-        return obj.isoformat()
-    if isinstance(obj, dict):
-        return {str(k): payload_to_jsonable(v) for k, v in obj.items()}
-    if isinstance(obj, list):
-        return [payload_to_jsonable(x) for x in obj]
-    return obj
-
-def _compact_lines(s: str) -> str:
-    s = (s or "").replace("\u00a0", " ")
-    s = re.sub(r"[ \t]+", " ", s)
-    s = re.sub(r"\n{3,}", "\n\n", s)
-    return s.strip()
-
-def _read_pdf_pages_text(pdf_bytes: bytes) -> List[str]:
-    pages = []
-    with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
-        for p in pdf.pages:
-            pages.append(_compact_lines(p.extract_text() or ""))
-    return pages
-
-# ============================================================
-# UI 与 主逻辑
-# ============================================================
 def main():
-    st.set_page_config(page_title="Teaching Agent Suite AI", layout="wide")
-    
-    # 侧边栏：API Key 配置
-    with st.sidebar:
-        st.title("⚙️ 设置")
-        api_key = st.text_input("Gemini API Key", type="password", help="从 Google AI Studio 获取")
-        st.divider()
-        st.caption("v0.7 (AI Powered)")
+    st.set_page_config(page_title="Teaching Agent Suite", page_icon="🧠", layout="wide")
+    _init_state()
 
-    # 项目初始化
-    if "project_data" not in st.session_state:
-        st.session_state.project_data = {}
+    prj = ui_project_sidebar()
+    _render_top_header(prj)
 
-    st.header("🧠 教学文件智能工作台")
-    
-    tab1, tab2 = st.tabs(["培养方案基座 (AI 抽取)", "项目概览"])
-    
+    tab1, tab2, tab3 = st.tabs(["培养方案基座", "模板化教学文件", "项目概览"])
     with tab1:
-        col_l, col_r = st.columns([1, 1.5])
-        
-        with col_l:
-            pdf = st.file_uploader("上传培养方案 PDF", type=["pdf"])
-            use_ai = st.toggle("启用 Gemini AI 增强抽取", value=True)
-            
-            if st.button("开始智能抽取", type="primary", use_container_width=True):
-                if not pdf:
-                    st.warning("请上传 PDF")
-                elif use_ai and not api_key:
-                    st.error("请先在侧边栏配置 API Key")
-                else:
-                    with st.spinner("正在解析 PDF 并请求 AI 处理..."):
-                        pdf_bytes = pdf.getvalue()
-                        pages = _read_pdf_pages_text(pdf_bytes)
-                        full_text = "\n".join(pages)
-                        
-                        # 1. 基础文字处理
-                        sections = {}
-                        if use_ai:
-                            sections = ai_extract_sections(api_key, full_text)
-                        
-                        # 2. 表格处理 (附表 1 示例)
-                        tables = {}
-                        with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf_obj:
-                            # 假设附表1在后面几页，选取有表格的页面
-                            raw_rows = []
-                            for p in pdf_obj.pages[-12:]: # 扫描后12页找表格
-                                tbl = p.extract_table()
-                                if tbl: raw_rows.extend(tbl)
-                            
-                            if use_ai and raw_rows:
-                                tables["7"] = ai_align_table(api_key, raw_rows[:100], "7") # 取前100行测试
-                        
-                        st.session_state.project_data = {
-                            "sections": sections or {},
-                            "tables": tables,
-                            "raw_text": full_text
-                        }
-                        st.success("抽取完成！")
+        ui_base_training_plan(prj)
+    with tab2:
+        st.info("这里留给你的“模板化教学文件”模块（你原来的生成/校对/导出流程可以放回这里）。")
+    with tab3:
+        st.write("项目ID：", prj.project_id)
+        st.write("最后更新：", prj.updated_at)
+        payload = st.session_state.project_data.get(prj.project_id)
+        if payload:
+            st.write("已写入基座：✅")
+            st.write("已抽取附表：", payload.get("debug", {}).get("assigned", {}))
+        else:
+            st.write("已写入基座：❌")
 
-        with col_r:
-            data = st.session_state.project_data
-            if not data:
-                st.info("待抽取数据...")
-            else:
-                sec_list = ["1", "2", "3", "4", "5", "6"]
-                choice = st.selectbox("查看栏目", sec_list, format_func=lambda x: f"栏目 {x}")
-                st.text_area("内容", value=data["sections"].get(choice, ""), height=300)
-                
-                if "7" in data["tables"]:
-                    st.markdown("### 自动生成的专业教学计划表 (附表1)")
-                    st.data_editor(data["tables"]["7"], use_container_width=True)
 
 if __name__ == "__main__":
     main()
-
