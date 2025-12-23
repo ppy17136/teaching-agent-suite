@@ -977,7 +977,121 @@ def find_appendix_pages(pdf_bytes: bytes) -> Dict[str, List[int]]:
             if "附表1" in text or "专业教学计划表" in text:
                 found["7"].append(i)
     return found
+# app.py 升级版逻辑
+import io, json, pd, streamlit as st, pdfplumber
+import google.generativeai as genai
 
+# ============================================================
+# 定义标准字段：确保 Table 1 列完全符合您的要求
+# ============================================================
+TABLE_1_COLS = [
+    "课程体系", "课程编码", "课程名称", "开课模式", "考核方式", 
+    "学分", "总学时", "内_讲课", "内_实验", "内_上机", "内_实践", 
+    "外_学分", "外_学时", "上课学期", "专业方向", "学位课", "备注"
+]
+
+# ============================================================
+# AI 逻辑升级
+# ============================================================
+def ai_multi_table_extractor(api_key: str, raw_data: str, table_type: str):
+    """
+    table_type: "1" (教学计划), "2" (学分统计), "4" (支撑关系)
+    """
+    genai.configure(api_key=api_key)
+    model = genai.GenerativeModel('gemini-1.5-flash')
+    
+    # 针对不同表类型定制不同的 Prompt
+    prompts = {
+        "1": f"将原始数据转换为 JSON 列表。列必须精确匹配：{TABLE_1_COLS}。注意将‘课内/课外’学时分别拆分到对应列。",
+        "2": "提取学分统计表。包含列：[课程体系, 必修学分, 选修学分, 合计, 比例]。",
+        "4": "提取课程对毕业要求的支撑关系。包含列：[课程名称, 毕业要求编号, 支撑强度(H/M/L)]。"
+    }
+    
+    prompt = f"{prompts.get(table_type, '')}\n原始数据：{raw_data}"
+    response = model.generate_content(prompt, generation_config={"response_mime_type": "application/json"})
+    return json.loads(response.text)
+
+# ============================================================
+# 主解析引擎：自动识别附表并分流处理
+# ============================================================
+def full_appendix_processor(api_key, pdf_bytes):
+    all_results = {"1": [], "2": [], "3": [], "4": [], "5": None}
+    
+    with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+        for i, page in enumerate(pdf.pages):
+            text = page.extract_text() or ""
+            
+            # 识别当前页属于哪个附表
+            target = None
+            if "附表1" in text or "专业教学计划表" in text: target = "1"
+            elif "附表2" in text or "学分统计表" in text: target = "2"
+            elif "附表3" in text or "教学进程表" in text: target = "3"
+            elif "附表4" in text or "支撑关系表" in text: target = "4"
+            elif "附表5" in text or "逻辑思维导图" in text: target = "5"
+            
+            if target in ["1", "2", "4"]:
+                table_data = page.extract_table()
+                if table_data:
+                    # 分块调用 AI 保证精度
+                    st.write(f"正在深度解析第 {i+1} 页 (附表{target})...")
+                    res = ai_multi_table_extractor(api_key, json.dumps(table_data, ensure_ascii=False), target)
+                    all_results[target].extend(res)
+            
+            elif target == "3":
+                # 教学进程表通常是符号矩阵，直接让 AI 总结文字描述
+                all_results["3"].append(text)
+            
+            elif target == "5":
+                # 逻辑思维导图通常是图片 
+                all_results["5"] = f"检测到逻辑导图在第 {i+1} 页。建议使用 Vision 模式查看。"
+
+    return all_results
+
+# ============================================================
+# Streamlit UI
+# ============================================================
+def main():
+    st.set_page_config(layout="wide", page_title="全量教学文件抽取")
+    
+    with st.sidebar:
+        api_key = st.text_input("Gemini API Key", type="password")
+        
+    st.title("📑 全量培养方案智能抽取")
+    file = st.file_uploader("上传 2024培养方案.pdf", type="pdf")
+    
+    if file and api_key:
+        if st.button("一键全量抽取"):
+            results = full_appendix_processor(api_key, file.getvalue())
+            st.session_state.all_appendix = results
+            st.success("所有附表解析完毕！")
+
+    if "all_appendix" in st.session_state:
+        res = st.session_state.all_appendix
+        
+        tab1, tab2, tab3, tab4, tab5 = st.tabs(["附表1：教学计划", "附表2：学分统计", "附表3：进程表", "附表4：支撑矩阵", "附表5：逻辑图"])
+        
+        with tab1:
+            df1 = pd.DataFrame(res["1"])
+            # 确保列序一致
+            df1 = df1.reindex(columns=TABLE_1_COLS)
+            st.dataframe(df1, use_container_width=True)
+            
+        with tab2:
+            st.table(pd.DataFrame(res["2"]))
+            
+        with tab3:
+            st.write("### 教学进程安排总结")
+            for t in res["3"]: st.info(t)
+            
+        with tab4:
+            st.write("### 课程与毕业要求支撑关系")
+            st.dataframe(pd.DataFrame(res["4"]), use_container_width=True)
+            
+        with tab5:
+            st.warning(res["5"])
+
+if __name__ == "__main__":
+    main()
 # ============================================================
 # 3. Streamlit UI 主程序
 # ============================================================
