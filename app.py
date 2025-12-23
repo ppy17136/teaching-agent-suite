@@ -25,7 +25,6 @@ import streamlit as st
 import pdfplumber
 import google.generativeai as genai
 
-
 def extract_with_gemini(api_key: str, raw_text: str, task_type: str):
     genai.configure(api_key=api_key)
     model = genai.GenerativeModel('gemini-1.5-pro') # 建议使用 pro 版本处理长文档
@@ -996,7 +995,7 @@ def ai_multi_table_extractor(api_key: str, raw_data: str, table_type: str):
     table_type: "1" (教学计划), "2" (学分统计), "4" (支撑关系)
     """
     genai.configure(api_key=api_key)
-    model = genai.GenerativeModel('gemini-1.5-flash')
+    model = genai.GenerativeModel('gemini-2.5-flash')
     
     # 针对不同表类型定制不同的 Prompt
     prompts = {
@@ -1093,60 +1092,150 @@ if __name__ == "__main__":
 # ============================================================
 # 3. Streamlit UI 主程序
 # ============================================================
-def main():
-    st.set_page_config(page_title="教学文件智能工作台 V2", layout="wide")
-    
-    with st.sidebar:
-        st.header("⚙️ 配置")
-        key = st.text_input("Gemini API Key", type="password")
-        st.info("提示：针对长文档，建议使用分段抽取模式以保证信息完整性。")
 
-    st.title("🧠 教学文件智能工作台")
-    
-    up_file = st.file_uploader("上传培养方案 PDF", type="pdf")
-    
-    if up_file and key:
-        if st.button("开始全量深度抽取", type="primary"):
-            with st.status("深度解析中...", expanded=True) as status:
-                pdf_bytes = up_file.getvalue()
-                
-                # 步骤 1：文本预读
-                st.write("正在读取 PDF 文本...")
-                with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
-                    all_pages = [p.extract_text() for p in pdf.pages]
-                
-                # 步骤 2：AI 提取 1-6 项
-                st.write("AI 正在解析 1-6 项正文...")
-                sections = ai_extract_full_sections(key, all_pages)
-                
-                # 步骤 3：定位并提取长表格 (附表1)
-                st.write("正在定位附表 1 并进行全量校对...")
-                page_indices = find_appendix_pages(pdf_bytes)["7"]
-                all_raw_rows = []
-                with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
-                    for idx in page_indices:
-                        table = pdf.pages[idx].extract_table()
-                        if table: all_raw_rows.extend(table[1:]) # 跳过表头
-                
-                table_df = ai_process_long_table(key, all_raw_rows)
-                
-                st.session_state.final_data = {"sections": sections, "table": table_df}
-                status.update(label="抽取完成！", state="complete")
 
-    # 结果展示
-    if "final_data" in st.session_state:
-        data = st.session_state.final_data
-        
-        col1, col2 = st.columns([1, 2])
-        with col1:
-            st.subheader("1-6 项正文")
-            sec_id = st.selectbox("选择栏目", list(data["sections"].keys()))
-            st.text_area("内容", value=data["sections"][sec_id], height=400)
+# ============================================================
+# 1. 字段定义与配置
+# ============================================================
+TABLE_1_FULL_COLS = [
+    "课程体系", "课程编码", "课程名称", "开课模式", "考核方式", 
+    "学分", "总学时", "内_讲课", "内_实验", "内_上机", "内_实践", 
+    "外_学分", "外_学时", "上课学期", "专业方向", "学位课", "备注"
+]
+
+def configure_ai(api_key: str):
+    genai.configure(api_key=api_key)
+    return genai.GenerativeModel('gemini-1.5-flash')
+
+# ============================================================
+# 2. AI 抽取逻辑 (核心)
+# ============================================================
+def ai_query_json(model, prompt: str):
+    """通用结构化 JSON 抽取"""
+    try:
+        response = model.generate_content(
+            prompt,
+            generation_config={"response_mime_type": "application/json"}
+        )
+        return json.loads(response.text)
+    except Exception as e:
+        st.error(f"AI 解析出错: {e}")
+        return []
+
+def process_table_1(model, raw_rows: List[List[str]]):
+    """处理教学计划表：支持超细分列"""
+    prompt = f"""
+    你是一个教务数据助手。请将原始表格行转换为 JSON 列表。
+    必须严格遵循以下字段映射：{TABLE_1_FULL_COLS}。
+    
+    特别要求：
+    1. 识别“课内学时分配”中的 讲课、实验、上机、实践 字段 。
+    2. 识别“学位课”列，若有“√”或“是”则标记为“学位课” [cite: 108, 110]。
+    3. 识别课程所属体系（如通识教育、学科基础） 。
+    
+    原始数据：{json.dumps(raw_rows, ensure_ascii=False)}
+    """
+    return ai_query_json(model, prompt)
+
+# ============================================================
+# 3. PDF 解析引擎
+# ============================================================
+def parse_full_document(api_key, pdf_bytes):
+    model = configure_ai(api_key)
+    results = {"sections": {}, "tables": {"1": [], "2": [], "4": []}, "others": {}}
+    
+    with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+        # 1. 提取前几页正文 (1-6项)
+        header_text = "\n".join([p.extract_text() or "" for p in pdf.pages[:6]])
+        sec_prompt = """
+        提取 1-6 项正文：1.培养目标, 2.毕业要求, 3.专业定位与特色, 
+        4.主干学科/核心课程, 5.学制与学位, 6.毕业条件。
+        返回 JSON 字典，键为 "1" 到 "6"。
+        """
+        results["sections"] = ai_query_json(model, f"{sec_prompt}\n内容：{header_text}")
+
+        # 2. 扫描所有附表
+        for i, page in enumerate(pdf.pages):
+            text = page.extract_text() or ""
+            table = page.extract_table()
+            if not table: continue
+
+            # 附表1 识别 (可能跨多页)
+            if "附表1" in text or "教学计划表" in text:
+                st.write(f"正在深度解析：附表1 (第 {i+1} 页)...")
+                res = process_table_1(model, table[1:])
+                results["tables"]["1"].extend(res)
             
-        with col2:
-            st.subheader("自动生成的专业教学计划表 (全量)")
-            st.dataframe(data["table"], use_container_width=True, height=600)
-            st.download_button("导出 Excel", data=data["table"].to_csv().encode('utf-8'), file_name="teaching_plan.csv")
+            # 附表2 识别
+            elif "附表2" in text or "学分统计" in text:
+                st.write(f"正在同步数据：附表2 (第 {i+1} 页)...")
+                prompt = "提取学分统计表 JSON。字段：[体系, 学期学分, 合计, 比例]。"
+                res = ai_query_json(model, f"{prompt}\n数据：{json.dumps(table)}")
+                results["tables"]["2"].extend(res)
+            
+            # 附表4 识别
+            elif "附表4" in text or "支撑关系" in text:
+                st.write(f"正在矩阵映射：附表4 (第 {i+1} 页)...")
+                prompt = "将课程与毕业要求的支撑关系转为列表 JSON。字段：[课程名称, 毕业要求点, 强度]。"
+                res = ai_query_json(model, f"{prompt}\n数据：{json.dumps(table)}")
+                results["tables"]["4"].extend(res)
+
+    return results
+
+# ============================================================
+# 4. Streamlit UI (修复 ID 冲突)
+# ============================================================
+def main():
+    st.set_page_config(layout="wide", page_title="Teaching Agent Suite Pro")
+    
+    # 侧边栏设置 (使用唯一 key 修复错误)
+    with st.sidebar:
+        st.title("⚙️ 配置中心")
+        api_key = st.text_input("Gemini API Key", type="password", key="main_api_key_input")
+        st.caption("版本：v0.8 (AI 全量抽取)")
+
+    st.header("🧠 培养方案全量智能工作台")
+    file = st.file_uploader("上传培养方案 PDF", type="pdf", key="pdf_uploader_main")
+
+    if file and api_key:
+        if st.button("🚀 执行全量深度抽取", key="run_btn"):
+            with st.spinner("AI 正在阅读 1-11 项并解析所有附表..."):
+                start_time = time.time()
+                data = parse_full_document(api_key, file.getvalue())
+                st.session_state.all_data = data
+                st.success(f"抽取成功！耗时：{int(time.time() - start_time)}秒")
+
+    if "all_data" in st.session_state:
+        d = st.session_state.all_data
+        
+        # 定义展示 Tabs
+        t1, t2, t3, t4, t5 = st.tabs(["1-11正文", "附表1:计划表", "附表2:学分统计", "附表4:支撑关系", "附表3&5:进程与图"])
+        
+        with t1:
+            sec_pick = st.selectbox("选择章节", ["1","2","3","4","5","6"], key="sec_select")
+            st.markdown(f"### {sec_pick} 内容提取结果")
+            st.text_area("内容文本", value=d["sections"].get(sec_pick, ""), height=400, key=f"ta_{sec_pick}")
+            
+        with t2:
+            st.markdown("### 专业教学计划表 (全字段校对)")
+            df1 = pd.DataFrame(d["tables"]["1"])
+            if not df1.empty:
+                # 重新对齐列顺序
+                df1 = df1.reindex(columns=TABLE_1_FULL_COLS)
+                st.data_editor(df1, use_container_width=True, key="editor_t1")
+            
+        with t3:
+            st.markdown("### 学分统计表")
+            st.table(pd.DataFrame(d["tables"]["2"]))
+            
+        with t4:
+            st.markdown("### 课程设置对毕业要求支撑关系表")
+            st.dataframe(pd.DataFrame(d["tables"]["4"]), use_container_width=True, key="editor_t4")
+
+        with t5:
+            st.info("附表3 (进程表) 与 附表5 (逻辑图) 通常包含大量复杂符号或图像。")
+            st.markdown("- **附表3**：建议在正文中查看提取的时间节点 [cite: 116, 122]。")
+            st.markdown("- **附表5**：逻辑思维导图请参考 PDF 原文最后两页 [cite: 135, 210]。")
 
 if __name__ == "__main__":
     main()
