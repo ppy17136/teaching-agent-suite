@@ -25,6 +25,315 @@ from typing import Any, Dict, List, Optional, Tuple
 import streamlit as st
 import pandas as pd
 
+import os, json, time
+from dataclasses import dataclass, asdict
+from typing import Any, Dict, List, Optional
+import requests
+import streamlit as st
+
+
+# -------------------------
+# LLM Config + Provider presets
+# -------------------------
+@dataclass
+class LLMConfig:
+    enabled: bool = False
+    provider: str = "openai_compat"   # openai_compat / anthropic / gemini / custom_rest
+    api_key: str = ""
+    base_url: str = ""                # openai_compat: https://xxx/v1 ; custom_rest: full URL
+    model: str = ""
+    timeout: int = 60
+    temperature: float = 0.2
+    max_tokens: int = 2048
+
+    # for advanced / custom
+    extra_headers_json: str = ""      # JSON dict string
+    extra_params_json: str = ""       # JSON dict string
+    # gemini/anthropic extra
+    api_version: str = ""             # optional
+    endpoint_url: str = ""            # gemini/custom full URL override
+
+
+def _safe_json_loads(s: str) -> Dict[str, Any]:
+    if not s or not str(s).strip():
+        return {}
+    try:
+        obj = json.loads(s)
+        return obj if isinstance(obj, dict) else {}
+    except Exception:
+        return {}
+
+
+def _read_llm_defaults() -> Dict[str, Any]:
+    """
+    Defaults priority: secrets.llm > env > hardcode
+    """
+    s = {}
+    try:
+        s = dict(st.secrets.get("llm", {}))
+    except Exception:
+        s = {}
+
+    return {
+        "enabled": bool(s.get("enabled", False)),
+        "provider": str(s.get("provider", os.environ.get("LLM_PROVIDER", "openai_compat"))),
+        "api_key": str(s.get("api_key", os.environ.get("LLM_API_KEY", ""))),
+        "base_url": str(s.get("base_url", os.environ.get("LLM_BASE_URL", ""))),
+        "model": str(s.get("model", os.environ.get("LLM_MODEL", ""))),
+        "timeout": int(s.get("timeout", int(os.environ.get("LLM_TIMEOUT", 60)))),
+        "temperature": float(s.get("temperature", float(os.environ.get("LLM_TEMPERATURE", 0.2)))),
+        "max_tokens": int(s.get("max_tokens", int(os.environ.get("LLM_MAX_TOKENS", 2048)))),
+        "extra_headers_json": str(s.get("extra_headers_json", "")),
+        "extra_params_json": str(s.get("extra_params_json", "")),
+        "endpoint_url": str(s.get("endpoint_url", "")),
+        "api_version": str(s.get("api_version", "")),
+    }
+
+
+# 你可以给一些“预设模板”，但不要把 base_url 写死成唯一答案（平台经常变）。
+# 这些 preset 的核心作用：让 UI 有“品牌选择”，同时告诉用户要填哪些字段。
+PROVIDER_PRESETS: Dict[str, Dict[str, Any]] = {
+    # --- OpenAI compatible: 只要平台提供 OpenAI 兼容接口，就选这个 ---
+    "OpenAI / OpenAI兼容（通用）": {
+        "provider": "openai_compat",
+        "base_url_hint": "例如：https://xxx/v1 （通常以 /v1 结尾）",
+        "model_hint": "例如：gpt-4.1-mini / deepseek-chat / qwen-plus / kimi-k1 / yi-lightning 等（以你平台实际为准）",
+    },
+    "DeepSeek（通常可用OpenAI兼容）": {
+        "provider": "openai_compat",
+        "base_url_hint": "填 DeepSeek 提供的 OpenAI 兼容 base_url（一般以 /v1 结尾）",
+        "model_hint": "填平台给的 model id",
+    },
+    "通义千问 / 阿里云 DashScope/百炼（通常可用OpenAI兼容）": {
+        "provider": "openai_compat",
+        "base_url_hint": "填 DashScope/百炼 的 OpenAI 兼容 base_url",
+        "model_hint": "填平台给的 model id（如 qwen-*）",
+    },
+    "豆包 Doubao（通常可用OpenAI兼容）": {
+        "provider": "openai_compat",
+        "base_url_hint": "填 Doubao 的 OpenAI 兼容 base_url",
+        "model_hint": "填平台给的 model id",
+    },
+    "零一万物 Yi（通常可用OpenAI兼容）": {
+        "provider": "openai_compat",
+        "base_url_hint": "填 Yi 的 OpenAI 兼容 base_url",
+        "model_hint": "填平台给的 model id",
+    },
+    "月之暗面 Kimi（通常可用OpenAI兼容）": {
+        "provider": "openai_compat",
+        "base_url_hint": "填 Kimi 的 OpenAI 兼容 base_url",
+        "model_hint": "填平台给的 model id",
+    },
+    "智谱AI GLM（通常可用OpenAI兼容）": {
+        "provider": "openai_compat",
+        "base_url_hint": "填 GLM 的 OpenAI 兼容 base_url",
+        "model_hint": "填平台给的 model id",
+    },
+    "百度千帆 / 文心一言（建议优先尝试OpenAI兼容；不行则用自定义REST）": {
+        "provider": "openai_compat",
+        "base_url_hint": "若平台提供 OpenAI 兼容则填；否则选“自定义REST”",
+        "model_hint": "填平台给的 model id",
+    },
+
+    # --- Native adapters (optional) ---
+    "Claude (Anthropic) 原生接口": {
+        "provider": "anthropic",
+        "base_url_hint": "可留空（使用 endpoint_url）；或填 https://api.anthropic.com",
+        "model_hint": "例如：claude-3-5-sonnet-2024xxxx（以你账号实际为准）",
+    },
+    "Gemini 原生接口": {
+        "provider": "gemini",
+        "base_url_hint": "可留空（使用 endpoint_url）",
+        "model_hint": "例如：gemini-1.5-pro / gemini-2.0-...（以你账号实际为准）",
+    },
+
+    # --- Custom REST ---
+    "自定义 REST（任意平台/私有模型）": {
+        "provider": "custom_rest",
+        "base_url_hint": "填完整 URL（例如 https://host/path）",
+        "model_hint": "可选：有的平台需要 model 字段，有的不需要",
+    },
+}
+
+
+# -------------------------
+# LLM unified call
+# -------------------------
+def llm_chat(messages: List[Dict[str, str]], cfg: LLMConfig) -> str:
+    """
+    messages: [{"role":"system|user|assistant","content":"..."}]
+    return: assistant text
+    """
+    if not cfg.enabled:
+        raise RuntimeError("LLM is disabled")
+
+    if cfg.provider == "openai_compat":
+        return _call_openai_compat(messages, cfg)
+    if cfg.provider == "anthropic":
+        return _call_anthropic(messages, cfg)
+    if cfg.provider == "gemini":
+        return _call_gemini(messages, cfg)
+    if cfg.provider == "custom_rest":
+        return _call_custom_rest(messages, cfg)
+
+    raise ValueError(f"Unknown provider: {cfg.provider}")
+
+
+def _call_openai_compat(messages: List[Dict[str, str]], cfg: LLMConfig) -> str:
+    base = (cfg.base_url or "").rstrip("/")
+    # 兼容：用户可能填到 /v1，也可能没填
+    if base.endswith("/v1"):
+        url = base + "/chat/completions"
+    elif base.endswith("/chat/completions"):
+        url = base
+    else:
+        # 尝试拼成 /v1/chat/completions
+        url = base + "/v1/chat/completions"
+
+    headers = {"Authorization": f"Bearer {cfg.api_key}"}
+    headers.update(_safe_json_loads(cfg.extra_headers_json))
+
+    payload = {
+        "model": cfg.model,
+        "messages": messages,
+        "temperature": cfg.temperature,
+        "max_tokens": cfg.max_tokens,
+    }
+    payload.update(_safe_json_loads(cfg.extra_params_json))
+
+    r = requests.post(url, headers=headers, json=payload, timeout=cfg.timeout)
+    r.raise_for_status()
+    data = r.json()
+    # 兼容多数 OpenAI 风格响应
+    return data["choices"][0]["message"]["content"]
+
+
+def _call_anthropic(messages: List[Dict[str, str]], cfg: LLMConfig) -> str:
+    """
+    Anthropic Messages API (REST). 如果你用的是代理/网关，也可在 UI 改 endpoint_url
+    """
+    endpoint = cfg.endpoint_url.strip()
+    if not endpoint:
+        base = (cfg.base_url or "https://api.anthropic.com").rstrip("/")
+        endpoint = base + "/v1/messages"
+
+    # Anthropic 不使用 OpenAI messages 的 system 合并方式，这里做个简单转换：
+    system_text = "\n".join([m["content"] for m in messages if m["role"] == "system"]).strip()
+    user_parts = []
+    for m in messages:
+        if m["role"] == "user":
+            user_parts.append({"type": "text", "text": m["content"]})
+        elif m["role"] == "assistant":
+            # 作为对话历史，可选；简单起见当成 user 的上下文也可以
+            user_parts.append({"type": "text", "text": f"(assistant) {m['content']}"})
+
+    headers = {
+        "x-api-key": cfg.api_key,
+        "content-type": "application/json",
+        # 版本号不同平台可能要求不同；UI 可填 api_version 覆盖
+        "anthropic-version": cfg.api_version.strip() or "2023-06-01",
+    }
+    headers.update(_safe_json_loads(cfg.extra_headers_json))
+
+    payload = {
+        "model": cfg.model,
+        "max_tokens": cfg.max_tokens,
+        "temperature": cfg.temperature,
+        "messages": [{"role": "user", "content": user_parts or [{"type":"text","text":"(empty)"}]}],
+    }
+    if system_text:
+        payload["system"] = system_text
+    payload.update(_safe_json_loads(cfg.extra_params_json))
+
+    r = requests.post(endpoint, headers=headers, json=payload, timeout=cfg.timeout)
+    r.raise_for_status()
+    data = r.json()
+    # 常见返回：content=[{type:"text",text:"..."}]
+    parts = data.get("content", [])
+    texts = [p.get("text", "") for p in parts if isinstance(p, dict)]
+    return "\n".join([t for t in texts if t]).strip()
+
+
+def _call_gemini(messages: List[Dict[str, str]], cfg: LLMConfig) -> str:
+    """
+    Gemini Generative Language API（REST）。如果你的接口不一样，直接在 UI 里填 endpoint_url 用自定义/覆盖。
+    """
+    endpoint = cfg.endpoint_url.strip()
+    if not endpoint:
+        # 这里给一个“可编辑模板”，如果不匹配你账号的 endpoint，就改 endpoint_url 或用 custom_rest
+        # 常见形式：.../v1beta/models/{model}:generateContent?key=API_KEY
+        endpoint = f"https://generativelanguage.googleapis.com/v1beta/models/{cfg.model}:generateContent?key={cfg.api_key}"
+
+    # 转换 messages -> contents
+    contents = []
+    for m in messages:
+        role = "user" if m["role"] != "assistant" else "model"
+        contents.append({"role": role, "parts": [{"text": m["content"]}]})
+
+    payload = {
+        "contents": contents,
+        "generationConfig": {
+            "temperature": cfg.temperature,
+            "maxOutputTokens": cfg.max_tokens,
+        },
+    }
+    payload.update(_safe_json_loads(cfg.extra_params_json))
+
+    headers = {"content-type": "application/json"}
+    headers.update(_safe_json_loads(cfg.extra_headers_json))
+
+    r = requests.post(endpoint, headers=headers, json=payload, timeout=cfg.timeout)
+    r.raise_for_status()
+    data = r.json()
+    # 常见返回：candidates[0].content.parts[0].text
+    c0 = (data.get("candidates") or [{}])[0]
+    content = c0.get("content", {})
+    parts = content.get("parts", []) if isinstance(content, dict) else []
+    texts = [p.get("text", "") for p in parts if isinstance(p, dict)]
+    return "\n".join([t for t in texts if t]).strip()
+
+
+def _call_custom_rest(messages: List[Dict[str, str]], cfg: LLMConfig) -> str:
+    """
+    自定义 REST：你自己提供 URL + headers + params。
+    约定 payload 里会给 messages/model/temperature/max_tokens，你可以用 extra_params_json 覆盖结构。
+    """
+    url = cfg.endpoint_url.strip() or cfg.base_url.strip()
+    if not url:
+        raise ValueError("custom_rest requires endpoint_url or base_url")
+
+    headers = _safe_json_loads(cfg.extra_headers_json)
+    # 可选：如果你希望 custom 也自动带 Bearer
+    if cfg.api_key and "authorization" not in {k.lower(): v for k, v in headers.items()}:
+        headers["Authorization"] = f"Bearer {cfg.api_key}"
+
+    payload = {
+        "model": cfg.model,
+        "messages": messages,
+        "temperature": cfg.temperature,
+        "max_tokens": cfg.max_tokens,
+    }
+    payload.update(_safe_json_loads(cfg.extra_params_json))
+
+    r = requests.post(url, headers=headers, json=payload, timeout=cfg.timeout)
+    r.raise_for_status()
+    data = r.json()
+
+    # 你可以在 extra_params_json 里指定如何取回字段；这里先做通用兜底
+    # 1) OpenAI风格
+    try:
+        return data["choices"][0]["message"]["content"]
+    except Exception:
+        pass
+    # 2) 常见 text 字段
+    for k in ["text", "output", "result", "answer", "content"]:
+        if isinstance(data.get(k), str):
+            return data[k]
+    return json.dumps(data, ensure_ascii=False)[:4000]
+
+
+
+
 # ---- Optional deps ----
 try:
     import pdfplumber
@@ -1236,5 +1545,125 @@ def main():
             z = export_project_zip(prj.project_id)
             st.download_button("下载 zip", data=z, file_name=f"{prj.name}-{prj.project_id}.zip", mime="application/zip")
 
+
+def ui_llm_sidebar(project_obj=None) -> LLMConfig:
+    st.sidebar.markdown("---")
+    st.sidebar.markdown("### LLM（可选：用于校对/修正/补全）")
+
+    backend = _read_llm_defaults()
+
+    # 项目里如果存了 llm 配置（可选）
+    prj_llm = {}
+    if project_obj is not None and hasattr(project_obj, "llm") and isinstance(project_obj.llm, dict):
+        prj_llm = project_obj.llm
+
+    ui_defaults = {**backend, **prj_llm}
+
+    mode = st.sidebar.selectbox(
+        "配置来源",
+        ["自动(推荐)", "仅后台", "仅页面", "合并(页面优先)"],
+        index=0,
+    )
+
+    preset_name = st.sidebar.selectbox(
+        "Provider 选择",
+        list(PROVIDER_PRESETS.keys()),
+        index=0,
+    )
+    preset = PROVIDER_PRESETS[preset_name]
+    provider = preset["provider"]
+
+    enabled = st.sidebar.checkbox("启用 LLM 校对与修正", value=bool(ui_defaults.get("enabled", False)))
+
+    # 通用字段
+    api_key = st.sidebar.text_input("API Key", value=str(ui_defaults.get("api_key", "")), type="password")
+    model = st.sidebar.text_input("Model", value=str(ui_defaults.get("model", "")), help=preset.get("model_hint", ""))
+
+    # OpenAI兼容需要 base_url；custom_rest/原生也可以填
+    base_url = st.sidebar.text_input(
+        "Base URL",
+        value=str(ui_defaults.get("base_url", "")),
+        help=preset.get("base_url_hint", ""),
+    )
+
+    # 原生/自定义可填完整 endpoint_url
+    endpoint_url = st.sidebar.text_input(
+        "Endpoint URL（可选，用于原生/自定义覆盖）",
+        value=str(ui_defaults.get("endpoint_url", "")),
+        help="Gemini/Claude/自定义REST建议填完整URL；OpenAI兼容一般不需要。",
+    )
+
+    api_version = ""
+    if provider == "anthropic":
+        api_version = st.sidebar.text_input(
+            "Anthropic-Version（可选）",
+            value=str(ui_defaults.get("api_version", "")),
+            help="不确定就留空。不同网关可能要求不同版本字符串。",
+        )
+
+    timeout = st.sidebar.slider("超时（秒）", 10, 180, int(ui_defaults.get("timeout", 60)))
+    temperature = st.sidebar.slider("temperature", 0.0, 1.5, float(ui_defaults.get("temperature", 0.2)))
+    max_tokens = st.sidebar.slider("max_tokens", 256, 8192, int(ui_defaults.get("max_tokens", 2048)), step=256)
+
+    extra_headers_json = st.sidebar.text_area(
+        "额外 Headers（JSON，可选）",
+        value=str(ui_defaults.get("extra_headers_json", "")),
+        help='例如：{"X-Org":"xxx"}；自定义REST很常用。',
+        height=80,
+    )
+    extra_params_json = st.sidebar.text_area(
+        "额外 Params（JSON，可选）",
+        value=str(ui_defaults.get("extra_params_json", "")),
+        help='例如：{"top_p":0.9} 或覆盖payload结构；自定义REST很常用。',
+        height=80,
+    )
+
+    ui_cfg = dict(
+        enabled=enabled,
+        provider=provider,
+        api_key=api_key,
+        base_url=base_url,
+        model=model,
+        timeout=timeout,
+        temperature=temperature,
+        max_tokens=max_tokens,
+        extra_headers_json=extra_headers_json,
+        extra_params_json=extra_params_json,
+        endpoint_url=endpoint_url,
+        api_version=api_version,
+    )
+
+    # 合并逻辑
+    if mode == "仅后台":
+        merged = backend
+    elif mode == "仅页面":
+        merged = ui_cfg
+    else:
+        merged = dict(backend)
+        for k, v in ui_cfg.items():
+            if k in ["enabled"]:
+                merged[k] = bool(v)
+            elif isinstance(v, str):
+                if v.strip() != "":
+                    merged[k] = v.strip()
+            elif v is not None:
+                merged[k] = v
+
+    llm_cfg = LLMConfig(**merged)
+
+    # 保存到项目（不建议保存 api_key，除非你明确要）
+    if project_obj is not None and st.sidebar.button("保存为本项目默认（不含Key）", use_container_width=True):
+        safe = dict(merged)
+        safe["api_key"] = ""
+        project_obj.llm = safe
+        # 你项目保存函数按你工程里现有的来
+        # save_project(project_obj)
+        st.sidebar.success("已保存（Key未写入项目）。")
+
+    return llm_cfg
+
+
+
 if __name__ == "__main__":
     main()
+    llm_cfg = ui_llm_sidebar(project_obj=prj)  # prj 是你当前项目对象，没有就传 None
