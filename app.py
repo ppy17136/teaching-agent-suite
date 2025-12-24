@@ -18,13 +18,11 @@ PROVIDERS = {
 }
 
 # ============================================================
-# 2. 安全数据转换工具 (解决 AttributeError)
+# 2. 安全渲染工具 (防止 UI 崩溃)
 # ============================================================
 def safe_to_df(data: Any, default_cols: List[str]) -> pd.DataFrame:
-    """
-    强制将 AI 返回的杂乱数据清洗为 Pandas 可识别的字典列表
-    """
-    if not isinstance(data, list):
+    """清洗 AI 数据，确保 Pandas 能够正常加载"""
+    if not data or not isinstance(data, list):
         return pd.DataFrame(columns=default_cols)
     
     clean_list = []
@@ -32,21 +30,18 @@ def safe_to_df(data: Any, default_cols: List[str]) -> pd.DataFrame:
         if isinstance(item, dict):
             clean_list.append(item)
         elif isinstance(item, list) and len(item) <= len(default_cols):
-            # 如果 AI 错误地返回了列表，尝试将其转回字典
             clean_list.append(dict(zip(default_cols, item)))
     
-    df = pd.DataFrame(clean_list)
-    if df.empty:
-        return pd.DataFrame(columns=default_cols)
-    return df
+    return pd.DataFrame(clean_list) if clean_list else pd.DataFrame(columns=default_cols)
 
 # ============================================================
-# 3. 深度流控调用引擎
+# 3. 核心调用引擎 (带重试与流控)
 # ============================================================
 def call_llm_engine(provider_name, api_key, prompt, max_retries=3):
     config = PROVIDERS.get(provider_name, PROVIDERS["Gemini (Google)"])
     for i in range(max_retries):
         try:
+            # 基础节流延迟
             time.sleep(6 if config["is_gemini"] else 3) 
             if config["is_gemini"]:
                 genai.configure(api_key=api_key)
@@ -61,7 +56,7 @@ def call_llm_engine(provider_name, api_key, prompt, max_retries=3):
                 response = client.chat.completions.create(
                     model=config["model"],
                     messages=[
-                        {"role": "system", "content": "你是一个只输出 JSON 数据的教务专家。严禁解释文字。"},
+                        {"role": "system", "content": "你是一个严谨的教务专家，只输出 JSON。"},
                         {"role": "user", "content": prompt}
                     ],
                     response_format={"type": "json_object"},
@@ -75,80 +70,89 @@ def call_llm_engine(provider_name, api_key, prompt, max_retries=3):
     return None
 
 # ============================================================
-# 4. 稳健型分块解析逻辑
+# 4. 稳健型分块解析引擎 (彻底修复 AttributeError)
 # ============================================================
-def ultra_parse_v54(api_key, pdf_bytes, provider_name):
+def ultra_parse_v55(api_key, pdf_bytes, provider_name):
     results = {"sections": {}, "table1": [], "table2": [], "table4": []}
     
     with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
         all_text = "\n".join([p.extract_text() or "" for p in pdf.pages])
         raw_rows_t1, raw_rows_t4 = [], []
         for page in pdf.pages:
-            txt = page.extract_text() or ""
-            tbls = page.extract_tables()
+            txt, tbls = page.extract_text() or "", page.extract_tables()
             if any(x in txt for x in ["附表1", "教学计划表"]):
                 for t in tbls: raw_rows_t1.extend(t)
             if any(x in txt for x in ["附表4", "支撑矩阵"]):
                 for t in tbls: raw_rows_t4.extend(t)
 
-    # 任务 1: 正文提取
-    st.info("步骤 1/4: 提取正文内容...")
+    # 1. 正文
+    st.info("步骤 1/4: 提取正文...")
     p_sec = f"提取正文 JSON。键名：1培养目标, 2毕业要求, 3专业定位与特色, 4主干学科, 5标准学制, 6毕业条件。内容：{all_text[:12000]}"
     res_sec = call_llm_engine(provider_name, api_key, p_sec)
-    if res_sec: results["sections"] = res_sec.get("sections", res_sec)
+    if res_sec:
+        # 兼容处理正文嵌套
+        results["sections"] = res_sec if isinstance(res_sec, dict) else {}
 
-    # 任务 2: 附表 1 分块
+    # 2. 附表 1 (关键修复点)
     if raw_rows_t1:
         clean_t1 = [r for r in raw_rows_t1 if any(r)]
         st.info(f"步骤 2/4: 解析计划表 (共 {len(clean_t1)} 行)...")
         for i in range(0, len(clean_t1), 25):
             chunk = clean_t1[i : i+25]
-            p_chunk = f"表格行转 JSON 列表。字段：[课程名称, 学分, 学位课, 上课学期]。数据：{json.dumps(chunk, ensure_ascii=False)}"
-            res = call_llm_engine(provider_name, api_key, p_chunk)
+            p = f"表格行转 JSON 列表。字段：[课程名称, 学分, 学位课, 上课学期]。数据：{json.dumps(chunk, ensure_ascii=False)}"
+            res = call_llm_engine(provider_name, api_key, p)
             if res:
-                data = res.get("table1") or res.get("data") or (res if isinstance(res, list) else [])
-                if isinstance(data, list): results["table1"].extend(data)
+                # ✅ 修复逻辑：先判断类型，再调用方法
+                if isinstance(res, list):
+                    results["table1"].extend(res)
+                elif isinstance(res, dict):
+                    data = res.get("table1") or res.get("data") or list(res.values())[0]
+                    if isinstance(data, list): results["table1"].extend(data)
 
-    # 任务 3: 附表 2
+    # 3. 附表 2
     st.info("步骤 3/4: 分析学分统计...")
-    p_t2 = f"提取学分统计 JSON 列表。区分焊接/无损检测。内容：{all_text}"
-    res_t2 = call_llm_engine(provider_name, api_key, p_t2)
-    if res_t2: results["table2"] = res_t2 if isinstance(res_t2, list) else res_t2.get("table2", [])
+    res_t2 = call_llm_engine(provider_name, api_key, f"提取学分统计 JSON 列表。区分焊接/无损。内容：{all_text}")
+    if res_t2:
+        results["table2"] = res_t2 if isinstance(res_t2, list) else res_t2.get("table2", [])
 
-    # 任务 4: 附表 4 分块 (修复变量命名)
+    # 4. 附表 4 (关键修复点)
     if raw_rows_t4:
         clean_t4 = [r for r in raw_rows_t4 if any(r)]
         st.info(f"步骤 4/4: 解析支撑矩阵 (共 {len(clean_t4)} 行)...")
         for i in range(0, len(clean_t4), 35):
             chunk = clean_t4[i : i+35]
-            p_t4 = f"提取支撑矩阵 JSON 列表 [课程名称, 指标点, 强度]。数据：{json.dumps(chunk, ensure_ascii=False)}"
-            res = call_llm_engine(provider_name, api_key, p_t4)
+            p = f"提取支撑矩阵 JSON 列表 [课程名称, 指标点, 强度]。数据：{json.dumps(chunk, ensure_ascii=False)}"
+            res = call_llm_engine(provider_name, api_key, p)
             if res:
-                data = res.get("table4") or res.get("data") or (res if isinstance(res, list) else [])
-                if isinstance(data, list): results["table4"].extend(data)
+                # ✅ 修复逻辑：先判断类型，再调用方法
+                if isinstance(res, list):
+                    results["table4"].extend(res)
+                elif isinstance(res, dict):
+                    data = res.get("table4") or res.get("data") or list(res.values())[0]
+                    if isinstance(data, list): results["table4"].extend(data)
 
     return results
 
 # ============================================================
-# 5. UI 渲染 (解决 AttributeError 核心区域)
+# 5. UI 渲染
 # ============================================================
 def main():
-    st.set_page_config(layout="wide", page_title="培养方案智能助手 v5.4")
+    st.set_page_config(layout="wide", page_title="培养方案智能助手 v5.5")
     if "data" not in st.session_state: st.session_state.data = None
 
     with st.sidebar:
-        st.title("⚙️ 配置")
-        prov = st.selectbox("模型供应商", list(PROVIDERS.keys()))
-        key = st.text_input("API Key", type="password")
+        st.title("⚙️ 设置")
+        prov = st.selectbox("模型供应商", list(PROVIDERS.keys()), key="prov_v55")
+        key = st.text_input("API Key", type="password", key="key_v55")
         if st.button("清理缓存"):
             st.session_state.data = None
             st.rerun()
 
-    st.header("🧠 培养方案智能提取工作台 (v5.4 健壮版)")
-    file = st.file_uploader("上传 PDF 培养方案", type="pdf")
+    st.header("🧠 培养方案智能工作台 (修复版)")
+    file = st.file_uploader("上传 PDF", type="pdf")
 
-    if file and key and st.button("🚀 开始全量抽取", type="primary"):
-        res = ultra_parse_v54(key, file.getvalue(), prov)
+    if file and key and st.button("🚀 开始执行抽取", type="primary"):
+        res = ultra_parse_v55(key, file.getvalue(), prov)
         if res:
             st.session_state.data = res
             st.success("抽取任务已完成！")
@@ -161,17 +165,13 @@ def main():
             sec = d.get("sections", {})
             if isinstance(sec, dict) and sec:
                 pick = st.selectbox("选择查看栏目", list(sec.keys()))
-                st.text_area("内容", value=sec.get(pick, ""), height=400, key=f"ta_{pick}")
+                st.text_area("内容", value=str(sec.get(pick, "")), height=400, key=f"ta_{pick}")
         
-        # ✅ 使用 safe_to_df 替代直接创建，防止 AttributeError
         with tabs[1]:
             st.dataframe(safe_to_df(d.get("table1"), ["课程名称", "学分", "学位课", "上课学期"]), use_container_width=True)
-        
         with tabs[2]:
             st.dataframe(safe_to_df(d.get("table2"), ["专业方向", "项目", "学分要求"]), use_container_width=True)
-        
         with tabs[3]:
-            # 处理支撑矩阵渲染
             st.dataframe(safe_to_df(d.get("table4"), ["课程名称", "指标点", "强度"]), use_container_width=True)
 
 if __name__ == "__main__":
