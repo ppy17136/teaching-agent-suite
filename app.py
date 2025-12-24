@@ -72,7 +72,7 @@ def main():
     st.header("📑 培养方案全量智能提取 (单次请求版)")
     file = st.file_uploader("上传 PDF", type="pdf")
 
-    if file and api_key and st.button("🚀 执行一键全量抽取"):
+    if file and api_key and st.button("🚀 执行一键全量抽取", type="primary"):
         result = parse_document_mega(api_key, file.getvalue())
         if result:
             st.session_state.mega_data = result
