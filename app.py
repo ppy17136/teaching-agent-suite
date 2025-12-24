@@ -38,7 +38,7 @@ APP_VERSION = "v0.7 (LLM-Mega-Extraction)"
 DATA_ROOT = Path("data/projects")
 
 PROVIDERS = {
-    "Gemini (Google)": {"base_url": None, "model": "gemini-1.5-flash"},
+    "Gemini (Google)": {"base_url": None, "model": "gemini-2.5-flash"},
     "DeepSeek": {"base_url": "https://api.deepseek.com", "model": "deepseek-chat"},
     "Kimi (Moonshot)": {"base_url": "https://api.moonshot.cn/v1", "model": "moonshot-v1-8k"},
     "智谱 AI (GLM)": {"base_url": "https://open.bigmodel.cn/api/paas/v4/", "model": "glm-4"},
