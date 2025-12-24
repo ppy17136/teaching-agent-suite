@@ -62,45 +62,50 @@ def get_gemini_keys() -> List[str]:
     return list(keys)
 
 def call_llm_with_retry_and_rotation(provider_name, user_api_key, prompt):
-    all_keys = get_gemini_keys()
+    all_keys = get_gemini_keys() # 获取 Secrets 中的 Key 列表
     
-    # 场景 A: 非 Gemini 或用户手动输入了 Key，直接使用不轮换
+    # 初始化索引
+    if "api_key_index" not in st.session_state:
+        st.session_state.api_key_index = 0
+
+    # 场景 A：手动输入 Key 时不参与轮换
     if "Gemini" not in provider_name or user_api_key:
         target_key = user_api_key if user_api_key else st.secrets.get("GEMINI_API_KEY", "")
         return call_llm_core(provider_name, target_key, prompt)
 
-    # 场景 B: Gemini 且使用 Secrets 里的多 Key 轮换
-    if not all_keys: raise Exception("未在 Secrets 中配置 GEMINI_KEYS 列表")
+    # 场景 B：自动轮换逻辑
+    if not all_keys:
+        raise Exception("未在 Secrets 中配置 GEMINI_KEYS")
 
-    if "api_key_index" not in st.session_state: st.session_state.api_key_index = 0
-    
-    # 记录起始索引
-    start_idx = st.session_state.api_key_index % len(all_keys)
     last_exception = None
+    # 记录本次点击开始时的索引
+    start_idx = st.session_state.api_key_index % len(all_keys)
 
     for i in range(len(all_keys)):
+        # 计算当前要尝试的 Key 索引
         curr_idx = (start_idx + i) % len(all_keys)
         curr_key = all_keys[curr_idx]
         
-        # 实时更新 session 状态，让 UI 能够感知到当前在用哪一个
+        # 实时更新 session_state，让 UI 反馈当前状态
         st.session_state.api_key_index = curr_idx
         
         try:
             st.write(f"正在尝试使用 Key #{curr_idx + 1}...")
             result = call_llm_core(provider_name, curr_key, prompt)
             
-            # 任务成功，将索引推向下一个，为下一次运行做准备
+            # --- 关键修改：成功后将索引推向下一个，确保下次点击直接用新 Key ---
             st.session_state.api_key_index = (curr_idx + 1) % len(all_keys)
             return result
         except Exception as e:
             err = str(e).lower()
+            # 如果是配额错误，继续循环尝试下一个
             if any(x in err for x in ["429", "quota", "limit"]):
-                st.warning(f"⚠️ Key #{curr_idx + 1} 配额耗尽，自动切换下一个...")
+                st.warning(f"⚠️ Key #{curr_idx + 1} 配额耗尽，正在自动切换...")
                 last_exception = e
                 continue 
             raise e
     
-    raise Exception(f"❌ 所有 {len(all_keys)} 个 Key 均已失效或超限。")
+    raise Exception(f"❌ 所有 Key 均已尝试，无法完成提取。最后错误: {last_exception}")
 
 # ============================================================
 # 3. 培养方案全量解析引擎
