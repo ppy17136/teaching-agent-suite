@@ -16,7 +16,7 @@ TABLE_1_FULL_COLS = [
 
 def configure_ai(api_key: str):
     genai.configure(api_key=api_key)
-    return genai.GenerativeModel('gemini-1.5-flash')
+    return genai.GenerativeModel('gemini-2.5-flash')
 
 # ============================================================
 # 2. AI 智能分块处理逻辑 (解决显示不全的关键)
