@@ -42,15 +42,13 @@ MEGA_PROMPT = """
 # 1. 模型供应商配置
 # ============================================================
 PROVIDERS = {
-    "Gemini (Google)": {"base_url": None, "model": "gemini-2.5-flash"},
-    "DeepSeek": {"base_url": "https://api.deepseek.com", "model": "deepseek-chat"},
-    "Kimi (Moonshot)": {"base_url": "https://api.moonshot.cn/v1", "model": "moonshot-v1-8k"},
-    "智谱 AI (GLM)": {"base_url": "https://open.bigmodel.cn/api/paas/v4/", "model": "glm-4"},
-    "零一万物 (Yi)": {"base_url": "https://api.lingyiwanwu.com/v1", "model": "yi-34b-chat-0205"},
-    "通义千问 (Qwen)": {"base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1", "model": "qwen-plus"},
-    "豆包 (字节)": {"base_url": "https://ark.cn-beijing.volces.com/api/v3", "model": "doubao-pro-32k"}
+    "Gemini (Google)": {"base_url": None, "model": "gemini-2.5-flash", "is_gemini": True},
+    "DeepSeek": {"base_url": "https://api.deepseek.com", "model": "deepseek-chat", "is_gemini": False},
+    "Kimi (Moonshot)": {"base_url": "https://api.moonshot.cn/v1", "model": "moonshot-v1-8k", "is_gemini": False},
+    "智谱 AI (GLM)": {"base_url": "https://open.bigmodel.cn/api/paas/v4/", "model": "glm-4", "is_gemini": False},
+    "通义千问 (Qwen)": {"base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1", "model": "qwen-plus", "is_gemini": False},
+    "豆包 (字节)": {"base_url": "https://ark.cn-beijing.volces.com/api/v3", "model": "doubao-pro-32k", "is_gemini": False}
 }
-
 # ============================================================
 # 2. 统一大模型调用路由
 # ============================================================
