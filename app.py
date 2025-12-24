@@ -76,20 +76,20 @@ MEGA_PROMPT = """
 # ============================================================
 # 2. 简化的解析引擎
 # ============================================================
-def parse_document_mega(api_key, pdf_bytes):
-    genai.configure(api_key=api_key)
-    model = genai.GenerativeModel('gemini-2.5-flash')
-    
+def parse_document_mega(api_key, pdf_bytes, provider_name):
+    """
+    接收 api_key, pdf内容, 以及 选择的模型供应商名称
+    """
     with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
         # 一次性读取全文文本
         all_text = "\n".join([p.extract_text() or "" for p in pdf.pages])
         
-    st.info("正在发送单次全量抽取请求，请稍候（约 15-30 秒）...")
+    st.info(f"正在向 {provider_name} 发送抽取请求，请稍候...")
     
     try:
-        # 只发一次请求，解决 ResourceExhausted 问题
         full_prompt = f"{MEGA_PROMPT}\n\n培养方案原文：\n{all_text}"
-        result = call_llm(selected_provider, api_key, full_prompt)
+        # ✅ 正确调用统一路由函数
+        result = call_llm(provider_name, api_key, full_prompt)
         return result
     except Exception as e:
         st.error(f"抽取失败: {str(e)}")
@@ -116,10 +116,10 @@ def main():
     file = st.file_uploader("上传 PDF 培养方案", type="pdf")
 
     if file and api_key and st.button("🚀 执行一键全量抽取", type="primary"):
-        result = parse_document_mega(api_key, file.getvalue())
+        result = parse_document_mega(api_key, file.getvalue(), selected_provider)
         if result:
             st.session_state.mega_data = result
-            st.success("抽取成功！仅消耗 1 次 API 请求配额。")
+            st.success(f"抽取成功！来自模型: {selected_provider}")
 
 
     if st.session_state.mega_data:
