@@ -37,7 +37,7 @@ MEGA_PROMPT = """
 # ============================================================
 def parse_document_mega(api_key, pdf_bytes):
     genai.configure(api_key=api_key)
-    model = genai.GenerativeModel('gemini-1.5-flash')
+    model = genai.GenerativeModel('gemini-2.5-flash')
     
     with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
         # 一次性读取全文文本
