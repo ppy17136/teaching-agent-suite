@@ -47,7 +47,7 @@ def extract_sections_precise(model, full_text):
     5: 标准学制与授予学位 (五、标准学制 之后) [cite: 88]
     6: 毕业条件 (六、毕业条件 之后) [cite: 91]
     
-    返回 JSON: {{"1": "...", "2": "...", "3": "...", "4": "...", "5": "...", "6": "..."}}
+    返回 JSON: {{"1培养目标": "...", "2毕业要求": "...", "3专业定位与特色": "...", "4主干学科/核心课程/实践环节": "...", "5标准学制与授予学位": "...", "6毕业条件": "..."}}
     文本：{full_text[:18000]}
     """
     return ai_safe_call(model, prompt)
@@ -94,21 +94,27 @@ def parse_document_v12_1(api_key, pdf_bytes):
                 tbl = page.extract_table()
                 if tbl: raw_t4.extend(tbl[1:])
 
-        # 3. 结构化校对
+        # 3. 分块处理附表
         if raw_t1:
-            st.write("正在校对附表1: 全量计划表...")
-            # 分块校对逻辑...
-            prompt = f"转换教学计划表片段。列名：{TABLE_1_FULL_COLS}。数据：{json.dumps(raw_t1[:80], ensure_ascii=False)}"
-            results["tables"]["1"] = ai_safe_call(model, prompt)
+            st.write("正在校对教学计划表...")
+            # 分块逻辑同前，chunk_size 设为 80 以减少请求数
+            for i in range(0, len(raw_t1), 80):
+                chunk = raw_t1[i : i+80]
+                prompt = f"转换教学计划表片段为 JSON 列表。字段：{TABLE_1_FULL_COLS}。数据：{json.dumps(chunk, ensure_ascii=False)}"
+                res = ai_safe_call(model, prompt)
+                if isinstance(res, list): results["tables"]["1"].extend(res)
             
         if text_t2:
             st.write("正在重构附表2: 学分统计表...")
             results["tables"]["2"] = process_table_2_flat(model, text_t2)
             
         if raw_t4:
-            st.write("正在生成附表4: 支撑关系矩阵...")
-            prompt = "提取支撑关系 JSON 列表 [课程名称, 指标点, 强度]。"
-            results["tables"]["4"] = ai_safe_call(model, f"{prompt}\n数据：{json.dumps(raw_t4[:100], ensure_ascii=False)}")
+            st.write("正在处理支撑矩阵表...")
+            for i in range(0, len(raw_t4), 100):
+                chunk = raw_t4[i : i+100]
+                prompt = f"提取支撑关系 JSON 列表 [课程名称, 指标点, 强度]。数据：{json.dumps(chunk, ensure_ascii=False)}"
+                res = ai_safe_call(model, prompt)
+                if isinstance(res, list): results["tables"]["4"].extend(res)
 
     return results
 
@@ -125,6 +131,8 @@ def main():
         st.title("⚙️ 设置")
         api_key = st.text_input("Gemini API Key", type="password", key="v121_api_key")
         st.caption("版本: v1.2.1 (修复 NameError)")
+        
+    st.markdown("## 🧠 培养方案全量智能提取 (修复版)")
     
     file = st.file_uploader("上传培养方案 PDF", type="pdf", key="v121_uploader")
 
@@ -142,7 +150,7 @@ def main():
         
         with tab1:
             # 解决切换问题的关键：使用带有 sec_pick 的 key
-            sec_pick = st.selectbox("查看栏目内容", ["1","2","3","4","5","6"], key="v121_sec_pick")
+            sec_pick = st.selectbox("查看栏目内容", ["1培养目标", "2毕业要求", "3专业定位与特色", "4主干学科/核心课程/实践环节", "5标准学制与授予学位", "6毕业条件"], key="v121_sec_pick")
             content = d["sections"].get(sec_pick, "未提取到相关正文。")
             st.text_area("提取结果", value=content, height=450, key=f"v121_ta_{sec_pick}")
 
