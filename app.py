@@ -5,7 +5,7 @@ import pdfplumber
 import google.generativeai as genai
 from typing import Dict, List, Any
 from openai import OpenAI  # 用于适配 DeepSeek, Kimi, Yi, 智谱等
-
+from google.api_core import exceptions
 # ============================================================
 # 1. 核心提示词定义：一次性指令
 # ============================================================
