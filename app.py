@@ -120,10 +120,7 @@ def main():
         if result:
             st.session_state.mega_data = result
             st.success("抽取成功！仅消耗 1 次 API 请求配额。")
-        except Exception as e:
-            st.error(f"调用失败: {str(e)}")           
-            
-            
+
 
     if st.session_state.mega_data:
         d = st.session_state.mega_data
