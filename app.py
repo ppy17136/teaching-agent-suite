@@ -5,173 +5,164 @@ import pdfplumber
 import google.generativeai as genai
 from typing import Dict, List, Any
 from openai import OpenAI
-from google.api_core import exceptions  # ✅ 修正 1：确保导入异常处理模块
+from google.api_core import exceptions  # ✅ 解决 NameError: exceptions
 
 # ============================================================
-# 1. 模型供应商配置
+# 1. 模型供应商配置 (增加 max_out 限制提示)
 # ============================================================
 PROVIDERS = {
-    "Gemini (Google)": {"base_url": None, "model": "gemini-1.5-flash", "is_gemini": True},
-    "DeepSeek": {"base_url": "https://api.deepseek.com", "model": "deepseek-chat", "is_gemini": False},
-    "Kimi (Moonshot)": {"base_url": "https://api.moonshot.cn/v1", "model": "moonshot-v1-8k", "is_gemini": False},
-    "智谱 AI (GLM)": {"base_url": "https://open.bigmodel.cn/api/paas/v4/", "model": "glm-4", "is_gemini": False},
-    "通义千问 (Qwen)": {"base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1", "model": "qwen-plus", "is_gemini": False},
-    "豆包 (字节)": {"base_url": "https://ark.cn-beijing.volces.com/api/v3", "model": "doubao-pro-32k", "is_gemini": False}
+    "Gemini (Google)": {"base_url": None, "model": "gemini-1.5-flash", "is_gemini": True, "limit": 8192},
+    "DeepSeek": {"base_url": "https://api.deepseek.com", "model": "deepseek-chat", "is_gemini": False, "limit": 4096},
+    "Kimi (Moonshot)": {"base_url": "https://api.moonshot.cn/v1", "model": "moonshot-v1-8k", "is_gemini": False, "limit": 4096},
+    "通义千问 (Qwen)": {"base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1", "model": "qwen-plus", "is_gemini": False, "limit": 4096},
 }
 
 # ============================================================
-# 2. 核心提示词：强调结构化与分条
-# ============================================================
-MEGA_PROMPT = """
-你是一个专业的高校教务专家。请精确提取以下内容并严格输出一个 JSON 对象。
-提取要求：
-1. **分条列出**：1-6项正文必须保留原始编号，使用 '\\n' 换行。
-2. **禁止嵌套**：表格内严禁出现嵌套 JSON，必须全部为扁平字符串。
-3. **附表要求**：附表1提取全量课程；附表2区分焊接/无损方向；附表4提取支撑强度。
-"""
-
-# ============================================================
-# 3. 统一驱动引擎 (带重试、节流与 Token 保护)
+# 2. 深度节流调用引擎
 # ============================================================
 def call_llm_engine(provider_name, api_key, prompt, max_retries=3):
-    """统一处理所有模型的调用逻辑，修复 NameError 和 截断问题"""
-    if provider_name not in PROVIDERS:
-        st.error(f"无效的供应商: {provider_name}")
-        return None
-        
     config = PROVIDERS[provider_name]
-    
     for i in range(max_retries):
         try:
-            # 基础流控 (防止过快触发限制)
+            # 强制冷却：Gemini 免费版 5s，其他 2s
             time.sleep(5 if config["is_gemini"] else 2)
             
             if config["is_gemini"]:
                 genai.configure(api_key=api_key)
                 model = genai.GenerativeModel(config["model"])
-                # Gemini 支持 8192 token 输出
                 response = model.generate_content(
                     prompt, 
-                    generation_config={"response_mime_type": "application/json", "max_output_tokens": 8192}
+                    generation_config={"response_mime_type": "application/json", "max_output_tokens": config["limit"]}
                 )
                 return json.loads(response.text)
             else:
                 client = OpenAI(api_key=api_key, base_url=config["base_url"])
-                # ✅ 修正 2：为 OpenAI 兼容模型增加 max_tokens 设置，防止截断
                 response = client.chat.completions.create(
                     model=config["model"],
                     messages=[
-                        {"role": "system", "content": "你是一个严谨的教务专家，只输出完整的 JSON，严禁截断。"},
+                        {"role": "system", "content": "你是一个严谨的教务专家，只输出 JSON 列表。严禁输出任何额外描述。"},
                         {"role": "user", "content": prompt}
                     ],
                     response_format={"type": "json_object"},
-                    max_tokens=4096 # 国产模型通常最大支持 4k 输出
+                    max_tokens=config["limit"]
                 )
                 return json.loads(response.choices[0].message.content)
-                
         except exceptions.ResourceExhausted:
             wait = (i + 1) * 20
             st.warning(f"触发配额限制，正在第 {i+1} 次重试，需等待 {wait} 秒...")
             time.sleep(wait)
-        except json.JSONDecodeError as je:
-            # 捕获截断导致的 JSON 错误
-            st.error(f"JSON 解析失败 (可能是内容太长被模型强行截断): {str(je)}")
-            return None
         except Exception as e:
             if i == max_retries - 1: st.error(f"调用失败: {str(e)}")
             continue
     return None
 
 # ============================================================
-# 4. 智能解析引擎 (分段策略决策)
+# 3. 智能解析核心 (增加极致切片逻辑)
 # ============================================================
-def intelligent_processor(api_key, pdf_bytes, provider_name):
+def ultra_parse(api_key, pdf_bytes, provider_name):
+    # 1. 初始化结果集
+    results = {"sections": {}, "table1": [], "table2": [], "table4": []}
+    
+    # 2. 提取文本与原始表格行
     with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
         all_text = "\n".join([p.extract_text() or "" for p in pdf.pages])
-    
-    char_count = len(all_text)
-    is_gemini = PROVIDERS[provider_name]["is_gemini"]
-    
-    # 策略判断：非 Gemini 且字符 > 12,000，则分段请求以防止截断
-    needs_split = (not is_gemini) and (char_count > 12000)
-    final_res = {"sections": {}, "table1": [], "table2": [], "table4": []}
+        raw_rows_t1 = []
+        raw_rows_t4 = []
+        for page in pdf.pages:
+            tbls = page.extract_tables()
+            txt = page.extract_text() or ""
+            if "附表1" in txt or "教学计划表" in txt:
+                for t in tbls: raw_rows_t1.extend(t)
+            if "附表4" in txt or "支撑矩阵" in txt:
+                for t in tbls: raw_rows_t4.extend(t)
 
-    if not needs_split:
-        st.info("📊 采用【全量单次】抽取模式...")
-        full_p = f"{MEGA_PROMPT}\n\n内容原文：\n{all_text}"
-        res = call_llm_engine(provider_name, api_key, full_p)
-        if res: final_res = res
-    else:
-        st.warning(f"📊 文档较长 ({char_count} 字符)，为防止输出截断，自动切换为【分段安全】抽取模式...")
-        
-        # 任务 1: 正文 + 学分表 (限制输入长度)
-        st.write("步骤 1: 正在提取正文与学分统计...")
-        p1 = f"{MEGA_PROMPT}\n任务：仅提取 1-6 项正文和附表 2。内容：{all_text[:15000]}"
-        r1 = call_llm_engine(provider_name, api_key, p1)
-        if r1:
-            final_res["sections"] = r1.get("sections", {})
-            final_res["table2"] = r1.get("table2", [])
+    # --- 任务 A: 提取 1-6 项正文 (单次请求文字量可控) ---
+    st.info("步骤 1: 正在提取 1-6 项正文内容...")
+    p_sec = f"从文本中提取 1-6 项正文 JSON。要求分条列出。键名：1培养目标, 2毕业要求, 3专业定位与特色, 4主干学科, 5标准学制, 6毕业条件。文本：{all_text[:12000]}"
+    res_sec = call_llm_engine(provider_name, api_key, p_sec)
+    if res_sec: results["sections"] = res_sec
 
-        # 任务 2: 教学计划表 (附表 1)
-        st.write("步骤 2: 正在提取教学计划表...")
-        p2 = f"请提取附表 1 的所有课程，格式 {{'table1':[...]}}。内容：\n{all_text}"
-        r2 = call_llm_engine(provider_name, api_key, p2)
-        if r2: final_res["table1"] = r2.get("table1", [])
+    # --- 任务 B: 附表 1 (极致切片：每 30 行请求一次，彻底根除 JSON 截断) ---
+    if raw_rows_t1:
+        st.info(f"步骤 2: 正在解析教学计划表 (共 {len(raw_rows_t1)} 行，分块处理中)...")
+        # 过滤掉明显的空行
+        clean_rows_t1 = [r for r in raw_rows_t1 if any(r)]
+        for i in range(0, len(clean_rows_t1), 30):
+            chunk = clean_rows_t1[i:i+30]
+            st.write(f"  > 正在处理第 {i} 至 {i+len(chunk)} 行...")
+            p_chunk = f"将数据行转换为 JSON 列表。字段：课程名称, 学分, 学位课, 上课学期。数据：{json.dumps(chunk, ensure_ascii=False)}"
+            res_chunk = call_llm_engine(provider_name, api_key, p_chunk)
+            if res_chunk and isinstance(res_chunk.get("table1"), list):
+                results["table1"].extend(res_chunk["table1"])
+            elif isinstance(res_chunk, list): # 兼容不同模型的返回习惯
+                results["table1"].extend(res_chunk)
 
-        # 任务 3: 支撑矩阵 (附表 4)
-        st.write("步骤 3: 正在提取支撑矩阵...")
-        p3 = f"请提取附表 4 的支撑矩阵，格式 {{'table4':[...]}}。内容：\n{all_text}"
-        r3 = call_llm_engine(provider_name, api_key, p3)
-        if r3: final_res["table4"] = r3.get("table4", [])
+    # --- 任务 C: 附表 2 (学分统计) ---
+    st.info("步骤 3: 正在分析学分统计表...")
+    p_t2 = f"提取学分统计 JSON 列表。必须区分焊接/无损检测。内容：{all_text}"
+    res_t2 = call_llm_engine(provider_name, api_key, p_t2)
+    if res_t2: results["table2"] = res_t2.get("table2", [])
 
-    return final_res
+    # --- 任务 D: 附表 4 (支撑矩阵切片) ---
+    if raw_rows_t4:
+        st.info(f"步骤 4: 正在解析支撑关系矩阵...")
+        clean_rows_t4 = [r for r in raw_rows_t4 if any(r)]
+        for i in range(0, len(clean_rows_t4), 40):
+            chunk = clean_rows_t4[i:i+40]
+            p_chunk_t4 = f"提取支撑矩阵 JSON 列表 [课程名称, 指标点, 强度]。数据：{json.dumps(chunk, ensure_ascii=False)}"
+            res_chunk_t4 = call_llm_engine(provider_name, api_key, p_chunk_t4)
+            if res_chunk_t4:
+                results["table4"].extend(res_chunk_t4.get("table4", []))
+
+    return results
 
 # ============================================================
-# 5. UI 逻辑 (修复下拉列表状态问题)
+# 4. Streamlit UI (修复所有显示逻辑)
 # ============================================================
 def main():
-    st.set_page_config(layout="wide", page_title="智能教学工作台 v4.1")
+    st.set_page_config(layout="wide", page_title="培养方案智能工作台 v5.0")
     
-    if "mega_data" not in st.session_state:
-        st.session_state.mega_data = None
+    if "final_data" not in st.session_state:
+        st.session_state.final_data = None
 
     with st.sidebar:
-        st.title("🤖 模型配置")
-        selected_provider = st.selectbox("选择模型供应商", list(PROVIDERS.keys()), key="prov_v4")
-        api_key = st.text_input(f"输入 {selected_provider} 的 API Key", type="password", key="key_v4")
+        st.title("⚙️ 模型配置")
+        prov = st.selectbox("选择模型供应商", list(PROVIDERS.keys()), key="v5_prov")
+        key = st.text_input(f"输入 {prov} API Key", type="password", key="v5_key")
         st.divider()
-        if st.button("清理缓存数据"):
-            st.session_state.mega_data = None
+        if st.button("清理数据缓存"):
+            st.session_state.final_data = None
             st.rerun()
 
-    st.header("🧠 培养方案全量提取 (策略分流版)")
-    file = st.file_uploader("上传 PDF 培养方案", type="pdf")
+    st.header("🧠 培养方案全量智能提取 (终极稳定版)")
+    file = st.file_uploader("上传 2024培养方案.pdf", type="pdf")
 
-    if file and api_key and st.button("🚀 执行全量抽取", type="primary"):
-        with st.spinner("AI 正在深度解析文档，请稍候..."):
-            result = intelligent_processor(api_key, file.getvalue(), selected_provider)
-            if result:
-                st.session_state.mega_data = result
-                st.success("抽取成功！")
+    if file and key and st.button("🚀 执行一键全量抽取", type="primary"):
+        with st.spinner("正在执行超长文档分块校对，请稍候（约 1-2 分钟）..."):
+            res = ultra_parse(key, file.getvalue(), prov)
+            if res:
+                st.session_state.final_data = res
+                st.success("🎉 数据抽取完毕！")
 
-    if st.session_state.mega_data:
-        d = st.session_state.mega_data
-        tab1, tab2, tab3, tab4 = st.tabs(["1-6 正文", "附表1: 计划表", "附表2: 学分统计", "附表4: 支撑矩阵"])
+    if st.session_state.final_data:
+        d = st.session_state.final_data
+        t1, t2, t3, t4 = st.tabs(["1-6 正文", "附表1: 计划表", "附表2: 学分统计", "附表4: 支撑矩阵"])
         
-        with tab1:
+        with t1:
             sections = d.get("sections", {})
-            if sections:
-                sec_pick = st.selectbox("选择栏目", list(sections.keys()), key="sec_pick_v4")
-                # ✅ 修正 3：使用动态 key 确保切换下拉列表后内容即时刷新
-                st.text_area("内容文本", value=sections.get(sec_pick, ""), height=450, key=f"ta_v4_{sec_pick}")
+            if isinstance(sections, dict) and sections:
+                # 兼容不同模型可能返回的嵌套结构
+                if "sections" in sections: sections = sections["sections"]
+                sec_pick = st.selectbox("选择栏目", list(sections.keys()), key="v5_sec_sel")
+                st.text_area("内容", value=sections.get(sec_pick, ""), height=450, key=f"v5_ta_{sec_pick}")
             else:
-                st.warning("正文部分提取失败。")
+                st.warning("正文部分提取失败，请检查 API Key 或尝试 Gemini。")
 
-        with tab2:
+        with t2:
             st.dataframe(pd.DataFrame(d.get("table1", [])), use_container_width=True)
-        with tab3:
+        with t3:
             st.dataframe(pd.DataFrame(d.get("table2", [])), use_container_width=True)
-        with tab4:
+        with t4:
             st.dataframe(pd.DataFrame(d.get("table4", [])), use_container_width=True)
 
 if __name__ == "__main__":
